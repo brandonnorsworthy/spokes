@@ -262,6 +262,9 @@ fn work_row(item: &Item, tree: &Tree, today: NaiveDate) -> Row {
     if let Some(due) = &node.due_at {
         flags.push(due_flag(due, today));
     }
+    if node.recur.is_some() {
+        flags.push("repeats".to_string());
+    }
     let mut rest = node.title.clone();
     if let Some(p) = progress(node) {
         rest.push(' ');
@@ -416,29 +419,35 @@ struct Queue {
 }
 
 impl Queue {
+    /// Questions (`waiting`) anywhere beneath a live claim.
+    fn questions_below(&mut self, tree: &Tree, parent: &Node) {
+        for kid in tree.kids(parent.id) {
+            if kid.status == Status::Waiting {
+                self.needs_you.push(kid.clone());
+            }
+            self.questions_below(tree, kid);
+        }
+    }
+
     fn walk(&mut self, tree: &Tree, parent: &Node, at: Walk) {
         let mut earlier_open_step = false;
         for kid in tree.kids(parent.id) {
             let blocked = parent.ordered && earlier_open_step;
             earlier_open_step = true;
-            if kid
-                .defer_until
-                .as_deref()
-                .and_then(parse_date)
-                .is_some_and(|d| d > self.today)
-            {
-                continue;
-            }
+            // What needs the user shows even when deferred; everything else waits.
             match kid.status {
                 Status::InProgress => {
                     let live = kid
                         .claim_expires
                         .as_deref()
                         .is_some_and(|e| e > self.now.as_str());
-                    if !live {
+                    if live {
+                        // A claimed subtree is hidden from everyone else, but a worker's
+                        // question inside an orchestrator's project still reaches the user.
+                        self.questions_below(tree, kid);
+                    } else {
                         self.needs_you.push(kid.clone());
                     }
-                    // A claimed subtree is hidden from everyone else.
                     continue;
                 }
                 Status::Waiting => {
@@ -451,6 +460,14 @@ impl Queue {
                     continue;
                 }
                 _ => {}
+            }
+            if kid
+                .defer_until
+                .as_deref()
+                .and_then(parse_date)
+                .is_some_and(|d| d > self.today)
+            {
+                continue;
             }
             let level = kid.priority.or(at.level);
             let reachable = at.reachable && !blocked;

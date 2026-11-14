@@ -45,6 +45,13 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
     if let Some(line) = claim_line(&node, tz) {
         out.push(line);
     }
+    if let Some(rule) = node
+        .recur
+        .as_deref()
+        .and_then(crate::recur::Rule::from_json)
+    {
+        out.push(format!("repeats {}", rule.describe()));
+    }
 
     let (tree, deeper) = subtree(conn, id, depth)?;
     let mut outline = Outline {
@@ -146,6 +153,7 @@ fn history(conn: &Connection, id: NodeId, tz: Tz) -> Result<Vec<String>, String>
                 line.push_str(&format!(" by {a}"));
             }
             if let Some(d) = detail.filter(|d| !d.is_empty()) {
+                let d = local_times(&d, tz);
                 let short: String = d.chars().take(120).collect();
                 let more = if d.chars().count() > 120 { "..." } else { "" };
                 line.push_str(&format!(": {short}{more}"));
@@ -153,6 +161,34 @@ fn history(conn: &Connection, id: NodeId, tz: Tz) -> Result<Vec<String>, String>
             line
         })
         .collect())
+}
+
+/// Hidden by `defer_until` until a later day.
+fn deferred(node: &Node, today: NaiveDate) -> bool {
+    node.defer_until
+        .as_deref()
+        .and_then(crate::format::parse_date)
+        .is_some_and(|d| d > today)
+}
+
+/// Event details store UTC timestamps (`until 2026-11-14T08:49:35Z`); show them as
+/// wall-clock time in `SPOKES_TZ` like the rest of the output.
+fn local_times(detail: &str, tz: Tz) -> String {
+    detail
+        .split(' ')
+        .map(|word| {
+            let end = word
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == ':' || c == '+'))
+                .unwrap_or(word.len());
+            let (stamp, tail) = word.split_at(end);
+            if stamp.len() >= 20 && chrono::DateTime::parse_from_rfc3339(stamp).is_ok() {
+                format!("{}{tail}", clock(stamp, tz))
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Descendants of `id` that are not beneath a dropped node.
@@ -222,7 +258,7 @@ impl Outline {
         let next_step: Option<NodeId> = (parent.ordered && !parent.status.is_closed())
             .then(|| kids.iter().find(|k| !k.status.is_closed()))
             .flatten()
-            .filter(|k| k.status == Status::Open)
+            .filter(|k| k.status == Status::Open && !deferred(k, self.today))
             .map(|k| k.id);
         let indent = "  ".repeat(level);
         let mut number = 0;
@@ -331,6 +367,7 @@ mod tests {
             &mut conn,
             serde_json::from_value(serde_json::json!({"ids": ["SPOKE-4"], "status": "dropped"}))
                 .unwrap(),
+            crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
         let out = get(&conn, get_args(Some(2), None), chrono_tz::UTC).unwrap();

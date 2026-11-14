@@ -5,13 +5,17 @@ use rusqlite::{Connection, params};
 use super::{
     ToolResult, children, clean_agent, db_err, load, log_event, renew_leases, require, touch,
 };
+use chrono::NaiveDate;
+
 use crate::db::now;
+use crate::format::{parse_date, short_date};
 use crate::model::{Kind, Node, NodeId, Status};
+use crate::recur::Rule;
 use crate::tools::args::SetStatusArgs;
 
 const MAX_IDS: usize = 100;
 
-pub fn set_status(conn: &mut Connection, args: SetStatusArgs) -> ToolResult {
+pub fn set_status(conn: &mut Connection, args: SetStatusArgs, today: NaiveDate) -> ToolResult {
     if args.ids.is_empty() {
         return Err("ids is empty. Pass one or more ids, e.g. [\"SPOKE-12\"].".to_string());
     }
@@ -27,16 +31,19 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs) -> ToolResult {
     let mut changed = Vec::new();
     let mut failures = 0;
     for raw in &args.ids {
-        match change_one(&tx, raw.parse(), target, agent.as_deref(), &now)? {
+        match change_one(&tx, raw.parse(), target, agent.as_deref(), &now, today)? {
             Outcome::Changed(node) => {
                 let mut line = format!("{} {}  {}", node.id, target.as_str(), node.title);
                 if target.is_closed() && node.focus_rank.is_some() {
                     line.push_str("  (taken off the focus list)");
                 }
+                if target == Status::Dropped && node.recur.is_some() {
+                    line.push_str("  (it stops repeating)");
+                }
                 lines.push(line);
                 changed.push(node);
             }
-            Outcome::Unchanged(line) => lines.push(line),
+            Outcome::Unchanged(line) | Outcome::Recurred(line) => lines.push(line),
             Outcome::Refused(line) => {
                 failures += 1;
                 lines.push(line);
@@ -88,6 +95,8 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs) -> ToolResult {
 
 enum Outcome {
     Changed(Box<Node>),
+    /// A recurring task marked done: reset in place, with a reply line.
+    Recurred(String),
     Unchanged(String),
     Refused(String),
 }
@@ -98,6 +107,7 @@ fn change_one(
     target: Status,
     agent: Option<&str>,
     now: &str,
+    today: NaiveDate,
 ) -> Result<Outcome, String> {
     let id = match id {
         Ok(id) => id,
@@ -126,6 +136,13 @@ fn change_one(
         )));
     }
 
+    if target == Status::Done
+        && node.kind == Kind::Task
+        && let Some(rule) = node.recur.as_deref().and_then(Rule::from_json)
+    {
+        return recur(conn, &node, rule, agent, now, today).map(Outcome::Recurred);
+    }
+
     let completed_at = (target == Status::Done).then_some(now);
     // Any of these endings clears a claim and an open question; closing a node also
     // takes it off the focus list, which keeps that list short by itself.
@@ -142,6 +159,68 @@ fn change_one(
     touch(conn, id, now).map_err(db_err)?;
     renew_leases(conn, id, agent, now).map_err(db_err)?;
     Ok(Outcome::Changed(Box::new(node)))
+}
+
+/// Resets a recurring task in place: logs `recurred`, reopens it with the next due
+/// date and hides it until shortly before then; clears any claim, question or answer
+/// mark; reopens its finished steps. The id and focus place stay.
+fn recur(
+    conn: &Connection,
+    node: &Node,
+    rule: Rule,
+    agent: Option<&str>,
+    now: &str,
+    today: NaiveDate,
+) -> Result<String, String> {
+    let id = node.id;
+    let occ = rule.next(node.due_at.as_deref().and_then(parse_date), today);
+    let due = occ.due.format("%Y-%m-%d").to_string();
+    let defer = occ.defer_until.map(|d| d.format("%Y-%m-%d").to_string());
+    conn.execute(
+        "UPDATE nodes SET status = 'open', completed_at = ?1, claimed_by = NULL, claim_expires = NULL,
+                          waiting_on = NULL, answered_at = NULL, updated_at = ?1,
+                          due_at = ?2, defer_until = ?3, recur = ?4
+         WHERE id = ?5",
+        params![now, due, defer, occ.rule.to_json(), id.0],
+    )
+    .map_err(db_err)?;
+    // Its finished steps come back with it (a checklist that repeats).
+    let reopened = conn
+        .execute(
+            "WITH RECURSIVE down(id) AS (
+               SELECT id FROM nodes WHERE parent_id = ?1
+               UNION ALL
+               SELECT c.id FROM nodes c JOIN down ON c.parent_id = down.id)
+             UPDATE nodes SET status = 'open', completed_at = NULL, updated_at = ?2
+             WHERE id IN (SELECT id FROM down) AND status = 'done'",
+            params![id.0, now],
+        )
+        .map_err(db_err)?;
+    let mut detail = format!("{} -> done -> open; next due {due}", node.status.as_str());
+    if let Some(d) = &defer {
+        detail.push_str(&format!(", hidden until {d}"));
+    }
+    if reopened > 0 {
+        detail.push_str(&format!(", {reopened} steps reopened"));
+    }
+    log_event(conn, id, now, agent, "recurred", &detail).map_err(db_err)?;
+    touch(conn, id, now).map_err(db_err)?;
+    renew_leases(conn, id, agent, now).map_err(db_err)?;
+
+    let when = match occ.defer_until {
+        Some(d) => format!("back in the queue {}", short_date(&d.to_string(), today)),
+        None => "open again now".to_string(),
+    };
+    let mut line = format!(
+        "{id} done  {}  (repeats {}: {when}, due {})",
+        node.title,
+        rule.describe(),
+        short_date(&due, today)
+    );
+    if reopened > 0 {
+        line.push_str(&format!(". Its {reopened} finished steps were reopened"));
+    }
+    Ok(line)
 }
 
 #[cfg(test)]
@@ -165,14 +244,29 @@ mod tests {
         let (mut conn, dir) = temp_db("status");
         add(&mut conn, args(None, "Project", Kind::Task)).unwrap(); // 2
         add(&mut conn, args(Some(2), "Step", Kind::Task)).unwrap(); // 3
-        let out = set_status(&mut conn, status_args(&["SPOKE-3"], SettableStatus::Done)).unwrap();
+        let out = set_status(
+            &mut conn,
+            status_args(&["SPOKE-3"], SettableStatus::Done),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert_eq!(
             out,
             "SPOKE-3 done  Step\nAll steps of SPOKE-2 Project are done. If it is finished too, mark it done with set_status."
         );
-        let out = set_status(&mut conn, status_args(&["3"], SettableStatus::Done)).unwrap();
+        let out = set_status(
+            &mut conn,
+            status_args(&["3"], SettableStatus::Done),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert_eq!(out, "SPOKE-3 is already done  Step");
-        set_status(&mut conn, status_args(&["SPOKE-3"], SettableStatus::Open)).unwrap();
+        set_status(
+            &mut conn,
+            status_args(&["SPOKE-3"], SettableStatus::Open),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         let events: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM events WHERE node_id = 3 AND type = 'status'",
@@ -195,6 +289,7 @@ mod tests {
                 &["SPOKE-2", "SPOKE-1", "SPOKE-99", "nope"],
                 SettableStatus::Done,
             ),
+            crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap_err();
         assert!(err.contains("areas never finish"), "{err}");
@@ -205,6 +300,7 @@ mod tests {
         let out = set_status(
             &mut conn,
             status_args(&["SPOKE-3", "SPOKE-99"], SettableStatus::Dropped),
+            crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
         assert!(out.starts_with("SPOKE-3 dropped  Task"), "{out}");
@@ -220,12 +316,22 @@ mod tests {
         for t in ["One", "Two", "Three"] {
             add(&mut conn, args(Some(2), t, Kind::Task)).unwrap(); // 3, 4, 5
         }
-        let out = set_status(&mut conn, status_args(&["SPOKE-3"], SettableStatus::Done)).unwrap();
+        let out = set_status(
+            &mut conn,
+            status_args(&["SPOKE-3"], SettableStatus::Done),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert_eq!(
             out,
             "SPOKE-3 done  One\nNext step of SPOKE-2 Plan: SPOKE-4 Two"
         );
-        let out = set_status(&mut conn, status_args(&["4", "5"], SettableStatus::Done)).unwrap();
+        let out = set_status(
+            &mut conn,
+            status_args(&["4", "5"], SettableStatus::Done),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert!(out.ends_with("All steps of SPOKE-2 Plan are done. If it is finished too, mark it done with set_status."), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }

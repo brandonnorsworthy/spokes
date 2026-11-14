@@ -81,6 +81,12 @@ pub fn move_node(conn: &mut Connection, args: MoveArgs) -> ToolResult {
             target.id, target.title
         ));
     }
+    if node.recur.is_some() && target.ordered && Some(target.id) != node.parent_id {
+        return Err(super::add::recur_step_error(
+            &target.id.to_string(),
+            &target.title,
+        ));
+    }
 
     let siblings: Vec<Node> = children(&tx, target.id)?
         .into_iter()
@@ -165,6 +171,7 @@ mod tests {
                 status,
                 agent: None,
             },
+            crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
     }

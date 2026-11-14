@@ -6,6 +6,7 @@ use super::{ToolResult, clean_agent, db_err, log_event, renew_leases, require, t
 use crate::db::{now, position};
 use crate::format::parse_date;
 use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID};
+use crate::recur::{RecurArg, RecurChange};
 use crate::tools::args::{AddArgs, NodeSpec};
 
 const MAX_TITLE: usize = 300;
@@ -25,6 +26,8 @@ struct Clean {
     due: Option<String>,
     defer: Option<String>,
     aliases: Option<String>,
+    /// The repeat rule as stored JSON.
+    recur: Option<String>,
     notes: Option<String>,
     children: Vec<Clean>,
 }
@@ -53,6 +56,9 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
             "{} {} is a task; areas can only go under areas. Add a task instead, or pick an area as parent.",
             parent.id, parent.title
         ));
+    }
+    if spec.recur.is_some() && parent.ordered {
+        return Err(recur_step_error(&parent.id.to_string(), &parent.title));
     }
 
     let now = now();
@@ -104,8 +110,8 @@ fn insert(
     };
     tx.execute(
         "INSERT INTO nodes (user_id, parent_id, position, kind, ordered, title, priority,
-                            due_at, defer_until, aliases, created_at, updated_at, touched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)",
+                            due_at, defer_until, aliases, recur, created_at, updated_at, touched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?11, ?11, ?11)",
         params![
             DEFAULT_USER,
             parent.0,
@@ -117,7 +123,8 @@ fn insert(
             spec.due,
             spec.defer,
             spec.aliases,
-            now
+            now,
+            spec.recur
         ],
     )
     .map_err(db_err)?;
@@ -175,6 +182,8 @@ fn clean_spec(
         .map_err(at)?;
     let aliases = clean_aliases(spec.aliases.as_deref().unwrap_or_default()).map_err(at)?;
     let notes = clean_notes(spec.notes.as_deref()).map_err(at)?;
+    let recur = clean_recur(spec.recur.as_ref(), kind).map_err(at)?;
+    let ordered = spec.ordered.unwrap_or(false);
 
     let kids = spec.children.as_deref().unwrap_or_default();
     if !kids.is_empty() && nest >= MAX_NEST {
@@ -196,16 +205,24 @@ fn clean_spec(
                 clean.title
             ));
         }
+        if clean.recur.is_some() && ordered {
+            return Err(format!(
+                "{kid_path} (\"{}\"): {}",
+                clean.title,
+                recur_step_error("its parent", &title)
+            ));
+        }
         children.push(clean);
     }
     Ok(Clean {
         title,
         kind,
-        ordered: spec.ordered.unwrap_or(false),
+        ordered,
         priority,
         due,
         defer,
         aliases,
+        recur,
         notes,
         children,
     })
@@ -281,6 +298,36 @@ pub(crate) fn clean_date(field: &str, raw: &str) -> Result<String, String> {
             "{field} '{raw}' is not a date. Use YYYY-MM-DD, e.g. 2026-11-20."
         )),
     }
+}
+
+/// A repeat rule as stored JSON; areas never finish, so they cannot repeat.
+/// `Some(None)` means "clear it" (only meaningful for update).
+pub(crate) fn clean_recur_change(raw: Option<&RecurArg>) -> Result<Option<Option<String>>, String> {
+    match raw.map(RecurArg::parse).transpose()? {
+        None => Ok(None),
+        Some(RecurChange::Clear) => Ok(Some(None)),
+        Some(RecurChange::Set(rule)) => Ok(Some(Some(rule.to_json()))),
+    }
+}
+
+fn clean_recur(raw: Option<&RecurArg>, kind: Kind) -> Result<Option<String>, String> {
+    let recur = clean_recur_change(raw)?.flatten();
+    if recur.is_some() && kind == Kind::Area {
+        return Err(AREA_RECUR.to_string());
+    }
+    Ok(recur)
+}
+
+pub(crate) const AREA_RECUR: &str =
+    "areas never finish, so they cannot repeat. Put recur on a task under it.";
+
+/// Steps of an ordered parent do not repeat on their own: a step that reset itself
+/// would hold every later step back forever. The parent repeats instead, and its
+/// finished steps reopen with it.
+pub(crate) fn recur_step_error(parent: &str, title: &str) -> String {
+    format!(
+        "{parent} {title} has ordered steps, and a step cannot repeat on its own (it would hold the later steps back). Put recur on {title} instead: when it repeats, its steps reopen."
+    )
 }
 
 /// Aliases are stored newline-separated, as the schema describes.

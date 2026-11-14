@@ -3,7 +3,10 @@
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use super::add::{MAX_NOTES, clean_aliases, clean_date, clean_notes, clean_priority, clean_title};
+use super::add::{
+    AREA_RECUR, MAX_NOTES, clean_aliases, clean_date, clean_notes, clean_priority,
+    clean_recur_change, clean_title, recur_step_error,
+};
 use super::{ToolResult, children, clean_agent, db_err, log_event, renew_leases, require, touch};
 use crate::db::now;
 use crate::model::{Kind, Status};
@@ -65,6 +68,15 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
         ));
         changed.push("aliases");
     }
+    let recur = clean_recur_change(args.recur.as_ref())?;
+    if let Some(r) = &recur {
+        sets.push(("recur", r.clone().map_or(Value::Null, Value::Text)));
+        changed.push(if r.is_some() {
+            "recur"
+        } else {
+            "recur cleared"
+        });
+    }
     let replace_notes = args
         .notes
         .as_deref()
@@ -76,7 +88,7 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     }
     if sets.is_empty() && replace_notes.is_none() && append.is_none() {
         return Err(
-            "nothing to update. Pass at least one field (title, kind, ordered, priority, due, defer_until, aliases, notes, notes_append). To change status use set_status; to reparent use move."
+            "nothing to update. Pass at least one field (title, kind, ordered, priority, due, defer_until, aliases, recur, notes, notes_append). To change status use set_status; to reparent use move."
                 .to_string(),
         );
     }
@@ -88,6 +100,7 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     {
         check_kind_change(&tx, &node, kind)?;
     }
+    check_recur(&tx, &node, args.kind, args.ordered, recur.as_ref())?;
 
     let now = now();
     if !sets.is_empty() {
@@ -166,6 +179,43 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     let title = require(&tx, id)?.title;
     tx.commit().map_err(db_err)?;
     Ok(format!("Updated {id}  {title}  ({detail})"))
+}
+
+/// Only tasks repeat, and never as a step of an ordered parent (see `recur_step_error`).
+fn check_recur(
+    conn: &Connection,
+    node: &crate::model::Node,
+    kind: Option<Kind>,
+    ordered: Option<bool>,
+    recur: Option<&Option<String>>,
+) -> Result<(), String> {
+    let repeats = match recur {
+        Some(r) => r.is_some(),
+        None => node.recur.is_some(),
+    };
+    if repeats && kind.unwrap_or(node.kind) == Kind::Area {
+        return Err(format!("{} {}: {AREA_RECUR}", node.id, node.title));
+    }
+    if matches!(recur, Some(Some(_)))
+        && let Some(pid) = node.parent_id
+    {
+        let parent = require(conn, pid)?;
+        if parent.ordered {
+            return Err(recur_step_error(&parent.id.to_string(), &parent.title));
+        }
+    }
+    if ordered == Some(true)
+        && !node.ordered
+        && let Some(kid) = children(conn, node.id)?
+            .into_iter()
+            .find(|c| c.recur.is_some() && !c.status.is_closed())
+    {
+        return Err(format!(
+            "{} {} repeats, and steps of an ordered parent cannot repeat on their own. Stop it repeating (update recur \"\") or leave {} unordered.",
+            kid.id, kid.title, node.id
+        ));
+    }
+    Ok(())
 }
 
 /// Areas live only under areas, and areas never finish.
@@ -274,6 +324,7 @@ mod tests {
                 status,
                 agent: None,
             },
+            crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
     }

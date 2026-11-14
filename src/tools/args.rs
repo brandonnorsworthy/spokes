@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::model::{IdArg, Kind, NumArg, SettableStatus};
+use crate::recur::RecurArg;
 
 /// One node to create, with optional nested children (a whole plan in one call).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -25,6 +26,8 @@ pub struct NodeSpec {
     pub defer_until: Option<String>,
     /// 2 to 5 other phrases this could be searched by: synonyms, plain spelling, what you'd call it out loud.
     pub aliases: Option<Vec<String>>,
+    /// Repeat rule for a task, e.g. {"every": 2, "unit": "week", "from": "completion"} or "every 2 weeks". from "schedule" counts from the due date (bills). Marking it done resets it with the next due date.
+    pub recur: Option<RecurArg>,
     /// Longer body: plan, research, links. Never shown in listings.
     pub notes: Option<String>,
     /// Nodes to create beneath this one, in order. Each takes the same fields (title, kind, ordered, notes, children...).
@@ -101,6 +104,8 @@ pub struct UpdateArgs {
     pub defer_until: Option<String>,
     /// Replaces all aliases; [] clears them.
     pub aliases: Option<Vec<String>>,
+    /// Repeat rule, e.g. {"every": 1, "unit": "month", "from": "schedule"} or "every 2 weeks"; "" stops it repeating.
+    pub recur: Option<RecurArg>,
     /// Replaces the whole notes body; "" clears it. To add to it, use notes_append instead.
     pub notes: Option<String>,
     /// Text appended to the end of the notes (e.g. what you did, findings).

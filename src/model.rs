@@ -198,6 +198,8 @@ pub struct Node {
     pub claim_expires: Option<String>,
     /// Set by `answer`; cleared when the task is claimed, asked again or closed.
     pub answered_at: Option<String>,
+    /// Repeat rule as stored JSON (see [`crate::recur::Rule`]); `None` = one-off.
+    pub recur: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Last activity on the node or anything beneath it (bubbles up).

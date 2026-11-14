@@ -12,8 +12,16 @@ use tracing_subscriber::util::SubscriberInitExt;
 async fn main() -> ExitCode {
     // `spokes healthcheck` probes /health on the configured port (for Docker HEALTHCHECK,
     // since the runtime image has no shell or curl).
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        return healthcheck();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("healthcheck") => return healthcheck(),
+        Some("backup") if args.len() == 2 => return cli_backup(&args[1]),
+        Some("restore") if args.len() == 2 => return cli_restore(&args[1]),
+        None => {}
+        Some(_) => {
+            eprintln!("usage: spokes [healthcheck | backup <dir-or-file> | restore <backup-file>]");
+            return ExitCode::from(2);
+        }
     }
     let level = std::env::var("SPOKES_LOG")
         .ok()
@@ -74,10 +82,8 @@ async fn shutdown_signal() {
     }
 }
 
-fn healthcheck() -> ExitCode {
-    let Ok(config) = Config::from_env() else {
-        return ExitCode::FAILURE;
-    };
+/// Probes /health on the configured address; true if it answers 200.
+fn server_running(config: &Config) -> bool {
     let mut addr = config.bind;
     if addr.ip().is_unspecified() {
         addr = SocketAddr::from(([127, 0, 0, 1], addr.port()));
@@ -93,8 +99,51 @@ fn healthcheck() -> ExitCode {
         stream.read_to_string(&mut response)?;
         Ok(response.starts_with("HTTP/1.1 200"))
     };
-    match probe() {
-        Ok(true) => ExitCode::SUCCESS,
+    probe().unwrap_or(false)
+}
+
+fn healthcheck() -> ExitCode {
+    match Config::from_env() {
+        Ok(config) if server_running(&config) => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
+    }
+}
+
+fn cli_backup(target: &str) -> ExitCode {
+    let run = || -> anyhow::Result<()> {
+        let config = Config::from_env()?;
+        let target = std::path::Path::new(target);
+        let dest = if target.is_dir() {
+            target.join(spokes::backup::backup_file_name())
+        } else {
+            target.to_path_buf()
+        };
+        let bytes = spokes::backup::write_backup(&config.db_path, &dest)?;
+        println!("{} ({bytes} bytes)", dest.display());
+        Ok(())
+    };
+    finish(run())
+}
+
+fn cli_restore(backup: &str) -> ExitCode {
+    let run = || -> anyhow::Result<()> {
+        let config = Config::from_env()?;
+        if server_running(&config) {
+            anyhow::bail!("spokes is running on {}; stop it first", config.bind);
+        }
+        let msg = spokes::backup::restore(std::path::Path::new(backup), &config.db_path)?;
+        println!("{msg}");
+        Ok(())
+    };
+    finish(run())
+}
+
+fn finish(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }

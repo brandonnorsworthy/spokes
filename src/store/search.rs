@@ -13,7 +13,7 @@ use rusqlite::{Connection, params};
 
 use super::focus::focus_numbers;
 use super::{ToolResult, db_err, require};
-use crate::format::{due_flag, is_unplanned, progress};
+use crate::format::{due_flag, is_unplanned, parse_date, progress, short_date};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
 use crate::text::{keywords, match_strength, normalize, trigrams};
 use crate::tools::args::SearchArgs;
@@ -190,6 +190,14 @@ fn result_line(
     }
     if let Some(due) = &node.due_at {
         flags.push(due_flag(due, today));
+    }
+    if let Some(defer) = node.defer_until.as_deref()
+        && parse_date(defer).is_some_and(|d| d > today)
+    {
+        flags.push(format!("deferred until {}", short_date(defer, today)));
+    }
+    if node.recur.is_some() {
+        flags.push("repeats".to_string());
     }
     if let Some(p) = progress(node) {
         flags.push(p);

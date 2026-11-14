@@ -112,9 +112,11 @@ pub fn progress(node: &Node) -> Option<String> {
 }
 
 /// A task with no children and no notes needs research before work. A step of an
-/// ordered task is already part of a written plan, so it is not flagged.
+/// ordered task is already part of a written plan, and a repeating chore is routine,
+/// so neither is flagged.
 pub fn is_unplanned(node: &Node) -> bool {
     node.kind == Kind::Task
+        && node.recur.is_none()
         && !node.status.is_closed()
         && node.child_total == 0
         && !node.has_notes
@@ -147,7 +149,10 @@ fn detail_flags(node: &Node, today: NaiveDate, parent_due: Option<&str>, out: &m
     if let Some(defer) = &node.defer_until
         && parse_date(defer).is_some_and(|d| d > today)
     {
-        out.push(format!("after {}", short_date(defer, today)));
+        out.push(format!("deferred until {}", short_date(defer, today)));
+    }
+    if node.recur.is_some() {
+        out.push("repeats".to_string());
     }
     if node.ordered {
         out.push("ordered".to_string());
@@ -181,6 +186,11 @@ pub fn child_line(node: &Node, today: NaiveDate, parent_due: Option<&str>) -> St
         Kind::Area => flags.push(format!("area {}", node.status.as_str())),
         Kind::Task => flags.push(node.status.as_str().to_string()),
     }
+    if node.status == Status::InProgress
+        && let Some(who) = &node.claimed_by
+    {
+        flags.push(format!("by {who}"));
+    }
     detail_flags(node, today, parent_due, &mut flags);
     format!("{}  {}", flags.join(" "), node.title)
 }
@@ -207,6 +217,7 @@ mod tests {
             claimed_by: None,
             claim_expires: None,
             answered_at: None,
+            recur: None,
             created_at: "2026-11-01T00:00:00Z".into(),
             updated_at: "2026-11-01T00:00:00Z".into(),
             touched_at: "2026-11-01T00:00:00Z".into(),

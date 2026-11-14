@@ -27,6 +27,11 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// The newest schema version this build knows (what `PRAGMA user_version` is after migrating).
+pub fn schema_version() -> i64 {
+    migrations::latest()
+}
+
 fn configure(conn: &Connection) -> anyhow::Result<()> {
     // journal_mode returns a row, so it goes through query_row.
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;

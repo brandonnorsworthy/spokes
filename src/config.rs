@@ -21,7 +21,24 @@ pub struct Config {
     /// `SPOKES_TZ`: IANA time zone name (e.g. `America/Chicago`), default `UTC`. Decides
     /// what "today" means for due dates and deferrals.
     pub tz: chrono_tz::Tz,
+    /// Nightly backups of the database file; `None` when `SPOKES_BACKUP_DIR` is unset.
+    pub backup: Option<BackupConfig>,
 }
+
+/// The in-process backup timer (the one scheduled job in spokes).
+#[derive(Debug, Clone)]
+pub struct BackupConfig {
+    /// `SPOKES_BACKUP_DIR`: where backup files go (created if missing).
+    pub dir: PathBuf,
+    /// `SPOKES_BACKUP_KEEP`: how many backup files to keep, default 14 (at least 1).
+    pub keep: usize,
+    /// `SPOKES_BACKUP_INTERVAL_SECS`: seconds between backups, default one day.
+    /// Test-only: shorten it to see a backup happen without waiting a day.
+    pub interval: std::time::Duration,
+}
+
+pub const DEFAULT_BACKUP_KEEP: usize = 14;
+pub const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
@@ -52,12 +69,41 @@ impl Config {
                 "SPOKES_TZ '{tz}' is not an IANA time zone name, e.g. America/Chicago or UTC"
             )
         })?;
+        let backup = match get("SPOKES_BACKUP_DIR") {
+            None => None,
+            Some(dir) => {
+                let keep = match get("SPOKES_BACKUP_KEEP") {
+                    None => DEFAULT_BACKUP_KEEP,
+                    Some(k) => match k.trim().parse::<usize>() {
+                        Ok(n) if n >= 1 => n,
+                        _ => anyhow::bail!(
+                            "SPOKES_BACKUP_KEEP '{k}' must be a whole number, 1 or more"
+                        ),
+                    },
+                };
+                let secs = match get("SPOKES_BACKUP_INTERVAL_SECS") {
+                    None => DEFAULT_BACKUP_INTERVAL_SECS,
+                    Some(v) => match v.trim().parse::<u64>() {
+                        Ok(n) if n >= 1 => n,
+                        _ => anyhow::bail!(
+                            "SPOKES_BACKUP_INTERVAL_SECS '{v}' must be a whole number of seconds, 1 or more"
+                        ),
+                    },
+                };
+                Some(BackupConfig {
+                    dir: PathBuf::from(dir.trim()),
+                    keep,
+                    interval: std::time::Duration::from_secs(secs),
+                })
+            }
+        };
         Ok(Config {
             bind,
             db_path,
             allowed_hosts,
             allowed_origins,
             tz,
+            backup,
         })
     }
 }

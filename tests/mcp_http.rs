@@ -35,6 +35,7 @@ async fn start_tz(db_path: &Path, tz: chrono_tz::Tz) -> Server {
         allowed_hosts: None,
         allowed_origins: Vec::new(),
         tz,
+        backup: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -1537,17 +1538,30 @@ async fn claim_rules_and_lease_renewal_over_http() {
     .await;
     assert!(e.starts_with("lease_minutes must be 1 to 1440"), "{e}");
 
-    // A claimed project hides its whole subtree; others cannot claim inside it, the
-    // holder can (an orchestrator taking a step itself).
+    // A claimed project hides its whole subtree. The orchestrator pattern: red holds the
+    // project, a worker (blue) claims a step inside it under its own label. The step
+    // stays hidden from next (its ancestor is claimed); get shows the worker's claim.
     mcp.ok("claim", json!({"id": 3, "agent": "red"})).await;
     let q = mcp.ok("next", json!({})).await;
     assert!(!q.contains("Garage") && !q.contains("Clear"), "{q}");
-    let e = err(&mcp, "claim", json!({"id": 4, "agent": "blue"})).await;
+    let c = mcp.ok("claim", json!({"id": 4, "agent": "blue"})).await;
     assert!(
-        e.starts_with("SPOKE-4 is inside SPOKE-3 Garage, which is claimed by red until "),
-        "{e}"
+        c.starts_with("Claimed SPOKE-4 Clear for blue until ")
+            && c.contains("It is a step of SPOKE-3 Garage, which red holds as the orchestrator."),
+        "{c}"
     );
-    mcp.ok("claim", json!({"id": 4, "agent": "red"})).await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(!q.contains("Clear"), "{q}");
+    let g = mcp.ok("get", json!({"id": 4})).await;
+    assert!(g.contains("\nclaimed by blue until "), "{g}");
+    let g = mcp.ok("get", json!({"id": 3})).await;
+    assert!(g.contains("SPOKE-4 in_progress by blue  Clear"), "{g}");
+    // A node someone else holds directly is still refused, to the orchestrator too.
+    let e = err(&mcp, "claim", json!({"id": 4, "agent": "red"})).await;
+    assert!(e.starts_with("SPOKE-4 is claimed by blue until "), "{e}");
+    // The holder can still claim a free step of its own project.
+    mcp.ok("claim", json!({"id": 5, "agent": "red"})).await;
+    mcp.ok("release", json!({"id": 5, "agent": "red"})).await;
 
     // A step claimed by one agent blocks another from claiming its parent.
     mcp.ok("claim", json!({"id": 7, "agent": "blue"})).await;
@@ -1557,10 +1571,16 @@ async fn claim_rules_and_lease_renewal_over_http() {
         "{e}"
     );
 
-    // Any write by the holder on the node or beneath it renews the lease; others' don't.
+    // Writes renew the writer's own claims only: the worker's on the step, the
+    // orchestrator's on the project.
     let conn = db(&path);
     let soon = (chrono::Utc::now() + chrono::Duration::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let left = |id: &str| {
+        (chrono::DateTime::parse_from_rfc3339(&claim_expires(&conn, id)).unwrap()
+            - chrono::Utc::now().fixed_offset())
+        .num_minutes()
+    };
     conn.execute(
         "UPDATE nodes SET claim_expires = ?1 WHERE id IN (3, 4)",
         [&soon],
@@ -1571,17 +1591,17 @@ async fn claim_rules_and_lease_renewal_over_http() {
         json!({"id": 4, "notes_append": "half done", "agent": "blue"}),
     )
     .await;
-    assert_eq!(claim_expires(&conn, "SPOKE-4"), soon);
+    assert!(left("SPOKE-4") >= 58, "worker renewed");
+    assert_eq!(claim_expires(&conn, "SPOKE-3"), soon);
+    conn.execute("UPDATE nodes SET claim_expires = ?1 WHERE id = 4", [&soon])
+        .unwrap();
     mcp.ok(
         "update",
-        json!({"id": 4, "notes_append": "cleared", "agent": "red"}),
+        json!({"id": 4, "notes_append": "checked", "agent": "red"}),
     )
     .await;
-    for id in ["SPOKE-3", "SPOKE-4"] {
-        let left = chrono::DateTime::parse_from_rfc3339(&claim_expires(&conn, id)).unwrap()
-            - chrono::Utc::now().fixed_offset();
-        assert!(left.num_minutes() >= 58, "{id}: {left}");
-    }
+    assert!(left("SPOKE-3") >= 58, "orchestrator renewed");
+    assert_eq!(claim_expires(&conn, "SPOKE-4"), soon);
     // add, move, focus and set_status renew too (here: on the parent project).
     for (tool, args) in [
         (
@@ -1939,6 +1959,445 @@ async fn project_with_all_steps_claimed_is_not_offered_over_http() {
         .await;
     mcp.ok("claim", json!({"id": 5, "agent": "opus-red"})).await;
     assert_eq!(listed_ids(&mcp.ok("next", json!({})).await), ["SPOKE-6"]);
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// M4: recurrence, defer_until, staleness, local times in history.
+// ---------------------------------------------------------------------------
+
+fn node_dates(conn: &rusqlite::Connection, id: &str) -> (String, Option<String>, Option<String>) {
+    let n: i64 = id.trim_start_matches("SPOKE-").parse().unwrap();
+    conn.query_row(
+        "SELECT status, due_at, defer_until FROM nodes WHERE id = ?1",
+        [n],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn recurrence_over_http() {
+    let dir = temp_dir("recur");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+    let today = chrono::Utc::now().date_naive();
+    let days = |n: i64| today + chrono::Duration::days(n);
+
+    let home = add_node(&mcp, json!({"title": "Home", "kind": "area"})).await;
+    let conn = db(&path);
+    add_node(&mcp, json!({"parent": home, "title": "Something else"})).await;
+
+    // From completion: every 2 weeks, back 3 days before it is due.
+    let oil = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Check oil",
+               "recur": {"every": 2, "unit": "week", "from": "completion"}}),
+    )
+    .await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(line_with(&q, "Check oil").contains("repeats"), "{q}");
+    mcp.ok("claim", json!({"id": oil, "agent": "red"})).await;
+    let out = mcp
+        .ok(
+            "set_status",
+            json!({"ids": [oil], "status": "done", "agent": "red"}),
+        )
+        .await;
+    assert_eq!(
+        out,
+        format!(
+            "{oil} done  Check oil  (repeats every 2 weeks, counted from completion: back in the queue {}, due {})",
+            short(days(11), today),
+            short(days(14), today)
+        )
+    );
+    assert_eq!(
+        node_dates(&conn, &oil),
+        ("open".into(), Some(iso(days(14))), Some(iso(days(11))))
+    );
+    let claimed: Option<String> = conn
+        .query_row(
+            "SELECT claimed_by FROM nodes WHERE id = ?1",
+            [oil.trim_start_matches("SPOKE-")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed, None, "claim cleared");
+    let q = mcp.ok("next", json!({})).await;
+    assert!(!q.contains("Check oil"), "deferred until relevant: {q}");
+    let g = mcp.ok("get", json!({"id": oil, "history": true})).await;
+    assert!(
+        g.starts_with(&format!(
+            "{oil} task due {} deferred until {} repeats  Check oil",
+            short(days(14), today),
+            short(days(11), today)
+        )),
+        "{g}"
+    );
+    assert!(
+        g.contains("\nrepeats every 2 weeks, counted from completion"),
+        "{g}"
+    );
+    assert!(
+        g.contains(" recurred by red: in_progress -> done -> open; next due "),
+        "{g}"
+    );
+    assert!(events(&conn, &oil).iter().any(|e| e.0 == "recurred"));
+
+    // From schedule, month ends clamp and the day-of-month anchor is kept.
+    let rent = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Pay rent", "due": "2027-01-31",
+               "recur": "every month from schedule"}),
+    )
+    .await;
+    mcp.ok("set_status", json!({"ids": [rent], "status": "done"}))
+        .await;
+    assert_eq!(
+        node_dates(&conn, &rent),
+        (
+            "open".into(),
+            Some("2027-02-28".into()),
+            Some("2027-02-21".into())
+        )
+    );
+    let out = mcp
+        .ok("set_status", json!({"ids": [rent], "status": "done"}))
+        .await;
+    assert!(out.contains("counted from the due date"), "{out}");
+    assert_eq!(
+        node_dates(&conn, &rent),
+        (
+            "open".into(),
+            Some("2027-03-31".into()),
+            Some("2027-03-24".into())
+        )
+    );
+
+    // A late completion of a schedule rule skips the periods gone by.
+    let bin = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Bins", "due": iso(days(-10)),
+               "recur": {"every": 1, "unit": "week", "from": "schedule"}}),
+    )
+    .await;
+    mcp.ok("set_status", json!({"ids": [bin], "status": "done"}))
+        .await;
+    let (_, due, _) = node_dates(&conn, &bin);
+    let due = chrono::NaiveDate::parse_from_str(&due.unwrap(), "%Y-%m-%d").unwrap();
+    assert!(due > today && due <= days(7), "{due}");
+
+    // A repeating checklist: its finished steps reopen with it.
+    let review = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Weekly review", "recur": "weekly",
+               "children": [{"title": "Inbox zero"}, {"title": "Plan week"}]}),
+    )
+    .await;
+    let step = mcp.ok("get", json!({"id": review})).await;
+    let inbox = first_id(line_with(&step, "Inbox zero"));
+    mcp.ok("set_status", json!({"ids": [inbox], "status": "done"}))
+        .await;
+    let out = mcp
+        .ok("set_status", json!({"ids": [review], "status": "done"}))
+        .await;
+    assert!(out.ends_with("Its 1 finished steps were reopened"), "{out}");
+    assert_eq!(node_dates(&conn, &inbox).0, "open");
+
+    // Dropping ends it.
+    let out = mcp
+        .ok("set_status", json!({"ids": [review], "status": "dropped"}))
+        .await;
+    assert_eq!(
+        out,
+        format!("{review} dropped  Weekly review  (it stops repeating)")
+    );
+
+    // Rules: areas never repeat; steps of an ordered parent do not repeat on their own.
+    let e = err(
+        &mcp,
+        "add",
+        json!({"title": "Garden", "kind": "area", "recur": "weekly"}),
+    )
+    .await;
+    assert!(
+        e.contains("areas never finish, so they cannot repeat"),
+        "{e}"
+    );
+    let e = err(
+        &mcp,
+        "add",
+        json!({"title": "Oil", "recur": "every fortnight"}),
+    )
+    .await;
+    assert!(e.contains("is not day, week, month or year"), "{e}");
+    let e = err(
+        &mcp,
+        "add",
+        json!({"title": "Plan", "ordered": true, "children": [{"title": "S1", "recur": "daily"}]}),
+    )
+    .await;
+    assert!(
+        e.starts_with("children[0] (\"S1\"): its parent Plan has ordered steps"),
+        "{e}"
+    );
+    let plan = add_node(
+        &mcp,
+        json!({"title": "Pipeline", "ordered": true, "children": [{"title": "A"}]}),
+    )
+    .await;
+    let e = err(
+        &mcp,
+        "add",
+        json!({"parent": plan, "title": "B", "recur": "daily"}),
+    )
+    .await;
+    assert!(e.contains("Put recur on Pipeline instead"), "{e}");
+    let bag = add_node(
+        &mcp,
+        json!({"title": "Bag", "children": [{"title": "Loop", "recur": "daily"}]}),
+    )
+    .await;
+    let e = err(&mcp, "update", json!({"id": bag, "ordered": true})).await;
+    assert!(e.contains("Loop repeats"), "{e}");
+    let g = mcp.ok("get", json!({"id": bag})).await;
+    let looped = first_id(line_with(&g, "Loop"));
+    let e = err(&mcp, "move", json!({"id": looped, "parent": plan})).await;
+    assert!(e.contains("has ordered steps"), "{e}");
+    let out = mcp.ok("update", json!({"id": looped, "recur": ""})).await;
+    assert!(out.ends_with("(recur cleared)"), "{out}");
+    mcp.ok("update", json!({"id": bag, "ordered": true})).await;
+    let out = mcp
+        .ok("set_status", json!({"ids": [looped], "status": "done"}))
+        .await;
+    assert!(
+        out.starts_with(&format!("{looped} done  Loop")) && !out.contains("repeats"),
+        "{out}"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn defer_until_over_http() {
+    let dir = temp_dir("defer");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+    let today = chrono::Utc::now().date_naive();
+    let later = iso(today + chrono::Duration::days(3));
+
+    let home = add_node(&mcp, json!({"title": "Home", "kind": "area"})).await;
+    // An ordered project whose first step is deferred offers nothing yet.
+    let proj = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Paint", "ordered": true,
+               "children": [{"title": "Buy paint", "defer_until": later}, {"title": "Paint wall"}]}),
+    )
+    .await;
+    let solo = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Later thing", "defer_until": later}),
+    )
+    .await;
+    add_node(&mcp, json!({"parent": home, "title": "Now thing"})).await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(
+        !q.contains("Paint") && !q.contains("Later thing") && q.contains("Now thing"),
+        "{q}"
+    );
+    let g = mcp.ok("get", json!({"id": proj})).await;
+    assert!(!g.contains("<- next"), "{g}");
+    assert!(
+        g.contains(&format!(
+            "deferred until {}",
+            short(today + chrono::Duration::days(3), today)
+        )),
+        "{g}"
+    );
+    // A question on a deferred task still reaches the user.
+    mcp.ok(
+        "ask",
+        json!({"id": solo, "agent": "red", "question": "Which color?"}),
+    )
+    .await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(line_with(&q, "Later thing").contains("waiting"), "{q}");
+    // Clearing the deferral brings it back.
+    mcp.ok("update", json!({"id": proj, "defer_until": ""}))
+        .await;
+    let g = mcp.ok("get", json!({"id": proj})).await;
+    let buy = first_id(line_with(&g, "Buy paint"));
+    mcp.ok("update", json!({"id": buy, "defer_until": ""}))
+        .await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(
+        line_with(&q, "Paint").contains(&format!("next: {buy} Buy paint")),
+        "{q}"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn staleness_over_http() {
+    let dir = temp_dir("stale");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+    let today = chrono::Utc::now().date_naive();
+
+    let home = add_node(&mcp, json!({"title": "Home", "kind": "area"})).await;
+    let conn = db(&path);
+    let mut ids = Vec::new();
+    for t in [
+        "Fresh",
+        "Aged 35",
+        "Aged 50",
+        "Aged 60",
+        "Aged 41",
+        "Project 45",
+    ] {
+        ids.push(add_node(&mcp, json!({"parent": home, "title": t})).await);
+    }
+    let deferred = add_node(
+        &mcp,
+        json!({"parent": home, "title": "Deferred 90",
+               "defer_until": iso(today + chrono::Duration::days(5))}),
+    )
+    .await;
+    let age = |id: &str, d: i64| {
+        let n: i64 = id.trim_start_matches("SPOKE-").parse().unwrap();
+        conn.execute(
+            "UPDATE nodes SET touched_at = ?1 WHERE id = ?2",
+            rusqlite::params![ts_ago(d * 24 * 60), n],
+        )
+        .unwrap();
+    };
+    // The area is old too, but areas are never stale.
+    age(&home, 400);
+    for (id, d) in ids.iter().zip([0, 35, 50, 60, 41, 45]) {
+        age(id, d);
+    }
+    age(&deferred, 90);
+    let q = mcp.ok("next", json!({"limit": 1})).await;
+    // UP NEXT shows Fresh (oldest created first); STALE the three oldest of the rest.
+    assert!(q.contains("UP NEXT\n"), "{q}");
+    let stale = &q[pos(&q, "STALE\n")..];
+    let lines: Vec<&str> = stale
+        .lines()
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .collect();
+    assert_eq!(lines.len(), 3, "{q}");
+    assert!(
+        lines[0].contains("untouched 60d") && lines[0].ends_with("Aged 60"),
+        "{q}"
+    );
+    assert!(
+        lines[1].contains("untouched 50d") && lines[1].ends_with("Aged 50"),
+        "{q}"
+    );
+    assert!(
+        lines[2].contains("untouched 45d") && lines[2].ends_with("Project 45"),
+        "{q}"
+    );
+    assert!(!q.contains("Deferred 90"), "{q}");
+
+    // Activity beneath a project touches it; deferring or dropping stops the nudge.
+    add_node(&mcp, json!({"parent": ids[5], "title": "First step"})).await;
+    mcp.ok(
+        "update",
+        json!({"id": ids[3], "defer_until": iso(today + chrono::Duration::days(30))}),
+    )
+    .await;
+    mcp.ok("set_status", json!({"ids": [ids[2]], "status": "dropped"}))
+        .await;
+    let q = mcp.ok("next", json!({"limit": 1})).await;
+    let stale = &q[pos(&q, "STALE\n")..];
+    let lines: Vec<&str> = stale
+        .lines()
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .collect();
+    assert_eq!(lines.len(), 2, "{q}");
+    assert!(
+        lines[0].contains("untouched 41d") && lines[0].ends_with("Aged 41"),
+        "{q}"
+    );
+    assert!(
+        lines[1].contains("untouched 35d") && lines[1].ends_with("Aged 35"),
+        "{q}"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn orchestrator_workers_and_local_history_over_http() {
+    let dir = temp_dir("orchestrator");
+    let path = dir.join("spokes.db");
+    let tz: chrono_tz::Tz = "America/Chicago".parse().unwrap();
+    let server = start_tz(&path, tz).await;
+    let mcp = Mcp::new(server.addr);
+
+    let proj = add_node(
+        &mcp,
+        json!({"title": "Deploy", "children": [{"title": "Secrets"}, {"title": "Docs"}]}),
+    )
+    .await;
+    mcp.ok("claim", json!({"id": proj, "agent": "opus"})).await;
+    let g = mcp.ok("get", json!({"id": proj})).await;
+    let secrets = first_id(line_with(&g, "Secrets"));
+    let docs = first_id(line_with(&g, "Docs"));
+    mcp.ok("claim", json!({"id": secrets, "agent": "sonnet-1"}))
+        .await;
+    mcp.ok("claim", json!({"id": docs, "agent": "sonnet-2"}))
+        .await;
+    // The orchestrator cannot be claimed over by a worker, nor can a worker's step.
+    let e = err(&mcp, "claim", json!({"id": proj, "agent": "sonnet-1"})).await;
+    assert!(
+        e.starts_with(&format!("{proj} is claimed by opus until ")),
+        "{e}"
+    );
+    let e = err(&mcp, "claim", json!({"id": docs, "agent": "sonnet-1"})).await;
+    assert!(
+        e.starts_with(&format!("{docs} is claimed by sonnet-2 until ")),
+        "{e}"
+    );
+    // A worker's question surfaces under NEEDS YOU although the project is claimed.
+    mcp.ok(
+        "ask",
+        json!({"id": secrets, "agent": "sonnet-1", "question": "Which vault?"}),
+    )
+    .await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(line_with(&q, "Secrets").contains("waiting"), "{q}");
+    assert!(!q.contains("Docs"), "{q}");
+    mcp.ok(
+        "set_status",
+        json!({"ids": [docs], "status": "done", "agent": "sonnet-2"}),
+    )
+    .await;
+
+    // History details show times in SPOKES_TZ, not raw UTC.
+    let h = mcp.ok("get", json!({"id": proj, "history": true})).await;
+    let line = line_with(&h, "claimed by opus: until ");
+    assert!(!line.contains('T') || !line.contains('Z'), "{line}");
+    let until = line.rsplit("until ").next().unwrap();
+    assert!(
+        until.len() == 5 || until.contains(' '),
+        "wall-clock time expected: {line}"
+    );
+    let h = mcp.ok("get", json!({"id": docs, "history": true})).await;
+    assert!(!h.contains(":00Z") && !h.chars().any(|c| c == 'Z'), "{h}");
+
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }

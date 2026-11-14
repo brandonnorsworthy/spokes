@@ -25,8 +25,10 @@ const MAX_LEASE_MINUTES: i64 = 24 * 60;
 const MAX_QUESTION: usize = 1000;
 
 /// The atomic claim. Wins only if the node is a claimable task (open, or already ours,
-/// or a claim whose lease has run out) and no other agent holds a live claim on an
-/// ancestor or a descendant. ?1 id, ?2 agent, ?3 now, ?4 new lease end.
+/// or a claim whose lease has run out) and no other agent holds a live claim on a
+/// descendant. A claim inside another agent's claimed project is allowed: that is the
+/// orchestrator pattern (the orchestrator claims the project, each worker claims its
+/// own step). ?1 id, ?2 agent, ?3 now, ?4 new lease end.
 const CLAIM_SQL: &str = "
 UPDATE nodes
    SET status = 'in_progress', claimed_by = ?2, claim_expires = ?4,
@@ -35,13 +37,6 @@ UPDATE nodes
    AND (status = 'open'
         OR (status = 'in_progress'
             AND (claimed_by = ?2 OR claim_expires IS NULL OR claim_expires <= ?3)))
-   AND NOT EXISTS (
-       WITH RECURSIVE up(id) AS (
-         SELECT parent_id FROM nodes WHERE id = ?1
-         UNION ALL
-         SELECT n.parent_id FROM nodes n JOIN up ON n.id = up.id WHERE n.parent_id IS NOT NULL)
-       SELECT 1 FROM nodes a JOIN up ON a.id = up.id
-        WHERE a.status = 'in_progress' AND a.claimed_by != ?2 AND a.claim_expires > ?3)
    AND NOT EXISTS (
        WITH RECURSIVE down(id) AS (
          SELECT id FROM nodes WHERE parent_id = ?1
@@ -114,6 +109,18 @@ pub fn claim(conn: &mut Connection, args: ClaimArgs, tz: Tz) -> ToolResult {
             ),
         ),
     };
+    if let Some(a) = ancestors(&tx, id)?
+        .into_iter()
+        .rev()
+        .find(|a| live_other(a, &agent, &now))
+    {
+        reply.push_str(&format!(
+            " It is a step of {} {}, which {} holds as the orchestrator.",
+            a.id,
+            a.title,
+            a.claimed_by.as_deref().unwrap_or("another agent")
+        ));
+    }
     if before.answered_at.is_some() {
         reply.push_str(" The user answered a question on it: read the notes (get notes: true).");
     } else if before.has_notes && before.status != Status::InProgress {
@@ -161,19 +168,6 @@ fn refusal(
     }
     if let Some(line) = held_by_other(node, agent, now, tz) {
         return Ok(line);
-    }
-    if let Some(a) = ancestors(conn, id)?
-        .into_iter()
-        .rev()
-        .find(|a| live_other(a, agent, now))
-    {
-        return Ok(format!(
-            "{id} is inside {} {}, which is claimed by {} until {}. Pick another task, or ask the user.",
-            a.id,
-            a.title,
-            a.claimed_by.as_deref().unwrap_or("another agent"),
-            clock(a.claim_expires.as_deref().unwrap_or(""), tz)
-        ));
     }
     let below: Option<(i64, String, String, String)> = conn
         .query_row(
