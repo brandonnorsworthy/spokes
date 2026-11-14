@@ -2,7 +2,9 @@
 
 use rusqlite::{Connection, params};
 
-use super::{ToolResult, children, clean_agent, db_err, load, log_event, require, touch};
+use super::{
+    ToolResult, children, clean_agent, db_err, load, log_event, renew_leases, require, touch,
+};
 use crate::db::now;
 use crate::model::{Kind, Node, NodeId, Status};
 use crate::tools::args::SetStatusArgs;
@@ -129,7 +131,7 @@ fn change_one(
     // takes it off the focus list, which keeps that list short by itself.
     conn.execute(
         "UPDATE nodes SET status = ?1, completed_at = ?2, claimed_by = NULL, claim_expires = NULL,
-                          waiting_on = NULL, updated_at = ?3,
+                          waiting_on = NULL, answered_at = NULL, updated_at = ?3,
                           focus_rank = CASE WHEN ?1 IN ('done', 'dropped') THEN NULL ELSE focus_rank END
          WHERE id = ?4",
         params![target.as_str(), completed_at, now, id.0],
@@ -138,6 +140,7 @@ fn change_one(
     let detail = format!("{} -> {}", node.status.as_str(), target.as_str());
     log_event(conn, id, now, agent, "status", &detail).map_err(db_err)?;
     touch(conn, id, now).map_err(db_err)?;
+    renew_leases(conn, id, agent, now).map_err(db_err)?;
     Ok(Outcome::Changed(Box::new(node)))
 }
 

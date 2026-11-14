@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::{ToolResult, clean_agent, db_err, log_event, require, touch};
+use super::{ToolResult, clean_agent, db_err, log_event, renew_leases, require, touch};
 use crate::db::{now, position};
 use crate::format::parse_date;
 use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID};
@@ -60,6 +60,7 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
     insert(&tx, parent_id, &spec, &now, agent.as_deref(), &mut ids)?;
     let top = ids[0];
     touch(&tx, ids[ids.len() - 1], &now).map_err(db_err)?;
+    renew_leases(&tx, parent_id, agent.as_deref(), &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
 
     let mut line = format!(

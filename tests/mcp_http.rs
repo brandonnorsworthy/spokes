@@ -176,10 +176,14 @@ async fn walking_skeleton_over_http() {
         names,
         [
             "add",
+            "answer",
+            "ask",
+            "claim",
             "focus",
             "get",
             "move",
             "next",
+            "release",
             "search",
             "set_status",
             "update"
@@ -858,14 +862,17 @@ async fn priority_inheritance_over_http() {
         assert!(!out.contains(hidden), "{hidden}: {out}");
     }
 
-    // Raising the ordered task's first step makes it a work item; later steps stay blocked.
+    // Raising the ordered task's first step makes it a work item, but its parent's line
+    // (p1, higher up) already points at it, so it is not listed twice. Later steps stay
+    // blocked.
     mcp.ok("update", json!({"id": "SPOKE-9", "priority": 4}))
         .await;
     mcp.ok("update", json!({"id": "SPOKE-10", "due": "2099-01-02"}))
         .await;
     let out = mcp.ok("next", json!({"limit": 50})).await;
+    assert_eq!(out.matches("Step one").count(), 1, "{out}");
     assert!(
-        out.contains("SPOKE-9   p4                 Step one\n"),
+        out.contains("Pipeline (0/2)  next: SPOKE-9 Step one"),
         "{out}"
     );
     assert!(!out.contains("Step two"), "{out}");
@@ -1293,5 +1300,645 @@ async fn timezone_over_http() {
 
     kiri.shutdown().await;
     pago.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// M3: claims, leases, questions and answers, and the event log.
+// ---------------------------------------------------------------------------
+
+/// A second connection to the server's database file, to read state and to move
+/// timestamps into the past (lease expiry, question age) without waiting.
+fn db(path: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    conn
+}
+
+fn ts_ago(minutes: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn claim_expires(conn: &rusqlite::Connection, id: &str) -> String {
+    let n: i64 = id.trim_start_matches("SPOKE-").parse().unwrap();
+    conn.query_row("SELECT claim_expires FROM nodes WHERE id = ?1", [n], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn events(conn: &rusqlite::Connection, id: &str) -> Vec<(String, Option<String>, String)> {
+    let n: i64 = id.trim_start_matches("SPOKE-").parse().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, agent, COALESCE(detail, '') FROM events WHERE node_id = ?1 ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([n], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+async fn err(mcp: &Mcp, tool: &str, args: Value) -> String {
+    let (text, is_error) = mcp.call(tool, args).await;
+    assert!(is_error, "{tool} should have failed: {text}");
+    text
+}
+
+/// The spec's "done when": two terminals asking "what's next" get different tasks.
+#[tokio::test]
+async fn two_agents_get_different_tasks_over_http() {
+    let dir = temp_dir("agents");
+    let path = dir.join("spokes.db");
+    let tz: chrono_tz::Tz = "America/Chicago".parse().unwrap();
+    let server = start_tz(&path, tz).await;
+    let red = Mcp::new(server.addr);
+    let blue = Mcp::new(server.addr);
+
+    add_node(
+        &red,
+        json!({"title": "Work", "kind": "area", "children": [
+            {"title": "Fix login bug", "priority": 1},
+            {"title": "Write release notes", "priority": 2},
+            {"title": "Tidy backlog", "priority": 3}]}),
+    )
+    .await; // 2: 3, 4, 5
+
+    // Both terminals see the same top task.
+    let first = red.ok("next", json!({})).await;
+    assert_eq!(first, blue.ok("next", json!({})).await);
+    let top = listed_ids(&first)[0].clone();
+    assert_eq!(top, "SPOKE-3");
+
+    // Red claims it; blue's next no longer has it and offers the next task.
+    let out = red
+        .ok("claim", json!({"id": top, "agent": "opus-red"}))
+        .await;
+    let expires = claim_expires(&db(&path), &top);
+    let until = spokes::format::clock(&expires, tz);
+    assert_eq!(
+        out,
+        format!(
+            "Claimed SPOKE-3 Fix login bug for opus-red until {until}. It is hidden from next for everyone else. Finish with set_status done, release, or ask."
+        )
+    );
+    let lease =
+        chrono::DateTime::parse_from_rfc3339(&expires).unwrap() - chrono::Utc::now().fixed_offset();
+    assert!((58..=60).contains(&lease.num_minutes()), "{lease}");
+
+    let seen = blue.ok("next", json!({})).await;
+    assert!(!seen.contains("SPOKE-3 "), "{seen}");
+    let blue_top = listed_ids(&seen)[0].clone();
+    assert_eq!(blue_top, "SPOKE-4");
+    blue.ok("claim", json!({"id": blue_top, "agent": "sonnet-blue"}))
+        .await;
+    let seen = red.ok("next", json!({})).await;
+    assert_eq!(listed_ids(&seen), ["SPOKE-5"], "{seen}");
+
+    // Blue cannot take red's task; the error says who, until when, and what to do.
+    let e = err(
+        &blue,
+        "claim",
+        json!({"id": "SPOKE-3", "agent": "sonnet-blue"}),
+    )
+    .await;
+    assert_eq!(
+        e,
+        format!(
+            "SPOKE-3 is claimed by opus-red until {until}. Pick another task, or ask the user."
+        )
+    );
+    // Red claiming again renews its own lease.
+    let out = red
+        .ok(
+            "claim",
+            json!({"id": "SPOKE-3", "agent": "opus-red", "lease_minutes": 120}),
+        )
+        .await;
+    assert!(
+        out.starts_with("Renewed SPOKE-3 Fix login bug for opus-red until "),
+        "{out}"
+    );
+    let lease = chrono::DateTime::parse_from_rfc3339(&claim_expires(&db(&path), "SPOKE-3"))
+        .unwrap()
+        - chrono::Utc::now().fixed_offset();
+    assert!((118..=120).contains(&lease.num_minutes()), "{lease}");
+
+    // get shows who holds it.
+    let shown = blue.ok("get", json!({"id": "SPOKE-3"})).await;
+    assert!(shown.starts_with("SPOKE-3 task in_progress p1"), "{shown}");
+    assert!(shown.contains("\nclaimed by opus-red until "), "{shown}");
+
+    // Release puts it back with the note; only the holder can release.
+    let e = err(
+        &blue,
+        "release",
+        json!({"id": "SPOKE-3", "agent": "sonnet-blue"}),
+    )
+    .await;
+    assert!(e.ends_with("Only opus-red can release it."), "{e}");
+    let out = red
+        .ok(
+            "release",
+            json!({"id": "SPOKE-3", "agent": "opus-red", "note": "Repro found; fix needs a schema change."}),
+        )
+        .await;
+    assert_eq!(
+        out,
+        "Released SPOKE-3 Fix login bug; it is open in the queue again. Your note was added to its notes."
+    );
+    let notes = blue.ok("get", json!({"id": 3, "notes": true})).await;
+    assert!(
+        notes.contains("Released by opus-red (")
+            && notes.contains("): Repro found; fix needs a schema change."),
+        "{notes}"
+    );
+    assert_eq!(
+        listed_ids(&blue.ok("next", json!({})).await),
+        ["SPOKE-3", "SPOKE-5"]
+    );
+    let e = err(
+        &red,
+        "release",
+        json!({"id": "SPOKE-3", "agent": "opus-red"}),
+    )
+    .await;
+    assert!(e.contains("is not claimed (open)"), "{e}");
+
+    // Done clears the claim.
+    blue.ok(
+        "set_status",
+        json!({"ids": ["SPOKE-4"], "status": "done", "agent": "sonnet-blue"}),
+    )
+    .await;
+    let (by, exp): (Option<String>, Option<String>) = db(&path)
+        .query_row(
+            "SELECT claimed_by, claim_expires FROM nodes WHERE id = 4",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((by, exp), (None, None));
+
+    let log = events(&db(&path), "SPOKE-3");
+    let kinds: Vec<&str> = log.iter().map(|e| e.0.as_str()).collect();
+    assert_eq!(kinds, ["created", "claimed", "claimed", "released"]);
+    assert_eq!(log[1].1.as_deref(), Some("opus-red"));
+    assert!(log[2].2.starts_with("renewed until "), "{:?}", log[2]);
+    assert_eq!(log[3].2, "Repro found; fix needs a schema change.");
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn claim_rules_and_lease_renewal_over_http() {
+    let dir = temp_dir("claim-rules");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+
+    // 2 Home area; 3 Garage project (ordered) with 4, 5; 6 Shed with 7; 8 Done task.
+    add_node(
+        &mcp,
+        json!({"title": "Home", "kind": "area", "children": [
+            {"title": "Garage", "ordered": true, "children": [{"title": "Clear"}, {"title": "Paint"}]},
+            {"title": "Shed", "children": [{"title": "Roof"}]},
+            {"title": "Old"}]}),
+    )
+    .await;
+    mcp.ok("set_status", json!({"ids": [8], "status": "done"}))
+        .await;
+
+    let e = err(&mcp, "claim", json!({"id": 2, "agent": "red"})).await;
+    assert_eq!(
+        e,
+        "SPOKE-2 Home is an area; areas are never claimed. Claim a task under it (next with scope SPOKE-2)."
+    );
+    let e = err(&mcp, "claim", json!({"id": 1, "agent": "red"})).await;
+    assert!(e.contains("is the root"), "{e}");
+    let e = err(&mcp, "claim", json!({"id": 8, "agent": "red"})).await;
+    assert_eq!(
+        e,
+        "SPOKE-8 Old is done. Reopen it with set_status open first, or pick another task."
+    );
+    let e = err(&mcp, "claim", json!({"id": 404, "agent": "red"})).await;
+    assert!(e.starts_with("SPOKE-404 does not exist"), "{e}");
+    let e = err(&mcp, "claim", json!({"id": 3, "agent": "  "})).await;
+    assert!(e.starts_with("agent is empty"), "{e}");
+    let e = err(
+        &mcp,
+        "claim",
+        json!({"id": 3, "agent": "red", "lease_minutes": 0}),
+    )
+    .await;
+    assert!(e.starts_with("lease_minutes must be 1 to 1440"), "{e}");
+
+    // A claimed project hides its whole subtree; others cannot claim inside it, the
+    // holder can (an orchestrator taking a step itself).
+    mcp.ok("claim", json!({"id": 3, "agent": "red"})).await;
+    let q = mcp.ok("next", json!({})).await;
+    assert!(!q.contains("Garage") && !q.contains("Clear"), "{q}");
+    let e = err(&mcp, "claim", json!({"id": 4, "agent": "blue"})).await;
+    assert!(
+        e.starts_with("SPOKE-4 is inside SPOKE-3 Garage, which is claimed by red until "),
+        "{e}"
+    );
+    mcp.ok("claim", json!({"id": 4, "agent": "red"})).await;
+
+    // A step claimed by one agent blocks another from claiming its parent.
+    mcp.ok("claim", json!({"id": 7, "agent": "blue"})).await;
+    let e = err(&mcp, "claim", json!({"id": 6, "agent": "red"})).await;
+    assert!(
+        e.starts_with("SPOKE-7 Roof under SPOKE-6 is claimed by blue until "),
+        "{e}"
+    );
+
+    // Any write by the holder on the node or beneath it renews the lease; others' don't.
+    let conn = db(&path);
+    let soon = (chrono::Utc::now() + chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    conn.execute(
+        "UPDATE nodes SET claim_expires = ?1 WHERE id IN (3, 4)",
+        [&soon],
+    )
+    .unwrap();
+    mcp.ok(
+        "update",
+        json!({"id": 4, "notes_append": "half done", "agent": "blue"}),
+    )
+    .await;
+    assert_eq!(claim_expires(&conn, "SPOKE-4"), soon);
+    mcp.ok(
+        "update",
+        json!({"id": 4, "notes_append": "cleared", "agent": "red"}),
+    )
+    .await;
+    for id in ["SPOKE-3", "SPOKE-4"] {
+        let left = chrono::DateTime::parse_from_rfc3339(&claim_expires(&conn, id)).unwrap()
+            - chrono::Utc::now().fixed_offset();
+        assert!(left.num_minutes() >= 58, "{id}: {left}");
+    }
+    // add, move, focus and set_status renew too (here: on the parent project).
+    for (tool, args) in [
+        (
+            "add",
+            json!({"parent": 3, "title": "Varnish", "agent": "red"}),
+        ),
+        ("move", json!({"id": 9, "before": 5, "agent": "red"})),
+        ("focus", json!({"id": 5, "agent": "red"})),
+        (
+            "set_status",
+            json!({"ids": [4], "status": "done", "agent": "red"}),
+        ),
+    ] {
+        conn.execute("UPDATE nodes SET claim_expires = ?1 WHERE id = 3", [&soon])
+            .unwrap();
+        mcp.ok(tool, args).await;
+        let left = chrono::DateTime::parse_from_rfc3339(&claim_expires(&conn, "SPOKE-3")).unwrap()
+            - chrono::Utc::now().fixed_offset();
+        assert!(left.num_minutes() >= 58, "{tool}: {left}");
+    }
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Many agents claim the same task at the same moment: exactly one wins.
+#[tokio::test]
+async fn concurrent_claims_have_one_winner_over_http() {
+    let dir = temp_dir("claim-race");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+    add_node(&mcp, json!({"title": "Contested"})).await; // 2
+
+    let addr = server.addr;
+    let tasks: Vec<_> = (0..24)
+        .map(|i| {
+            tokio::spawn(async move {
+                let mcp = Mcp::new(addr);
+                let (text, is_error) = mcp
+                    .call("claim", json!({"id": 2, "agent": format!("agent-{i}")}))
+                    .await;
+                (i, text, is_error)
+            })
+        })
+        .collect();
+    let mut winners = Vec::new();
+    for t in tasks {
+        let (i, text, is_error) = t.await.unwrap();
+        if is_error {
+            assert!(text.starts_with("SPOKE-2 is claimed by agent-"), "{text}");
+        } else {
+            winners.push((i, text));
+        }
+    }
+    assert_eq!(winners.len(), 1, "{winners:?}");
+    let holder: String = db(&path)
+        .query_row("SELECT claimed_by FROM nodes WHERE id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(holder, format!("agent-{}", winners[0].0));
+    let claims = events(&db(&path), "SPOKE-2")
+        .iter()
+        .filter(|e| e.0 == "claimed")
+        .count();
+    assert_eq!(claims, 1);
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn ask_answer_and_stalled_leases_over_http() {
+    let dir = temp_dir("ask");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+
+    // 2 Hobbies area: 3 Set up emulator (p2), 4 Workbench (p1), 5 Paint shed (p3).
+    add_node(
+        &mcp,
+        json!({"title": "Hobbies", "kind": "area", "children": [
+            {"title": "Set up emulator", "priority": 2},
+            {"title": "Workbench", "priority": 1},
+            {"title": "Paint shed", "priority": 3}]}),
+    )
+    .await;
+
+    // ask -> top of NEEDS YOU with the question, agent and age.
+    mcp.ok("claim", json!({"id": 3, "agent": "sonnet-2"})).await;
+    let e = err(
+        &mcp,
+        "ask",
+        json!({"id": 3, "agent": "opus-red", "question": "Which drive?"}),
+    )
+    .await;
+    assert!(
+        e.starts_with("SPOKE-3 is claimed by sonnet-2 until "),
+        "{e}"
+    );
+    let e = err(
+        &mcp,
+        "ask",
+        json!({"id": 3, "agent": "sonnet-2", "question": "  "}),
+    )
+    .await;
+    assert!(e.starts_with("question is empty"), "{e}");
+    let out = mcp
+        .ok(
+            "ask",
+            json!({"id": 3, "agent": "sonnet-2", "question": "Install to D: or E:?"}),
+        )
+        .await;
+    assert_eq!(
+        out,
+        "SPOKE-3 Set up emulator is waiting on the user: \"Install to D: or E:?\". It is at the top of next under NEEDS YOU. Stop work on it until it is answered."
+    );
+    let conn = db(&path);
+    conn.execute(
+        "UPDATE events SET at = ?1 WHERE node_id = 3 AND type = 'asked'",
+        [ts_ago(185)],
+    )
+    .unwrap();
+    let q = mcp.ok("next", json!({})).await;
+    assert_eq!(
+        q,
+        "NEEDS YOU\n\
+         \x20 SPOKE-3  waiting  Set up emulator: \"Install to D: or E:?\" (sonnet-2, 3h ago)\n\
+         UP NEXT\n\
+         \x20 SPOKE-4  p1  Workbench  unplanned\n\
+         \x20 SPOKE-5  p3  Paint shed  unplanned"
+    );
+    let e = err(&mcp, "claim", json!({"id": 3, "agent": "opus-red"})).await;
+    assert_eq!(
+        e,
+        "SPOKE-3 Set up emulator is waiting on the user: \"Install to D: or E:?\". Ask them, record the reply with answer, then claim it."
+    );
+    let shown = mcp.ok("get", json!({"id": 3})).await;
+    assert!(
+        shown.contains("\nwaiting on the user: \"Install to D: or E:?\" (asked by sonnet-2)"),
+        "{shown}"
+    );
+
+    // answer -> Q&A in the notes, open again, kept under NEEDS YOU as answered.
+    let e = err(&mcp, "answer", json!({"id": 4, "text": "E:"})).await;
+    assert!(e.contains("is not waiting on a question (open)"), "{e}");
+    let out = mcp
+        .ok("answer", json!({"id": 3, "text": "E:, it has more space."}))
+        .await;
+    assert!(
+        out.starts_with("Answered SPOKE-3 Set up emulator; it is open again"),
+        "{out}"
+    );
+    let notes = mcp.ok("get", json!({"id": 3, "notes": true})).await;
+    assert!(notes.contains("Question from sonnet-2 ("), "{notes}");
+    assert!(
+        notes.contains("): Install to D: or E:?\nAnswer from the user ("),
+        "{notes}"
+    );
+    assert!(notes.contains("): E:, it has more space."), "{notes}");
+    assert!(notes.contains("\nanswered "), "{notes}");
+    let q = mcp.ok("next", json!({})).await;
+    assert_eq!(
+        q,
+        "NEEDS YOU\n\
+         \x20 SPOKE-3  answered  Set up emulator  (answered just now; claim it and read the notes)\n\
+         UP NEXT\n\
+         \x20 SPOKE-4  p1  Workbench  unplanned\n\
+         \x20 SPOKE-5  p3  Paint shed  unplanned"
+    );
+    // The answer is searchable (notes are indexed).
+    assert!(search(&mcp, "more space").await.contains("SPOKE-3"));
+    // Claiming it clears the answered mark and points at the notes.
+    let out = mcp.ok("claim", json!({"id": 3, "agent": "opus-red"})).await;
+    assert!(
+        out.ends_with("The user answered a question on it: read the notes (get notes: true)."),
+        "{out}"
+    );
+    assert_eq!(
+        listed_ids(&mcp.ok("next", json!({})).await),
+        ["SPOKE-4", "SPOKE-5"]
+    );
+
+    // Lease expiry: stalled under NEEDS YOU (after questions), then a takeover.
+    conn.execute(
+        "UPDATE nodes SET claim_expires = ?1 WHERE id = 3",
+        [ts_ago(125)],
+    )
+    .unwrap();
+    mcp.ok("claim", json!({"id": 5, "agent": "sonnet-2"})).await;
+    mcp.ok(
+        "ask",
+        json!({"id": 5, "agent": "sonnet-2", "question": "Which colour?"}),
+    )
+    .await;
+    let q = mcp.ok("next", json!({})).await;
+    assert_eq!(
+        q,
+        "NEEDS YOU\n\
+         \x20 SPOKE-5  waiting  Paint shed: \"Which colour?\" (sonnet-2, just now)\n\
+         \x20 SPOKE-3  stalled  Set up emulator  (claim by opus-red expired 2h ago)\n\
+         UP NEXT\n\
+         \x20 SPOKE-4  p1  Workbench  unplanned"
+    );
+    let shown = mcp.ok("get", json!({"id": 3})).await;
+    assert!(
+        shown.contains("\nstalled: claim by opus-red expired "),
+        "{shown}"
+    );
+    let out = mcp
+        .ok("claim", json!({"id": 3, "agent": "sonnet-blue"}))
+        .await;
+    assert!(
+        out.contains("(took over from opus-red, whose lease expired ")
+            && out.contains("Read its notes (get notes: true) for where opus-red got to."),
+        "{out}"
+    );
+    assert!(!mcp.ok("next", json!({})).await.contains("SPOKE-3"));
+
+    // The history on get: newest first, with who did what.
+    let shown = mcp.ok("get", json!({"id": 3, "history": true})).await;
+    let hist = &shown[pos(&shown, "HISTORY (newest first)\n")..];
+    let lines: Vec<&str> = hist.lines().skip(1).collect();
+    assert!(
+        lines[0].contains("claimed by sonnet-blue: took over from opus-red, whose lease expired"),
+        "{hist}"
+    );
+    assert!(lines[1].contains("claimed by opus-red: until "), "{hist}");
+    assert!(
+        lines[2].contains("answered: E:, it has more space."),
+        "{hist}"
+    );
+    assert!(
+        lines[3].contains("asked by sonnet-2: Install to D: or E:?"),
+        "{hist}"
+    );
+    assert!(lines[4].contains("claimed by sonnet-2: until "), "{hist}");
+    assert!(
+        lines[5].contains("created by it: Set up emulator")
+            || lines[5].contains("created: Set up emulator"),
+        "{hist}"
+    );
+    let kinds: Vec<String> = events(&conn, "SPOKE-3").into_iter().map(|e| e.0).collect();
+    assert_eq!(
+        kinds,
+        [
+            "created", "claimed", "asked", "answered", "claimed", "claimed"
+        ]
+    );
+
+    // The asking agent can withdraw its question with release; others must answer it.
+    let e = err(&mcp, "release", json!({"id": 5, "agent": "opus-red"})).await;
+    assert!(
+        e.contains("Record the user's reply with answer instead."),
+        "{e}"
+    );
+    mcp.ok(
+        "release",
+        json!({"id": 5, "agent": "sonnet-2", "note": "Will pick a colour later."}),
+    )
+    .await;
+    assert!(!mcp.ok("next", json!({})).await.contains("waiting"));
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Retro from the M2 usage test: a container whose next step is already shown higher up
+/// (by a sub-project with a due date, or the step itself) is not listed again.
+#[tokio::test]
+async fn next_lists_each_actionable_step_once_over_http() {
+    let dir = temp_dir("dedupe");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+    let today = chrono::Utc::now().date_naive();
+    let soon = iso(today + chrono::Duration::days(3));
+    let later = iso(today + chrono::Duration::days(5));
+
+    // Hobbies > Skyforge (project) > Deploy Skyforge (ordered, due soon) > 6 steps, the
+    // first done. Work > Server (project) > Migrate (due soon). Plus a plain task.
+    add_node(
+        &mcp,
+        json!({"title": "Hobbies", "kind": "area", "children": [
+            {"title": "Skyforge", "children": [
+                {"title": "Deploy Skyforge", "ordered": true, "due": soon, "children": [
+                    {"title": "Map the pipeline"}, {"title": "Write the pipeline"},
+                    {"title": "Add secrets"}, {"title": "Push"}, {"title": "Verify"}, {"title": "Retro"}]}]}]}),
+    )
+    .await; // 2 > 3 > 4 > 5..10
+    mcp.ok("set_status", json!({"ids": [5], "status": "done"}))
+        .await;
+    add_node(
+        &mcp,
+        json!({"title": "Work", "kind": "area", "children": [
+            {"title": "Server", "children": [{"title": "Migrate", "due": later}]},
+            {"title": "Expenses"}]}),
+    )
+    .await; // 11 > 12 > 13; 14
+
+    let q = mcp.ok("next", json!({"limit": 20})).await;
+    assert_eq!(
+        listed_ids(&q),
+        ["SPOKE-4", "SPOKE-13", "SPOKE-14"],
+        "Skyforge (SPOKE-3) and Server (SPOKE-12) point at steps already shown:\n{q}"
+    );
+    assert!(
+        line_with(&q, "SPOKE-4 ")
+            .contains("Deploy Skyforge (1/6)  next: SPOKE-6 Write the pipeline"),
+        "{q}"
+    );
+    assert!(
+        !q.contains("more open"),
+        "dropped duplicates are not counted as more: {q}"
+    );
+
+    // Once the deploy step moves on to another sub-step, still one line per step.
+    mcp.ok("set_status", json!({"ids": [6], "status": "done"}))
+        .await;
+    let q = mcp.ok("next", json!({"limit": 20})).await;
+    assert_eq!(listed_ids(&q), ["SPOKE-4", "SPOKE-13", "SPOKE-14"], "{q}");
+    // Without the due sub-project the parent project carries the line again.
+    mcp.ok("update", json!({"id": 4, "due": ""})).await;
+    let q = mcp.ok("next", json!({"limit": 20})).await;
+    assert_eq!(listed_ids(&q), ["SPOKE-13", "SPOKE-3", "SPOKE-14"], "{q}");
+    assert!(
+        line_with(&q, "SPOKE-3 ").contains("next: SPOKE-7 Add secrets"),
+        "{q}"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A project whose only open work is claimed by someone else is not offered at all.
+#[tokio::test]
+async fn project_with_all_steps_claimed_is_not_offered_over_http() {
+    let dir = temp_dir("all-claimed");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+    add_node(
+        &mcp,
+        json!({"title": "Hobbies", "kind": "area", "children": [
+            {"title": "Skyforge", "children": [{"title": "Deploy", "children": [{"title": "Push"}]}]},
+            {"title": "Other"}]}),
+    )
+    .await; // 2 > 3 > 4 > 5; 6
+    assert_eq!(
+        listed_ids(&mcp.ok("next", json!({})).await),
+        ["SPOKE-3", "SPOKE-6"]
+    );
+    mcp.ok("claim", json!({"id": 4, "agent": "opus-red"})).await;
+    assert_eq!(listed_ids(&mcp.ok("next", json!({})).await), ["SPOKE-6"]);
+    mcp.ok("release", json!({"id": 4, "agent": "opus-red"}))
+        .await;
+    mcp.ok("claim", json!({"id": 5, "agent": "opus-red"})).await;
+    assert_eq!(listed_ids(&mcp.ok("next", json!({})).await), ["SPOKE-6"]);
+    server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }

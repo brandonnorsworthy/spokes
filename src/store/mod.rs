@@ -4,6 +4,7 @@
 //! message says what to do next. Writes run in one transaction and log an event.
 
 mod add;
+mod claims;
 mod focus;
 pub(crate) mod fts;
 mod get;
@@ -14,6 +15,7 @@ mod status;
 mod update;
 
 pub use add::add;
+pub use claims::{answer, ask, claim, release};
 pub use focus::focus;
 pub use get::get;
 pub use moves::move_node;
@@ -36,7 +38,8 @@ pub(crate) const NODE_COLS: &str = "n.id, n.parent_id, n.position, n.kind, n.ord
     EXISTS(SELECT 1 FROM notes t WHERE t.node_id = n.id) AS has_notes,
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status != 'dropped') AS child_total,
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status = 'done') AS child_done,
-    COALESCE((SELECT p.ordered AND p.kind = 'task' FROM nodes p WHERE p.id = n.parent_id), 0) AS is_step";
+    COALESCE((SELECT p.ordered AND p.kind = 'task' FROM nodes p WHERE p.id = n.parent_id), 0) AS is_step,
+    n.answered_at";
 
 pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
     let text_enum = |idx: usize, value: String| {
@@ -70,6 +73,7 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
         child_total: r.get(18)?,
         child_done: r.get(19)?,
         is_step: r.get(20)?,
+        answered_at: r.get(21)?,
     })
 }
 
@@ -163,6 +167,41 @@ pub(crate) fn log_event(
         params![id.0, now, agent, kind, detail],
     )?;
     Ok(())
+}
+
+/// The lease a claim gets by default, and what any write by the claiming agent renews it to.
+pub(crate) const DEFAULT_LEASE_MINUTES: i64 = 60;
+
+/// Any write by the claiming agent on a node or beneath it renews that agent's claims on
+/// the node and its ancestors: the lease runs at least [`DEFAULT_LEASE_MINUTES`] from now
+/// (a longer lease is kept). A lapsed claim the agent still holds is revived the same way.
+pub(crate) fn renew_leases(
+    conn: &Connection,
+    id: NodeId,
+    agent: Option<&str>,
+    now: &str,
+) -> rusqlite::Result<()> {
+    let Some(agent) = agent else { return Ok(()) };
+    let renewed = lease_end(now, DEFAULT_LEASE_MINUTES);
+    conn.execute(
+        "WITH RECURSIVE up(id) AS (
+           SELECT ?1
+           UNION ALL
+           SELECT n.parent_id FROM nodes n JOIN up ON n.id = up.id WHERE n.parent_id IS NOT NULL
+         )
+         UPDATE nodes SET claim_expires = MAX(COALESCE(claim_expires, ''), ?3)
+         WHERE id IN (SELECT id FROM up) AND status = 'in_progress' AND claimed_by = ?2",
+        params![id.0, agent, renewed],
+    )?;
+    Ok(())
+}
+
+/// `now` plus `minutes`, in the RFC 3339 UTC form every timestamp column uses.
+pub(crate) fn lease_end(now: &str, minutes: i64) -> String {
+    let base = chrono::DateTime::parse_from_rfc3339(now)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    (base + chrono::Duration::minutes(minutes)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Trims an optional agent label and bounds its length.

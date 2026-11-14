@@ -196,6 +196,8 @@ pub struct Node {
     pub waiting_on: Option<String>,
     pub claimed_by: Option<String>,
     pub claim_expires: Option<String>,
+    /// Set by `answer`; cleared when the task is claimed, asked again or closed.
+    pub answered_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Last activity on the node or anything beneath it (bubbles up).

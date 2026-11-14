@@ -4,7 +4,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::add::{MAX_NOTES, clean_aliases, clean_date, clean_notes, clean_priority, clean_title};
-use super::{ToolResult, children, clean_agent, db_err, log_event, require, touch};
+use super::{ToolResult, children, clean_agent, db_err, log_event, renew_leases, require, touch};
 use crate::db::now;
 use crate::model::{Kind, Status};
 use crate::tools::args::UpdateArgs;
@@ -162,6 +162,7 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     let detail = changed.join(", ");
     log_event(&tx, id, &now, agent.as_deref(), "updated", &detail).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
+    renew_leases(&tx, id, agent.as_deref(), &now).map_err(db_err)?;
     let title = require(&tx, id)?.title;
     tx.commit().map_err(db_err)?;
     Ok(format!("Updated {id}  {title}  ({detail})"))
@@ -225,7 +226,7 @@ mod tests {
 
     fn get_text(conn: &Connection, id: i64, notes: bool) -> String {
         let a: GetArgs = serde_json::from_value(json!({"id": id, "notes": notes})).unwrap();
-        get(conn, a, crate::format::today_in(chrono_tz::UTC)).unwrap()
+        get(conn, a, chrono_tz::UTC).unwrap()
     }
 
     type Row = (

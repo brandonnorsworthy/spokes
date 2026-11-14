@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, params};
 
-use super::{ToolResult, clean_agent, db_err, log_event, require, touch};
+use super::{ToolResult, clean_agent, db_err, log_event, renew_leases, require, touch};
 use crate::db::{now, position};
 use crate::model::{DEFAULT_USER, NodeId};
 use crate::tools::args::FocusArgs;
@@ -153,6 +153,7 @@ pub fn focus(conn: &mut Connection, args: FocusArgs) -> ToolResult {
     )
     .map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
+    renew_leases(&tx, id, agent.as_deref(), &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
 
     let mut line = format!(

@@ -71,6 +71,25 @@ pub fn parse_date(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value.get(..10)?, "%Y-%m-%d").ok()
 }
 
+/// A timestamp as wall-clock time in `SPOKES_TZ`: `14:20` today, `Nov 15 14:20` on
+/// another day (with the year if it is not this year).
+pub fn clock(timestamp: &str, tz: chrono_tz::Tz) -> String {
+    let Ok(t) = DateTime::parse_from_rfc3339(timestamp) else {
+        return timestamp.to_string();
+    };
+    let local = t.with_timezone(&tz);
+    let today = today_in(tz);
+    let time = local.format("%H:%M").to_string();
+    if local.date_naive() == today {
+        time
+    } else {
+        format!(
+            "{} {time}",
+            short_date(&local.date_naive().to_string(), today)
+        )
+    }
+}
+
 /// `3h ago`, `2d ago`, `just now`.
 pub fn ago(timestamp: &str, now: DateTime<Utc>) -> String {
     let Ok(then) = DateTime::parse_from_rfc3339(timestamp) else {
@@ -187,6 +206,7 @@ mod tests {
             waiting_on: None,
             claimed_by: None,
             claim_expires: None,
+            answered_at: None,
             created_at: "2026-11-01T00:00:00Z".into(),
             updated_at: "2026-11-01T00:00:00Z".into(),
             touched_at: "2026-11-01T00:00:00Z".into(),

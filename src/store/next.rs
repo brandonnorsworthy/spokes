@@ -3,7 +3,14 @@
 //! Sections, in order: NEEDS YOU (questions, then stalled claims), FOCUS (the global
 //! ranked list), DUE SOON (overdue, then due within 7 days), UP NEXT (by priority
 //! level 1..4, oldest first; unset levels inherit the nearest ancestor's) and STALE
-//! (up to three work items untouched for 30 days). A node is listed once at most.
+//! (up to three work items untouched for 30 days). A node is listed once at most, and
+//! so is each actionable step: a line whose `next:` step (or, for a leaf, the node
+//! itself) is already represented higher up is dropped, so a project and its sub-project
+//! never both point at the same step.
+//!
+//! NEEDS YOU holds questions (`waiting`), then stalled claims (lease run out), then
+//! answered tasks: open again after `answer`, kept here as "answered" until an agent
+//! claims them, so the reply is picked up next rather than sinking into the queue.
 //!
 //! The queue lists work items, not every leaf: top-level tasks (directly under areas)
 //! plus any deeper task that carries its own level or due date, and anything on the
@@ -74,16 +81,19 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
         },
     );
 
-    let total = queue.needs_you.len() + queue.focus.len() + queue.work.len();
-    if total == 0 {
+    if queue.needs_you.len() + queue.focus.len() + queue.work.len() == 0 {
         return Ok(format!(
             "Nothing actionable under {} {}. Add a task with add.",
             scope.id, scope.title
         ));
     }
 
-    // Questions first, then stalled claims (walk order within each).
-    queue.needs_you.sort_by_key(|n| n.status != Status::Waiting);
+    // Questions first, then stalled claims, then answered tasks (walk order within each).
+    queue.needs_you.sort_by_key(|n| match n.status {
+        Status::Waiting => 0,
+        Status::InProgress => 1,
+        _ => 2,
+    });
     let ranks = focus_numbers(conn)?;
     queue
         .focus
@@ -111,6 +121,27 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
         key(a).cmp(&key(b))
     });
 
+    // One line per actionable step, in section order: needs-you nodes first, then focus,
+    // due and the rest. A due or up-next line pointing at a step already represented is
+    // dropped.
+    let step_of = |i: &Item| {
+        tree.next_step(i.node.id, i.node.ordered, today)
+            .map_or(i.node.id, |s| s.id)
+    };
+    let mut steps: HashSet<NodeId> = queue.needs_you.iter().map(|n| n.id).collect();
+    // The focus list is the user's explicit ranking, so every entry stays; their steps
+    // still count, so later sections do not repeat them.
+    steps.extend(queue.focus.iter().map(step_of));
+    let mut first_for_step = |items: Vec<Item>| -> Vec<Item> {
+        items
+            .into_iter()
+            .filter(|i| steps.insert(step_of(i)))
+            .collect()
+    };
+    let due = first_for_step(due);
+    let rest = first_for_step(rest);
+    let total = queue.needs_you.len() + queue.focus.len() + due.len() + rest.len();
+
     let now_dt = Utc::now();
     let mut budget = limit;
     let mut take = |len: usize| {
@@ -124,8 +155,8 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
     let n = take(queue.needs_you.len());
     let rows: Vec<Row> = queue.needs_you[..n]
         .iter()
-        .map(|node| needs_you_row(node, now_dt))
-        .collect();
+        .map(|node| needs_you_row(conn, node, now_dt))
+        .collect::<Result<_, _>>()?;
     shown.extend(queue.needs_you[..n].iter().map(|node| node.id));
     sections.push(("NEEDS YOU", rows));
 
@@ -250,8 +281,14 @@ fn work_row(item: &Item, tree: &Tree, today: NaiveDate) -> Row {
     }
 }
 
-/// `SPOKE-88  waiting  Set up emulator: "Install to D: or E:?" (sonnet-2, 3h ago)`.
-fn needs_you_row(n: &Node, now_dt: chrono::DateTime<Utc>) -> Row {
+/// `SPOKE-88  waiting  Set up emulator: "Install to D: or E:?" (sonnet-2, 3h ago)`,
+/// `SPOKE-90  stalled  ...  (claim by opus-red expired 2h ago)` or
+/// `SPOKE-91  answered  ...  (answered 5m ago; claim it and read the notes)`.
+fn needs_you_row(
+    conn: &Connection,
+    n: &Node,
+    now_dt: chrono::DateTime<Utc>,
+) -> Result<Row, String> {
     let (flags, rest) = if n.status == Status::Waiting {
         let mut rest = n.title.clone();
         if let Some(q) = &n.waiting_on {
@@ -262,8 +299,26 @@ fn needs_you_row(n: &Node, now_dt: chrono::DateTime<Utc>) -> Row {
             .as_deref()
             .map(|a| format!("{a}, "))
             .unwrap_or_default();
-        rest.push_str(&format!(" ({who}{})", ago(&n.updated_at, now_dt)));
+        // When it was asked, from the log (updated_at moves with any later edit).
+        let asked: Option<String> = conn
+            .query_row(
+                "SELECT MAX(at) FROM events WHERE node_id = ?1 AND type = 'asked'",
+                params![n.id.0],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        let asked = asked.unwrap_or_else(|| n.updated_at.clone());
+        rest.push_str(&format!(" ({who}{})", ago(&asked, now_dt)));
         ("waiting", rest)
+    } else if let (Status::Open, Some(at)) = (n.status, n.answered_at.as_deref()) {
+        (
+            "answered",
+            format!(
+                "{}  (answered {}; claim it and read the notes)",
+                n.title,
+                ago(at, now_dt)
+            ),
+        )
     } else {
         let who = n.claimed_by.as_deref().unwrap_or("an agent");
         let since = n
@@ -276,12 +331,12 @@ fn needs_you_row(n: &Node, now_dt: chrono::DateTime<Utc>) -> Row {
             format!("{}  (claim by {who} expired {since})", n.title),
         )
     };
-    Row {
+    Ok(Row {
         rank: None,
         id: n.id.to_string(),
         flags: flags.to_string(),
         rest,
-    }
+    })
 }
 
 /// The live (not done or dropped) nodes, indexed by parent, in sibling order.
@@ -390,6 +445,11 @@ impl Queue {
                     self.needs_you.push(kid.clone());
                     continue;
                 }
+                // Answered: ready for an agent, so it stays near the top until claimed.
+                Status::Open if kid.answered_at.is_some() && kid.kind == Kind::Task => {
+                    self.needs_you.push(kid.clone());
+                    continue;
+                }
                 _ => {}
             }
             let level = kid.priority.or(at.level);
@@ -404,6 +464,10 @@ impl Queue {
             } else if kid.kind == Kind::Task
                 && reachable
                 && (at.top || kid.priority.is_some() || kid.due_at.is_some())
+                // A project whose every open step is claimed, waiting or deferred has
+                // nothing to offer right now (claiming it would be refused anyway).
+                && (tree.kids(kid.id).is_empty()
+                    || tree.next_step(kid.id, kid.ordered, self.today).is_some())
             {
                 self.work.push(item());
             }

@@ -31,8 +31,9 @@ pub struct NodeSpec {
     pub children: Option<Vec<NodeSpec>>,
 }
 
-// The `agent` label is worded as optional bookkeeping on every write: in the M0 usage
-// test a model kept telling the user which name it had logged under.
+// The `agent` label is optional on plain writes (it logs who acted and renews that agent's
+// claim) and says "no need to mention it": in the M0 usage test a model kept telling the
+// user which name it had logged under.
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddArgs {
@@ -41,7 +42,7 @@ pub struct AddArgs {
     pub parent: Option<IdArg>,
     #[serde(flatten)]
     pub node: NodeSpec,
-    /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
+    /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
 }
 
@@ -55,6 +56,8 @@ pub struct GetArgs {
     pub depth: Option<NumArg>,
     /// Include the notes body (default false).
     pub notes: Option<bool>,
+    /// Include the node's last 10 history events: who claimed, asked, answered, changed it (default false).
+    pub history: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -74,7 +77,7 @@ pub struct SetStatusArgs {
     pub ids: Vec<IdArg>,
     /// "done" (finished), "dropped" (won't do; replaces delete) or "open" (reopen).
     pub status: SettableStatus,
-    /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
+    /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
 }
 
@@ -102,7 +105,7 @@ pub struct UpdateArgs {
     pub notes: Option<String>,
     /// Text appended to the end of the notes (e.g. what you did, findings).
     pub notes_append: Option<String>,
-    /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
+    /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
 }
 
@@ -120,7 +123,7 @@ pub struct MoveArgs {
     /// Place just after this sibling. Without before or after the node goes last.
     #[schemars(with = "Option<String>")]
     pub after: Option<IdArg>,
-    /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
+    /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
 }
 
@@ -154,6 +157,51 @@ pub struct FocusArgs {
     pub after: Option<IdArg>,
     /// true takes it off the focus list (its priority level stays).
     pub remove: Option<bool>,
-    /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
+    /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
+}
+
+// Claims, questions and answers. Here `agent` is required: it is who holds the task.
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClaimArgs {
+    /// The task to take, e.g. "SPOKE-12".
+    #[schemars(with = "String")]
+    pub id: IdArg,
+    /// Your agent label, the same one for the whole session (e.g. "opus-red").
+    pub agent: String,
+    /// How long the claim lasts without activity (default 60, max 1440). Any write you make on the task or beneath it renews it.
+    #[schemars(with = "Option<u32>")]
+    pub lease_minutes: Option<NumArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReleaseArgs {
+    /// The task to give back, e.g. "SPOKE-12".
+    #[schemars(with = "String")]
+    pub id: IdArg,
+    /// Your agent label (the one you claimed with).
+    pub agent: String,
+    /// Why, and where you got to. Appended to the task's notes for the next agent.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AskArgs {
+    /// The task the question is about, e.g. "SPOKE-12".
+    #[schemars(with = "String")]
+    pub id: IdArg,
+    /// Your agent label.
+    pub agent: String,
+    /// The question for the user, short and specific (e.g. "Install to D: or E:?").
+    pub question: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnswerArgs {
+    /// The waiting task, e.g. "SPOKE-12".
+    #[schemars(with = "String")]
+    pub id: IdArg,
+    /// The user's reply, in their words. Appended to the task's notes with the question.
+    pub text: String,
 }

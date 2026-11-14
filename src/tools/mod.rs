@@ -13,7 +13,8 @@ use rusqlite::Connection;
 use crate::format::today_in;
 use crate::store::{self, ToolResult};
 use args::{
-    AddArgs, FocusArgs, GetArgs, MoveArgs, NextArgs, SearchArgs, SetStatusArgs, UpdateArgs,
+    AddArgs, AnswerArgs, AskArgs, ClaimArgs, FocusArgs, GetArgs, MoveArgs, NextArgs, ReleaseArgs,
+    SearchArgs, SetStatusArgs, UpdateArgs,
 };
 
 /// The one SQLite connection, shared by every request.
@@ -30,7 +31,8 @@ An ordered parent's children are steps: only the first unfinished one is actiona
 - Write a whole plan in one add with nested children. Give every new node 2 to 5 aliases (synonyms, plain spelling, what you'd call it out loud). Long detail goes in notes, not the title.
 - Priority: level 1-4 (inherits downward) for \"this matters\"; focus for the short ranked top list.
 - +notes means a body exists; read it with get notes: true. Record progress with update notes_append.
-- agent is optional bookkeeping (e.g. your model name); don't mention it to the user. Ask the user rather than guess.";
+- Before working on a task, claim it so other agents skip it; finish with set_status done, or release it with a note. Pass the same agent label (e.g. opus-red) on every call this session; it renews your claim. Don't mention it to the user.
+- Ask rather than guess: if you need the user, call ask with the exact question and stop work on that task. When the user replies, record it with answer.";
 
 /// One MCP server instance. Built per request (the transport is stateless), so it only
 /// holds the shared database handle and a clone of the prebuilt tool router.
@@ -99,11 +101,11 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Show one node, its path and an outline of its children (depth levels, default 1). Ordered steps are numbered and the actionable one is marked <- next. Notes only with notes: true."
+        description = "Show one node, its path, who holds it, and an outline of its children (depth levels, default 1). Ordered steps are numbered and the actionable one is marked <- next. Notes only with notes: true; recent history with history: true."
     )]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> ToolResult {
-        let today = today_in(self.tz);
-        self.run(move |c| store::get(c, args, today)).await
+        let tz = self.tz;
+        self.run(move |c| store::get(c, args, tz)).await
     }
 
     #[tool(
@@ -133,6 +135,38 @@ impl Spokes {
     )]
     async fn move_node(&self, Parameters(args): Parameters<MoveArgs>) -> ToolResult {
         self.run(move |c| store::move_node(c, args)).await
+    }
+
+    #[tool(
+        description = "Take a task before working on it: it leaves next for everyone else until you finish (set_status done), release or ask. The lease (default 60 min) renews with every write you make on it. Refused if another agent holds it."
+    )]
+    async fn claim(&self, Parameters(args): Parameters<ClaimArgs>) -> ToolResult {
+        let tz = self.tz;
+        self.run(move |c| store::claim(c, args, tz)).await
+    }
+
+    #[tool(
+        description = "Give a claimed task back without finishing it. It returns to the queue; the note (where you got to, why) is added to its notes."
+    )]
+    async fn release(&self, Parameters(args): Parameters<ReleaseArgs>) -> ToolResult {
+        let tz = self.tz;
+        self.run(move |c| store::release(c, args, tz)).await
+    }
+
+    #[tool(
+        description = "Hand a question to the user instead of guessing. The task waits at the top of next under NEEDS YOU until answered; stop work on it."
+    )]
+    async fn ask(&self, Parameters(args): Parameters<AskArgs>) -> ToolResult {
+        let tz = self.tz;
+        self.run(move |c| store::ask(c, args, tz)).await
+    }
+
+    #[tool(
+        description = "Record the user's reply to a waiting task's question. The Q&A is added to its notes and the task is open again for an agent to claim."
+    )]
+    async fn answer(&self, Parameters(args): Parameters<AnswerArgs>) -> ToolResult {
+        let tz = self.tz;
+        self.run(move |c| store::answer(c, args, tz)).await
     }
 }
 

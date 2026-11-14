@@ -60,6 +60,9 @@ const STEPS: &[Step] = &[
     ),
     // 2: the search index (trigram FTS5 over normalized text), backfilled from existing rows.
     Step::Code(search_index),
+    // 3: when a human answered an agent's question (answer). The task is open again and
+    // shown under NEEDS YOU as answered until an agent claims it or it is closed.
+    Step::Sql("ALTER TABLE nodes ADD COLUMN answered_at TEXT"),
 ];
 
 fn search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {

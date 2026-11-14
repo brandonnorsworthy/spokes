@@ -3,18 +3,22 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
+use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{NODE_COLS, ToolResult, ancestors, breadcrumb, db_err, node_from_row, require};
-use crate::format::{child_line, earliest, header_line};
+use crate::format::{child_line, clock, earliest, header_line, today_in};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
 use crate::tools::args::GetArgs;
 
 const MAX_DEPTH: i64 = 10;
 /// Cap on outline lines so a huge subtree stays cheap to read.
 const MAX_LINES: usize = 60;
+/// Events shown by `history: true`, newest first.
+const HISTORY_LINES: i64 = 10;
 
-pub fn get(conn: &Connection, args: GetArgs, today: NaiveDate) -> ToolResult {
+pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
+    let today = today_in(tz);
     let id = match &args.id {
         Some(i) => i.parse()?,
         None => ROOT_ID,
@@ -37,6 +41,9 @@ pub fn get(conn: &Connection, args: GetArgs, today: NaiveDate) -> ToolResult {
         } else {
             path
         });
+    }
+    if let Some(line) = claim_line(&node, tz) {
+        out.push(line);
     }
 
     let (tree, deeper) = subtree(conn, id, depth)?;
@@ -83,7 +90,69 @@ pub fn get(conn: &Connection, args: GetArgs, today: NaiveDate) -> ToolResult {
             None => out.push("(no notes)".to_string()),
         }
     }
+    if args.history.unwrap_or(false) {
+        out.push("HISTORY (newest first)".to_string());
+        out.extend(history(conn, id, tz)?);
+    }
     Ok(out.join("\n"))
+}
+
+/// Who holds the node, what it waits on, or that a question was answered.
+fn claim_line(node: &Node, tz: Tz) -> Option<String> {
+    let who = node.claimed_by.as_deref().unwrap_or("an agent");
+    match node.status {
+        Status::InProgress => {
+            let until = node.claim_expires.as_deref().unwrap_or("");
+            let lapsed = until <= crate::db::now().as_str();
+            Some(if lapsed {
+                format!("stalled: claim by {who} expired {}", clock(until, tz))
+            } else {
+                format!("claimed by {who} until {}", clock(until, tz))
+            })
+        }
+        Status::Waiting => Some(format!(
+            "waiting on the user: \"{}\" (asked by {who})",
+            node.waiting_on.as_deref().unwrap_or("")
+        )),
+        Status::Open => node.answered_at.as_deref().map(|at| {
+            format!(
+                "answered {}, ready to claim (the answer is in the notes)",
+                clock(at, tz)
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// `  Nov 14 14:02  opus-red  claimed  until ...`, newest first.
+fn history(conn: &Connection, id: NodeId, tz: Tz) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT at, agent, type, detail FROM events WHERE node_id = ?1
+             ORDER BY id DESC LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<(String, Option<String>, String, Option<String>)> = stmt
+        .query_map(params![id.0, HISTORY_LINES], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .and_then(|r| r.collect())
+        .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|(at, agent, kind, detail)| {
+            let mut line = format!("  {}  {kind}", clock(&at, tz));
+            if let Some(a) = agent {
+                line.push_str(&format!(" by {a}"));
+            }
+            if let Some(d) = detail.filter(|d| !d.is_empty()) {
+                let short: String = d.chars().take(120).collect();
+                let more = if d.chars().count() > 120 { "..." } else { "" };
+                line.push_str(&format!(": {short}{more}"));
+            }
+            line
+        })
+        .collect())
 }
 
 /// Descendants of `id` that are not beneath a dropped node.
@@ -195,6 +264,7 @@ mod tests {
             id: id.map(IdArg::Number),
             depth: depth.map(NumArg::Number),
             notes: None,
+            history: None,
         }
     }
 
@@ -204,12 +274,7 @@ mod tests {
         for t in ["Home", "Work", "Hobbies"] {
             add(&mut conn, args(None, t, Kind::Area)).unwrap();
         }
-        let out = get(
-            &conn,
-            get_args(None, None),
-            crate::format::today_in(chrono_tz::UTC),
-        )
-        .unwrap();
+        let out = get(&conn, get_args(None, None), chrono_tz::UTC).unwrap();
         assert_eq!(
             out,
             "SPOKE-1 area  To do\n  - SPOKE-2 area  Home\n  - SPOKE-3 area  Work\n  - SPOKE-4 area  Hobbies"
@@ -233,8 +298,9 @@ mod tests {
                 id: Some(IdArg::Text("SPOKE-3".into())),
                 depth: None,
                 notes: Some(true),
+                history: None,
             },
-            crate::format::today_in(chrono_tz::UTC),
+            chrono_tz::UTC,
         )
         .unwrap();
         assert_eq!(
@@ -247,12 +313,7 @@ mod tests {
     #[test]
     fn missing_node_is_an_actionable_error() {
         let (conn, dir) = temp_db("get-missing");
-        let err = get(
-            &conn,
-            get_args(Some(42), None),
-            crate::format::today_in(chrono_tz::UTC),
-        )
-        .unwrap_err();
+        let err = get(&conn, get_args(Some(42), None), chrono_tz::UTC).unwrap_err();
         assert!(err.starts_with("SPOKE-42 does not exist"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -272,12 +333,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let out = get(
-            &conn,
-            get_args(Some(2), None),
-            crate::format::today_in(chrono_tz::UTC),
-        )
-        .unwrap();
+        let out = get(&conn, get_args(Some(2), None), chrono_tz::UTC).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2 + 60 + 3, "{out}");
         assert_eq!(

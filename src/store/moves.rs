@@ -2,7 +2,9 @@
 
 use rusqlite::{Connection, params};
 
-use super::{ToolResult, ancestors, children, clean_agent, db_err, log_event, require, touch};
+use super::{
+    ToolResult, ancestors, children, clean_agent, db_err, log_event, renew_leases, require, touch,
+};
 use crate::db::{now, position};
 use crate::model::{Kind, Node, Status};
 use crate::tools::args::MoveArgs;
@@ -115,6 +117,7 @@ pub fn move_node(conn: &mut Connection, args: MoveArgs) -> ToolResult {
     log_event(&tx, id, &now, agent.as_deref(), "moved", &detail).map_err(db_err)?;
     touch(&tx, old_parent, &now).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
+    renew_leases(&tx, id, agent.as_deref(), &now).map_err(db_err)?;
 
     // Where it landed, counted like the outline (dropped siblings are hidden there).
     let live: Vec<Node> = children(&tx, target.id)?
