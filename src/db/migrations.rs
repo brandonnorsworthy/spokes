@@ -1,0 +1,78 @@
+//! Embedded, forward-only schema migrations tracked with `PRAGMA user_version`.
+//!
+//! Each entry in [`STEPS`] moves the schema from version `i` to `i + 1`. Never edit
+//! a step that has shipped; append a new one (e.g. `ALTER TABLE ... ADD COLUMN`).
+
+use anyhow::Context;
+use rusqlite::Connection;
+
+const STEPS: &[&str] = &[
+    // 1: core tables from the spec's data model.
+    "CREATE TABLE nodes (
+       id            INTEGER PRIMARY KEY AUTOINCREMENT,
+       user_id       INTEGER NOT NULL DEFAULT 1,
+       parent_id     INTEGER REFERENCES nodes(id),
+       position      TEXT    NOT NULL,
+       kind          TEXT    NOT NULL DEFAULT 'task' CHECK (kind IN ('area','task')),
+       ordered       INTEGER NOT NULL DEFAULT 0,
+       title         TEXT    NOT NULL,
+       status        TEXT    NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','in_progress','waiting','done','dropped')),
+       priority      INTEGER CHECK (priority BETWEEN 1 AND 4),
+       focus_rank    TEXT,
+       due_at        TEXT,
+       defer_until   TEXT,
+       recur         TEXT,
+       aliases       TEXT,
+       waiting_on    TEXT,
+       claimed_by    TEXT,
+       claim_expires TEXT,
+       created_at    TEXT NOT NULL,
+       updated_at    TEXT NOT NULL,
+       touched_at    TEXT NOT NULL,
+       completed_at  TEXT
+     );
+     CREATE INDEX nodes_children ON nodes(parent_id, position);
+     CREATE INDEX nodes_queue    ON nodes(user_id, status, due_at);
+
+     CREATE TABLE notes (
+       node_id INTEGER PRIMARY KEY REFERENCES nodes(id),
+       body    TEXT NOT NULL
+     );
+
+     CREATE TABLE events (
+       id      INTEGER PRIMARY KEY,
+       node_id INTEGER NOT NULL REFERENCES nodes(id),
+       at      TEXT NOT NULL,
+       agent   TEXT,
+       type    TEXT NOT NULL,
+       detail  TEXT
+     );
+     CREATE INDEX events_node ON events(node_id, at);",
+];
+
+/// The schema version a fully migrated database has.
+pub fn latest() -> i64 {
+    STEPS.len() as i64
+}
+
+pub fn apply(conn: &mut Connection) -> anyhow::Result<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current > latest() {
+        anyhow::bail!(
+            "database schema version {current} is newer than this build supports ({}); upgrade spokes",
+            latest()
+        );
+    }
+    for (i, sql) in STEPS.iter().enumerate().skip(current as usize) {
+        let version = i as i64 + 1;
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)
+            .with_context(|| format!("applying schema migration {version}"))?;
+        // PRAGMA cannot take bound parameters; version is a trusted integer.
+        tx.execute_batch(&format!("PRAGMA user_version = {version}"))?;
+        tx.commit()?;
+        tracing::info!(version, "applied schema migration");
+    }
+    Ok(())
+}

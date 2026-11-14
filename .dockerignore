@@ -1,0 +1,8 @@
+target/
+data/
+.git/
+docs/
+*.db
+*.db-*
+.env
+.env.*

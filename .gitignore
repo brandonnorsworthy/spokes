@@ -1,0 +1,19 @@
+# Build output
+/target/
+
+# Local database files (host test instance, scratch copies)
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Environment files with real values
+.env
+.env.*
+!.env.example
+
+# Editors and OS junk
+.idea/
+.vscode/
+*.swp
+.DS_Store
