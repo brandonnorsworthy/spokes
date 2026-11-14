@@ -189,6 +189,8 @@ pub struct Node {
     pub title: String,
     pub status: Status,
     pub priority: Option<i64>,
+    /// Place on the global focus list (fractional key); `None` = not on it.
+    pub focus_rank: Option<String>,
     pub due_at: Option<String>,
     pub defer_until: Option<String>,
     pub waiting_on: Option<String>,
@@ -196,6 +198,8 @@ pub struct Node {
     pub claim_expires: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Last activity on the node or anything beneath it (bubbles up).
+    pub touched_at: String,
     pub has_notes: bool,
     /// A step of a written plan: the parent is a task with ordered children.
     pub is_step: bool,

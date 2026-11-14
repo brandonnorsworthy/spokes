@@ -4,9 +4,54 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{Kind, Node, Status};
 
-/// Today's date (UTC for now; a configured time zone arrives with deadlines).
-pub fn today() -> NaiveDate {
-    Utc::now().date_naive()
+/// Today's date in the configured time zone (`SPOKES_TZ`), so "due today" means the user's today.
+pub fn today_in(tz: chrono_tz::Tz) -> NaiveDate {
+    Utc::now().with_timezone(&tz).date_naive()
+}
+
+/// `due Nov 20`, `due today`, or `overdue Nov 10` once the date has passed.
+pub fn due_flag(due: &str, today: NaiveDate) -> String {
+    match parse_date(due) {
+        Some(d) if d < today => format!("overdue {}", short_date(due, today)),
+        Some(d) if d == today => "due today".to_string(),
+        _ => format!("due {}", short_date(due, today)),
+    }
+}
+
+/// One line of a sectioned listing (`next`), split into columns that are aligned
+/// across the section: an optional rank (`1.`), the id, the flags and the rest.
+pub struct Row {
+    pub rank: Option<usize>,
+    pub id: String,
+    pub flags: String,
+    pub rest: String,
+}
+
+/// Renders a section's rows with the spec's column alignment. `id_width` is shared
+/// by every section so ids line up down the whole reply.
+pub fn render_rows(rows: &[Row], id_width: usize) -> Vec<String> {
+    let flag_width = rows
+        .iter()
+        .map(|r| r.flags.chars().count())
+        .max()
+        .unwrap_or(0);
+    let rank_width = rows
+        .iter()
+        .filter_map(|r| r.rank)
+        .map(|n| n.to_string().len() + 2)
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|r| {
+            let rank = r.rank.map(|n| format!("{n}. ")).unwrap_or_default();
+            let mut line = format!("  {rank:<rank_width$}{:<id_width$}  ", r.id);
+            if flag_width > 0 {
+                line.push_str(&format!("{:<flag_width$}  ", r.flags));
+            }
+            line.push_str(&r.rest);
+            line.trim_end().to_string()
+        })
+        .collect()
 }
 
 /// `2026-11-20` -> `Nov 20`, or `Nov 20 2027` outside the current year.
@@ -73,7 +118,7 @@ fn detail_flags(node: &Node, today: NaiveDate, parent_due: Option<&str>, out: &m
         out.push(format!("p{p}"));
     }
     if let Some(due) = &node.due_at {
-        out.push(format!("due {}", short_date(due, today)));
+        out.push(due_flag(due, today));
         if let Some(bound) = parent_due
             && parse_date(due) > parse_date(bound)
         {
@@ -121,32 +166,6 @@ pub fn child_line(node: &Node, today: NaiveDate, parent_due: Option<&str>) -> St
     format!("{}  {}", flags.join(" "), node.title)
 }
 
-/// A queue line in `next`: `SPOKE-142  p1 due Nov 20  Title (2/6)`.
-pub fn queue_line(node: &Node, today: NaiveDate) -> String {
-    let mut flags = Vec::new();
-    if let Some(p) = node.priority {
-        flags.push(format!("p{p}"));
-    }
-    if let Some(due) = &node.due_at {
-        flags.push(format!("due {}", short_date(due, today)));
-    }
-    let mut line = node.id.to_string();
-    if !flags.is_empty() {
-        line.push_str("  ");
-        line.push_str(&flags.join(" "));
-    }
-    line.push_str("  ");
-    line.push_str(&node.title);
-    if let Some(p) = progress(node) {
-        line.push(' ');
-        line.push_str(&p);
-    }
-    if is_unplanned(node) {
-        line.push_str("  unplanned");
-    }
-    line
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +181,7 @@ mod tests {
             title: "Deploy game to production".into(),
             status: Status::Open,
             priority: Some(1),
+            focus_rank: None,
             due_at: Some("2026-11-20".into()),
             defer_until: None,
             waiting_on: None,
@@ -169,6 +189,7 @@ mod tests {
             claim_expires: None,
             created_at: "2026-11-01T00:00:00Z".into(),
             updated_at: "2026-11-01T00:00:00Z".into(),
+            touched_at: "2026-11-01T00:00:00Z".into(),
             has_notes: true,
             is_step: false,
             child_total: 6,
@@ -201,10 +222,6 @@ mod tests {
             child_line(&n, day(), None),
             "SPOKE-142 open unplanned  Deploy game to production"
         );
-        assert_eq!(
-            queue_line(&n, day()),
-            "SPOKE-142  Deploy game to production  unplanned"
-        );
     }
 
     #[test]
@@ -228,6 +245,47 @@ mod tests {
         assert_eq!(
             earliest(Some("2026-12-05"), Some("2026-11-20")),
             Some("2026-11-20")
+        );
+    }
+
+    #[test]
+    fn due_flags_and_aligned_rows() {
+        assert_eq!(due_flag("2026-11-10", day()), "overdue Nov 10");
+        assert_eq!(due_flag("2026-11-14", day()), "due today");
+        assert_eq!(due_flag("2026-11-20", day()), "due Nov 20");
+        let row = |rank, id: &str, flags: &str, rest: &str| Row {
+            rank,
+            id: id.into(),
+            flags: flags.into(),
+            rest: rest.into(),
+        };
+        let rows = [
+            row(
+                Some(1),
+                "SPOKE-142",
+                "p1 due Nov 20",
+                "Deploy game to production (2/6)",
+            ),
+            row(
+                Some(2),
+                "SPOKE-201",
+                "p2",
+                "Rewire garage outlet  unplanned",
+            ),
+        ];
+        assert_eq!(
+            render_rows(&rows, 9),
+            [
+                "  1. SPOKE-142  p1 due Nov 20  Deploy game to production (2/6)",
+                "  2. SPOKE-201  p2             Rewire garage outlet  unplanned"
+            ]
+        );
+        assert_eq!(
+            render_rows(
+                &[row(None, "SPOKE-67", "untouched 41d", "Workbench build")],
+                9
+            ),
+            ["  SPOKE-67   untouched 41d  Workbench build"]
         );
     }
 

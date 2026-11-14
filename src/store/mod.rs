@@ -4,16 +4,21 @@
 //! message says what to do next. Writes run in one transaction and log an event.
 
 mod add;
+mod focus;
+pub(crate) mod fts;
 mod get;
 mod moves;
 mod next;
+mod search;
 mod status;
 mod update;
 
 pub use add::add;
+pub use focus::focus;
 pub use get::get;
 pub use moves::move_node;
 pub use next::next;
+pub use search::search;
 pub use status::set_status;
 pub use update::update;
 
@@ -27,7 +32,7 @@ pub type ToolResult = Result<String, String>;
 /// Columns for [`Node`], selected from `nodes n`.
 pub(crate) const NODE_COLS: &str = "n.id, n.parent_id, n.position, n.kind, n.ordered, n.title, n.status,
     n.priority, n.due_at, n.defer_until, n.waiting_on, n.claimed_by, n.claim_expires,
-    n.created_at, n.updated_at,
+    n.created_at, n.updated_at, n.focus_rank, n.touched_at,
     EXISTS(SELECT 1 FROM notes t WHERE t.node_id = n.id) AS has_notes,
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status != 'dropped') AS child_total,
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status = 'done') AS child_done,
@@ -59,10 +64,12 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
         claim_expires: r.get(12)?,
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
-        has_notes: r.get(15)?,
-        child_total: r.get(16)?,
-        child_done: r.get(17)?,
-        is_step: r.get(18)?,
+        focus_rank: r.get(15)?,
+        touched_at: r.get(16)?,
+        has_notes: r.get(17)?,
+        child_total: r.get(18)?,
+        child_done: r.get(19)?,
+        is_step: r.get(20)?,
     })
 }
 

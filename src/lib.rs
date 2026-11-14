@@ -6,6 +6,7 @@ pub mod format;
 pub mod model;
 pub mod server;
 pub mod store;
+pub mod text;
 pub mod tools;
 
 use tokio::net::TcpListener;

@@ -10,6 +10,7 @@ publish = false
 anyhow = "1.0.104"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10.4"
 # The 2026-07-28 MCP support is new; pin the SDK exactly and read its changelog before bumping.
 rmcp = { version = "=3.10.0", features = ["server", "macros", "transport-streamable-http-server"] }
 rusqlite = { version = "0.42.0", features = ["bundled"] }

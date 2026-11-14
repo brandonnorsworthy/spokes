@@ -129,6 +129,7 @@ fn insert(
         )
         .map_err(db_err)?;
     }
+    super::fts::reindex(tx, id).map_err(db_err)?;
     log_event(tx, id, now, agent, "created", &spec.title).map_err(db_err)?;
     for child in &spec.children {
         insert(tx, id, child, now, agent, ids)?;

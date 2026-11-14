@@ -4,11 +4,19 @@
 //! a step that has shipped; append a new one (e.g. `ALTER TABLE ... ADD COLUMN`).
 
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
-const STEPS: &[&str] = &[
+/// One migration: plain SQL, or Rust code for steps that need it (e.g. backfills that
+/// normalize text, which SQL cannot do).
+enum Step {
+    Sql(&'static str),
+    Code(fn(&Transaction<'_>) -> rusqlite::Result<()>),
+}
+
+const STEPS: &[Step] = &[
     // 1: core tables from the spec's data model.
-    "CREATE TABLE nodes (
+    Step::Sql(
+        "CREATE TABLE nodes (
        id            INTEGER PRIMARY KEY AUTOINCREMENT,
        user_id       INTEGER NOT NULL DEFAULT 1,
        parent_id     INTEGER REFERENCES nodes(id),
@@ -49,7 +57,24 @@ const STEPS: &[&str] = &[
        detail  TEXT
      );
      CREATE INDEX events_node ON events(node_id, at);",
+    ),
+    // 2: the search index (trigram FTS5 over normalized text), backfilled from existing rows.
+    Step::Code(search_index),
 ];
+
+fn search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE VIRTUAL TABLE node_fts USING fts5(title, aliases, notes, tokenize = 'trigram')",
+    )?;
+    let ids: Vec<i64> = tx
+        .prepare("SELECT id FROM nodes")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        crate::store::fts::reindex(tx, crate::model::NodeId(id))?;
+    }
+    Ok(())
+}
 
 /// The schema version a fully migrated database has.
 pub fn latest() -> i64 {
@@ -64,11 +89,14 @@ pub fn apply(conn: &mut Connection) -> anyhow::Result<()> {
             latest()
         );
     }
-    for (i, sql) in STEPS.iter().enumerate().skip(current as usize) {
+    for (i, step) in STEPS.iter().enumerate().skip(current as usize) {
         let version = i as i64 + 1;
         let tx = conn.transaction()?;
-        tx.execute_batch(sql)
-            .with_context(|| format!("applying schema migration {version}"))?;
+        match step {
+            Step::Sql(sql) => tx.execute_batch(sql),
+            Step::Code(run) => run(&tx),
+        }
+        .with_context(|| format!("applying schema migration {version}"))?;
         // PRAGMA cannot take bound parameters; version is a trusted integer.
         tx.execute_batch(&format!("PRAGMA user_version = {version}"))?;
         tx.commit()?;

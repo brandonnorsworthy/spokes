@@ -18,6 +18,9 @@ pub struct Config {
     /// any request carrying an `Origin` header is refused, which blocks browser-driven
     /// attacks (CSRF, DNS rebinding); MCP clients such as Claude Code send no Origin.
     pub allowed_origins: Vec<String>,
+    /// `SPOKES_TZ`: IANA time zone name (e.g. `America/Chicago`), default `UTC`. Decides
+    /// what "today" means for due dates and deferrals.
+    pub tz: chrono_tz::Tz,
 }
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
@@ -43,11 +46,18 @@ impl Config {
             .filter(|v| v.trim() != "*")
             .map(list);
         let allowed_origins = get("SPOKES_ALLOWED_ORIGINS").map(list).unwrap_or_default();
+        let tz = get("SPOKES_TZ").unwrap_or_else(|| "UTC".to_string());
+        let tz = tz.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "SPOKES_TZ '{tz}' is not an IANA time zone name, e.g. America/Chicago or UTC"
+            )
+        })?;
         Ok(Config {
             bind,
             db_path,
             allowed_hosts,
             allowed_origins,
+            tz,
         })
     }
 }

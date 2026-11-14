@@ -25,20 +25,24 @@ The finished v1 is for one person (Brandon) and the models and agents working fo
 | --- | --- | --- |
 | **M0, walking skeleton** | `add`, `get`, `next`, `set_status` on SQLite (WAL), stateless Streamable HTTP on `/mcp`, Docker image. Done when a fresh chat can add three areas and list them | **Done** |
 | **M1, the tree** | Ordered/unordered children, `move`, `update`, notes apart from listings, nested `add`, breadcrumb paths, the full compact output format. Done when a model can write and walk a six-step plan in three calls | **Done** |
-| M2, finding and ranking | `search` (aliases, trigram FTS5), priority inheritance, `focus`, due dates, the full `next` ordering. Done when "priority tasks for my server" finds the right project from a blank context | Not started (**current**) |
-| M3, agents | `claim`, `release`, `ask`, `answer`, leases, event log surfaced. Done when two terminals asking "what's next" get different tasks | Not started |
+| **M2, finding and ranking** | `search` (aliases, normalization, trigram FTS5), priority inheritance, `focus`, due dates with `SPOKES_TZ`, the full `next` ordering. Done when "priority tasks for my server" finds the right project from a blank context | **Done** |
+| M3, agents | `claim`, `release`, `ask`, `answer`, leases, event log surfaced. Done when two terminals asking "what's next" get different tasks | Not started (**current**) |
 | M4, time and reach | Recurrence, `defer_until`, staleness, nightly backup. Done when a restore from backup works | Not started |
 | After v1 | Auth and multiple users (OAuth, `user_id` already on every row), links (blocks/related), notifications, read-only web view, semantic search | Not started |
 
-### What works today (M0 + M1)
+### What works today (M0 + M1 + M2)
 
-Six of the twelve tools: `next`, `get`, `add`, `update`, `set_status`, `move`.
+Eight of the twelve tools: `next`, `get`, `search`, `add`, `update`, `set_status`, `move`, `focus`.
 
 - `add`: one node, or a whole plan in one call with nested `children` (any depth up to 8, at most 200 nodes, one transaction). Returns one line with every new id, e.g. `Added SPOKE-5 task  Deploy  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11`. A bad child names itself (`children[3] ("Push"): ...`) and nothing is written.
 - `get`: the node's header line, its breadcrumb (`Hobbies / Programming / Skyforge`) and an outline `depth` levels deep (default 1, max 10), indented per level. Ordered children are numbered and the actionable step is marked `<- next`; unordered children are bulleted. The outline is capped at 60 lines and ends with `(+N more ...)` lines for what was cut by the cap or lies below the depth, plus a count of hidden dropped nodes. A child whose due date is later than a parent's shows `(after parent's Nov 20)`. `notes: true` appends the body.
+- Levels: `priority` 1 to 4 on any node; unset nodes inherit the nearest ancestor's level. `get` shows a node's own level; `next` and `search` show the effective one.
 - `update`: title, kind, ordered, priority (`0` clears), due / defer_until (`""` clears), aliases (`[]` clears), `notes` (replace; `""` clears) or `notes_append` (adds a paragraph). Kind changes keep the rule that areas only live under areas and never finish.
 - `move`: reparent (`parent`) and/or reorder (`before` / `after` a sibling; without either it goes last). Writes one row via fractional positions. Refuses moving the root, cycles, areas under tasks and closed parents.
-- `next`: questions/stalled claims first, then work items (open tasks not inside another task) by priority, due date and age, with progress and the next actionable step (`next: SPOKE-7 ...`, honouring ordered vs unordered and `defer_until`). Focus, due-soon and stale sections come in M2/M4.
+- `next`: the queue, in sections, one line per work item, each node at most once:
+  `NEEDS YOU` (questions, then stalled claims), `FOCUS` (the ranked list, numbered by global rank), `DUE SOON` (overdue first, then due within 7 days), `UP NEXT` (priority level 1 to 4, then unset, oldest first) and `STALE` (up to 3 work items untouched for 30+ days, a nudge outside `limit`). Work items are top-level tasks (directly under areas), deeper tasks that carry their own level or due date, and anything on the focus list; later steps of an ordered parent are held back. Lines show the effective level (own, or inherited from the nearest ancestor), `due Nov 20` / `due today` / `overdue Nov 10`, progress and `next: SPOKE-7 ...` (the next actionable step). Columns are aligned as in the spec sample. `scope` limits it to a subtree; `limit` (default 5) caps the first four sections, ending with `(+N more open. Pass scope or limit.)`. Warns when the focus list passes 10 entries.
+- `search`: several keywords in one `query`, matched as alternatives (`server homelab nas proxmox`). Text is normalized (lowercase, accents folded, punctuation stripped, plus a squashed no-space form, so `home-lab` / `home lab` / `homelab` match) and indexed in an FTS5 trigram table. Typos still hit (edit distance 1-2 or shared trigrams); keywords under 3 letters (`pc`, `tv`) match whole words only; filler words (`for`, `my`, `tasks`) are ignored, but a whole multi-word title or alias found in the query (`my server`) earns a bonus. Ranked title > aliases > notes, ties by level. Each line has flags, the effective level, `focus #N`, the breadcrumb (`in Hobbies / Homelab`) and, when the title did not match, why it did (`(alias "nas")`, `(in notes)`). Default 10 results (`limit` up to 50), `scope`, `include_done` (done/dropped nodes and everything under them are hidden by default, with a count).
+- `focus`: put a node at any depth (task or area) on the global ranked list: append, `rank` (1 = top, clamps to the end), or `before` / `after` another entry; `remove: true` takes it off. Fractional `focus_rank` keys, one row per write. Closing a node (`done`/`dropped`) takes it off the list. Warns past 10 entries.
 - `set_status`: `done`, `dropped` or `open` on several ids at once. Areas cannot be done. After closing a step it names the next step of an ordered parent, or, when it was the last open step, suggests closing the parent (it never closes it itself).
 - Notes live in their own table and never appear in listings; `+notes` says a body exists.
 - `unplanned` marks a task with no children and no notes, except steps of an ordered task (the parent is their plan).
@@ -76,6 +80,7 @@ Environment variables only:
 | `SPOKES_DB_PATH` | `data/spokes.db` (image: `/data/spokes.db`) | SQLite file; its directory is created if missing |
 | `SPOKES_ALLOWED_HOSTS` | unset (any `Host`) | Comma-separated `Host` header values to accept, e.g. `spokes.lan,192.168.5.100`. `*` or unset accepts any |
 | `SPOKES_ALLOWED_ORIGINS` | unset (refuse any `Origin`) | Comma-separated browser origins to accept. By default every request that carries an `Origin` header is refused (403), which blocks browser-driven attacks such as DNS rebinding. MCP clients like Claude Code and OpenCode send no `Origin` |
+| `SPOKES_TZ` | `UTC` | IANA time zone name (e.g. `America/Chicago`). Decides what "today" is for due dates, `overdue` and `defer_until`. An unknown name stops startup with an error |
 | `SPOKES_LOG` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 
 There is no auth in v1: run it only on the LAN or a private Tailscale network.
@@ -110,7 +115,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence) and the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths).
+`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence), the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths) and M2 (search normalization, typos, short keywords, ranking, scope and include_done over a tree with decoys; level inheritance; focus placement and errors; due ordering and every `next` section; `SPOKES_TZ`).
 
 ### Layout
 
@@ -120,10 +125,11 @@ cargo test
 | `src/config.rs` | Environment variables |
 | `src/server.rs` | axum router: `/mcp` (rmcp Streamable HTTP, stateless) and `/health` |
 | `src/tools/` | MCP surface: tool definitions, argument schemas, server instructions |
-| `src/store/` | One file per operation (`add`, `get`, `next`, `status`, `update`, `moves`) plus shared queries |
+| `src/store/` | One file per operation (`add`, `get`, `next`, `search`, `focus`, `status`, `update`, `moves`), `fts.rs` (keeps the search index in step), plus shared queries |
+| `src/text.rs` | Search normalization, keywords and fuzzy matching |
 | `src/db/` | Opening SQLite (WAL), migrations (`PRAGMA user_version` steps), root seed, fractional position keys |
 | `src/model.rs`, `src/format.rs` | Domain types and the one-line-per-node text format |
 
-Schema changes: append a step to `STEPS` in `src/db/migrations.rs`; never edit a shipped step.
+Schema changes: append a step to `STEPS` in `src/db/migrations.rs` (SQL, or a Rust function for backfills); never edit a shipped step. Step 2 creates `node_fts` and backfills it. The index is written from Rust (`store::fts::reindex`) by `add` and `update`, not by triggers, because the text is normalized in Rust; status and position live only in `nodes`, which search joins.
 
 The MCP SDK (`rmcp`) is pinned to an exact version; read its changelog before bumping.

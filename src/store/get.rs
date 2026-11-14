@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{NODE_COLS, ToolResult, ancestors, breadcrumb, db_err, node_from_row, require};
-use crate::format::{child_line, earliest, header_line, today};
+use crate::format::{child_line, earliest, header_line};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
 use crate::tools::args::GetArgs;
 
@@ -14,7 +14,7 @@ const MAX_DEPTH: i64 = 10;
 /// Cap on outline lines so a huge subtree stays cheap to read.
 const MAX_LINES: usize = 60;
 
-pub fn get(conn: &Connection, args: GetArgs) -> ToolResult {
+pub fn get(conn: &Connection, args: GetArgs, today: NaiveDate) -> ToolResult {
     let id = match &args.id {
         Some(i) => i.parse()?,
         None => ROOT_ID,
@@ -24,7 +24,6 @@ pub fn get(conn: &Connection, args: GetArgs) -> ToolResult {
         None => 1,
     };
     let node = require(conn, id)?;
-    let today = today();
 
     let above = ancestors(conn, id)?;
     let above_due = above
@@ -205,7 +204,12 @@ mod tests {
         for t in ["Home", "Work", "Hobbies"] {
             add(&mut conn, args(None, t, Kind::Area)).unwrap();
         }
-        let out = get(&conn, get_args(None, None)).unwrap();
+        let out = get(
+            &conn,
+            get_args(None, None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert_eq!(
             out,
             "SPOKE-1 area  To do\n  - SPOKE-2 area  Home\n  - SPOKE-3 area  Work\n  - SPOKE-4 area  Hobbies"
@@ -230,6 +234,7 @@ mod tests {
                 depth: None,
                 notes: Some(true),
             },
+            crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
         assert_eq!(
@@ -242,7 +247,12 @@ mod tests {
     #[test]
     fn missing_node_is_an_actionable_error() {
         let (conn, dir) = temp_db("get-missing");
-        let err = get(&conn, get_args(Some(42), None)).unwrap_err();
+        let err = get(
+            &conn,
+            get_args(Some(42), None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap_err();
         assert!(err.starts_with("SPOKE-42 does not exist"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -262,7 +272,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let out = get(&conn, get_args(Some(2), None)).unwrap();
+        let out = get(
+            &conn,
+            get_args(Some(2), None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2 + 60 + 3, "{out}");
         assert_eq!(

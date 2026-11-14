@@ -10,8 +10,11 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use rusqlite::Connection;
 
+use crate::format::today_in;
 use crate::store::{self, ToolResult};
-use args::{AddArgs, GetArgs, MoveArgs, NextArgs, SetStatusArgs, UpdateArgs};
+use args::{
+    AddArgs, FocusArgs, GetArgs, MoveArgs, NextArgs, SearchArgs, SetStatusArgs, UpdateArgs,
+};
 
 /// The one SQLite connection, shared by every request.
 pub type Db = Arc<Mutex<Connection>>;
@@ -21,9 +24,11 @@ pub const INSTRUCTIONS: &str = "\
 Spokes is one tree of to-dos. IDs look like SPOKE-12 (a bare 12 also works). The root is SPOKE-1 \"To do\".
 Areas (kind area: Home, Work) hold work forever and never finish; tasks get done or dropped. Nothing is deleted.
 An ordered parent's children are steps: only the first unfinished one is actionable (marked <- next).
-- \"What should I do?\" -> next. Browse with get (start at SPOKE-1; depth 2+ for a deeper outline).
-- Look before adding (get the likely parent) so you don't create duplicates.
-- Write a whole plan in one add with nested children. Give new nodes 2 to 5 aliases. Long detail goes in notes, not the title.
+- \"What should I do?\" -> next (scope narrows it to one subtree).
+- To find something (\"my server\"), search first, with several keywords at once: names, synonyms, likely spellings. Results show each node's path; ask the user only if it is truly ambiguous.
+- Search before adding, so you don't create duplicates and the node lands under the right parent.
+- Write a whole plan in one add with nested children. Give every new node 2 to 5 aliases (synonyms, plain spelling, what you'd call it out loud). Long detail goes in notes, not the title.
+- Priority: level 1-4 (inherits downward) for \"this matters\"; focus for the short ranked top list.
 - +notes means a body exists; read it with get notes: true. Record progress with update notes_append.
 - agent is optional bookkeeping (e.g. your model name); don't mention it to the user. Ask the user rather than guess.";
 
@@ -33,6 +38,8 @@ An ordered parent's children are steps: only the first unfinished one is actiona
 pub struct Spokes {
     db: Db,
     tool_router: ToolRouter<Self>,
+    /// `SPOKES_TZ`: decides what "today" is for due dates and deferrals.
+    tz: chrono_tz::Tz,
 }
 
 #[tool_router]
@@ -42,8 +49,12 @@ impl Spokes {
         Self::tool_router()
     }
 
-    pub fn new(db: Db, tool_router: ToolRouter<Self>) -> Self {
-        Self { db, tool_router }
+    pub fn new(db: Db, tool_router: ToolRouter<Self>, tz: chrono_tz::Tz) -> Self {
+        Self {
+            db,
+            tool_router,
+            tz,
+        }
     }
 
     /// Runs a store operation on the blocking pool so SQLite never stalls the runtime.
@@ -65,17 +76,34 @@ impl Spokes {
     }
 
     #[tool(
-        description = "What to work on next: questions waiting for the user, then open tasks by priority, one line each. Use scope to look under one node."
+        description = "What to work on next, one line per work item: what needs the user, the focus list, what is due or overdue, then open work by priority level, and a few stale items. Use scope to look under one node."
     )]
     async fn next(&self, Parameters(args): Parameters<NextArgs>) -> ToolResult {
-        self.run(move |c| store::next(c, args)).await
+        let today = today_in(self.tz);
+        self.run(move |c| store::next(c, args, today)).await
+    }
+
+    #[tool(
+        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. Each result shows its path. Search before adding."
+    )]
+    async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> ToolResult {
+        let today = today_in(self.tz);
+        self.run(move |c| store::search(c, args, today)).await
+    }
+
+    #[tool(
+        description = "Put a node (any depth) on the short global ranked focus list, move it (rank 1 = top, or before/after another entry), or take it off (remove: true). Keep the list to about 10."
+    )]
+    async fn focus(&self, Parameters(args): Parameters<FocusArgs>) -> ToolResult {
+        self.run(move |c| store::focus(c, args)).await
     }
 
     #[tool(
         description = "Show one node, its path and an outline of its children (depth levels, default 1). Ordered steps are numbered and the actionable one is marked <- next. Notes only with notes: true."
     )]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> ToolResult {
-        self.run(move |c| store::get(c, args)).await
+        let today = today_in(self.tz);
+        self.run(move |c| store::get(c, args, today)).await
     }
 
     #[tool(

@@ -1,23 +1,35 @@
 //! `next`: the queue of what needs the user and what can be worked on.
 //!
-//! M0 ordering: questions and stalled claims first, then work items by level, due
-//! date and age. Focus, due-soon and stale sections arrive in later milestones.
+//! Sections, in order: NEEDS YOU (questions, then stalled claims), FOCUS (the global
+//! ranked list), DUE SOON (overdue, then due within 7 days), UP NEXT (by priority
+//! level 1..4, oldest first; unset levels inherit the nearest ancestor's) and STALE
+//! (up to three work items untouched for 30 days). A node is listed once at most.
+//!
+//! The queue lists work items, not every leaf: top-level tasks (directly under areas)
+//! plus any deeper task that carries its own level or due date, and anything on the
+//! focus list. Each line shows progress and the next actionable step beneath it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use chrono::{NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use rusqlite::{Connection, params};
 
-use super::{NODE_COLS, ToolResult, db_err, node_from_row, require};
+use super::focus::{focus_numbers, too_long_note};
+use super::{NODE_COLS, ToolResult, ancestors, db_err, node_from_row, require};
 use crate::db::now;
-use crate::format::{ago, parse_date, queue_line, today};
+use crate::format::{Row, ago, due_flag, is_unplanned, parse_date, progress, render_rows};
 use crate::model::{DEFAULT_USER, Kind, Node, NodeId, ROOT_ID, Status};
 use crate::tools::args::NextArgs;
 
 const DEFAULT_LIMIT: i64 = 5;
 const MAX_LIMIT: i64 = 50;
+/// DUE SOON covers overdue items and anything due within this many days.
+const DUE_SOON_DAYS: i64 = 7;
+/// STALE: untouched for at least this many days, at most this many lines.
+const STALE_DAYS: i64 = 30;
+const STALE_MAX: usize = 3;
 
-pub fn next(conn: &Connection, args: NextArgs) -> ToolResult {
+pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
     let scope_id = match &args.scope {
         Some(s) => s.parse()?,
         None => ROOT_ID,
@@ -35,28 +47,34 @@ pub fn next(conn: &Connection, args: NextArgs) -> ToolResult {
             scope.status.as_str()
         ));
     }
+    // The level the scope itself carries, own or inherited from above it.
+    let inherited = match scope.priority {
+        Some(p) => Some(p),
+        None => ancestors(conn, scope.id)?
+            .iter()
+            .rev()
+            .find_map(|a| a.priority),
+    };
 
     let tree = Tree::load(conn)?;
     let mut queue = Queue {
         now: now(),
-        today: today(),
+        today,
         needs_you: Vec::new(),
+        focus: Vec::new(),
         work: Vec::new(),
     };
-    queue.walk(&tree, &scope, true);
-    queue.work.sort_by(|a, b| {
-        let key = |n: &Node| {
-            (
-                n.priority.unwrap_or(5),
-                n.due_at.is_none(),
-                n.due_at.clone(),
-                n.created_at.clone(),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
+    queue.walk(
+        &tree,
+        &scope,
+        Walk {
+            top: true,
+            reachable: true,
+            level: inherited,
+        },
+    );
 
-    let total = queue.needs_you.len() + queue.work.len();
+    let total = queue.needs_you.len() + queue.focus.len() + queue.work.len();
     if total == 0 {
         return Ok(format!(
             "Nothing actionable under {} {}. Add a task with add.",
@@ -64,49 +82,188 @@ pub fn next(conn: &Connection, args: NextArgs) -> ToolResult {
         ));
     }
 
+    // Questions first, then stalled claims (walk order within each).
+    queue.needs_you.sort_by_key(|n| n.status != Status::Waiting);
+    let ranks = focus_numbers(conn)?;
+    queue
+        .focus
+        .sort_by(|a, b| a.node.focus_rank.cmp(&b.node.focus_rank));
+    let horizon = today + Duration::days(DUE_SOON_DAYS);
+    let (mut due, mut rest): (Vec<Item>, Vec<Item>) = queue.work.into_iter().partition(|i| {
+        i.node
+            .due_at
+            .as_deref()
+            .and_then(parse_date)
+            .is_some_and(|d| d <= horizon)
+    });
+    due.sort_by(|a, b| {
+        let key = |i: &Item| {
+            (
+                parse_date(i.node.due_at.as_deref().unwrap_or_default()),
+                i.sort_level(),
+                i.node.created_at.clone(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    rest.sort_by(|a, b| {
+        let key = |i: &Item| (i.sort_level(), i.node.created_at.clone(), i.node.id);
+        key(a).cmp(&key(b))
+    });
+
     let now_dt = Utc::now();
+    let mut budget = limit;
+    let mut take = |len: usize| {
+        let n = len.min(budget);
+        budget -= n;
+        n
+    };
+    let mut sections: Vec<(&str, Vec<Row>)> = Vec::new();
+    let mut shown: HashSet<NodeId> = HashSet::new();
+
+    let n = take(queue.needs_you.len());
+    let rows: Vec<Row> = queue.needs_you[..n]
+        .iter()
+        .map(|node| needs_you_row(node, now_dt))
+        .collect();
+    shown.extend(queue.needs_you[..n].iter().map(|node| node.id));
+    sections.push(("NEEDS YOU", rows));
+
+    let n = take(queue.focus.len());
+    let rows = queue.focus[..n]
+        .iter()
+        .map(|i| {
+            let mut row = work_row(i, &tree, today);
+            row.rank = ranks.get(&i.node.id).copied();
+            row
+        })
+        .collect();
+    shown.extend(queue.focus[..n].iter().map(|i| i.node.id));
+    sections.push(("FOCUS", rows));
+
+    let n = take(due.len());
+    sections.push((
+        "DUE SOON",
+        due[..n].iter().map(|i| work_row(i, &tree, today)).collect(),
+    ));
+    shown.extend(due[..n].iter().map(|i| i.node.id));
+
+    let n = take(rest.len());
+    sections.push((
+        "UP NEXT",
+        rest[..n]
+            .iter()
+            .map(|i| work_row(i, &tree, today))
+            .collect(),
+    ));
+    shown.extend(rest[..n].iter().map(|i| i.node.id));
+
+    // A nudge outside the limit: work items nobody has touched in a month.
+    let cutoff =
+        (now_dt - Duration::days(STALE_DAYS)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut stale: Vec<&Item> = due
+        .iter()
+        .chain(rest.iter())
+        .filter(|i| !shown.contains(&i.node.id) && i.node.touched_at <= cutoff)
+        .collect();
+    stale.sort_by(|a, b| (&a.node.touched_at, a.node.id).cmp(&(&b.node.touched_at, b.node.id)));
+    stale.truncate(STALE_MAX);
+    let rows = stale
+        .iter()
+        .map(|i| Row {
+            rank: None,
+            id: i.node.id.to_string(),
+            flags: format!(
+                "untouched {}",
+                ago(&i.node.touched_at, now_dt).trim_end_matches(" ago")
+            ),
+            rest: i.node.title.clone(),
+        })
+        .collect();
+    shown.extend(stale.iter().map(|i| i.node.id));
+    sections.push(("STALE", rows));
+
+    let id_width = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|r| r.id.len()))
+        .max()
+        .unwrap_or(0);
     let mut out = Vec::new();
-    let mut shown = 0;
-    if !queue.needs_you.is_empty() {
-        out.push("NEEDS YOU".to_string());
-        for n in queue.needs_you.iter().take(limit) {
-            out.push(format!("  {}", needs_you_line(n, now_dt)));
-            shown += 1;
+    for (title, rows) in &sections {
+        if rows.is_empty() {
+            continue;
         }
+        out.push((*title).to_string());
+        out.extend(render_rows(rows, id_width));
     }
-    if shown < limit && !queue.work.is_empty() {
-        out.push("UP NEXT".to_string());
-        for n in queue.work.iter().take(limit - shown) {
-            let mut line = format!("  {}", queue_line(n, queue.today));
-            if let Some(step) = tree.next_step(n.id, n.ordered, queue.today) {
-                line.push_str(&format!("  next: {} {}", step.id, step.title));
-            }
-            out.push(line);
-            shown += 1;
-        }
+    if let Some(note) = too_long_note(ranks.len()) {
+        out.push(format!("({note})"));
     }
-    if total > shown {
+    if total > shown.len() {
         out.push(format!(
             "(+{} more open. Pass scope or limit.)",
-            total - shown
+            total - shown.len()
         ));
     }
     Ok(out.join("\n"))
 }
 
-fn needs_you_line(n: &Node, now_dt: chrono::DateTime<Utc>) -> String {
-    if n.status == Status::Waiting {
-        let mut line = format!("{}  waiting  {}", n.id, n.title);
+/// A queue entry and its effective level (own, or the nearest ancestor's).
+struct Item {
+    node: Node,
+    level: Option<i64>,
+}
+
+impl Item {
+    /// Unset levels sort after level 4.
+    fn sort_level(&self) -> i64 {
+        self.level.unwrap_or(5)
+    }
+}
+
+/// `SPOKE-142  p1 due Nov 20  Deploy game to production (2/6)  next: SPOKE-145 Add secrets`.
+fn work_row(item: &Item, tree: &Tree, today: NaiveDate) -> Row {
+    let node = &item.node;
+    let mut flags = Vec::new();
+    if let Some(level) = item.level {
+        flags.push(format!("p{level}"));
+    }
+    if let Some(due) = &node.due_at {
+        flags.push(due_flag(due, today));
+    }
+    let mut rest = node.title.clone();
+    if let Some(p) = progress(node) {
+        rest.push(' ');
+        rest.push_str(&p);
+    }
+    if is_unplanned(node) {
+        rest.push_str("  unplanned");
+    }
+    if let Some(step) = tree.next_step(node.id, node.ordered, today) {
+        rest.push_str(&format!("  next: {} {}", step.id, step.title));
+    }
+    Row {
+        rank: None,
+        id: node.id.to_string(),
+        flags: flags.join(" "),
+        rest,
+    }
+}
+
+/// `SPOKE-88  waiting  Set up emulator: "Install to D: or E:?" (sonnet-2, 3h ago)`.
+fn needs_you_row(n: &Node, now_dt: chrono::DateTime<Utc>) -> Row {
+    let (flags, rest) = if n.status == Status::Waiting {
+        let mut rest = n.title.clone();
         if let Some(q) = &n.waiting_on {
-            line.push_str(&format!(": \"{q}\""));
+            rest.push_str(&format!(": \"{q}\""));
         }
         let who = n
             .claimed_by
             .as_deref()
             .map(|a| format!("{a}, "))
             .unwrap_or_default();
-        line.push_str(&format!(" ({who}{})", ago(&n.updated_at, now_dt)));
-        line
+        rest.push_str(&format!(" ({who}{})", ago(&n.updated_at, now_dt)));
+        ("waiting", rest)
     } else {
         let who = n.claimed_by.as_deref().unwrap_or("an agent");
         let since = n
@@ -114,10 +271,16 @@ fn needs_you_line(n: &Node, now_dt: chrono::DateTime<Utc>) -> String {
             .as_deref()
             .map(|e| ago(e, now_dt))
             .unwrap_or_default();
-        format!(
-            "{}  stalled  {}  (claim by {who} expired {since})",
-            n.id, n.title
+        (
+            "stalled",
+            format!("{}  (claim by {who} expired {since})", n.title),
         )
+    };
+    Row {
+        rank: None,
+        id: n.id.to_string(),
+        flags: flags.to_string(),
+        rest,
     }
 }
 
@@ -163,9 +326,10 @@ impl Tree {
                 .is_some_and(|d| d > today);
             if kid.status == Status::Open && !deferred {
                 if self.kids(kid.id).is_empty() {
-                    return Some(kid);
-                }
-                if let Some(step) = self.next_step(kid.id, kid.ordered, today) {
+                    if kid.kind == Kind::Task {
+                        return Some(kid);
+                    }
+                } else if let Some(step) = self.next_step(kid.id, kid.ordered, today) {
                     return Some(step);
                 }
             }
@@ -177,17 +341,27 @@ impl Tree {
     }
 }
 
+/// What the walk knows about the path down to the current parent.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// Still among areas: a task found here is a top-level work item.
+    top: bool,
+    /// No ordered parent above holds this branch behind an earlier step.
+    reachable: bool,
+    /// The level inherited from the nearest ancestor that sets one.
+    level: Option<i64>,
+}
+
 struct Queue {
     now: String,
     today: NaiveDate,
     needs_you: Vec<Node>,
-    work: Vec<Node>,
+    focus: Vec<Item>,
+    work: Vec<Item>,
 }
 
 impl Queue {
-    /// Walks the live tree. `collect_work` is false once inside a task (the queue lists
-    /// work items, not every leaf) or behind an earlier step of an ordered parent.
-    fn walk(&mut self, tree: &Tree, parent: &Node, collect_work: bool) {
+    fn walk(&mut self, tree: &Tree, parent: &Node, at: Walk) {
         let mut earlier_open_step = false;
         for kid in tree.kids(parent.id) {
             let blocked = parent.ordered && earlier_open_step;
@@ -218,14 +392,29 @@ impl Queue {
                 }
                 _ => {}
             }
-            let is_work_item = kid.kind == Kind::Task && collect_work && !blocked;
-            if is_work_item {
-                self.work.push(kid.clone());
+            let level = kid.priority.or(at.level);
+            let reachable = at.reachable && !blocked;
+            let item = || Item {
+                node: kid.clone(),
+                level,
+            };
+            if kid.focus_rank.is_some() {
+                // Explicitly ranked, so it is listed even behind an earlier step.
+                self.focus.push(item());
+            } else if kid.kind == Kind::Task
+                && reachable
+                && (at.top || kid.priority.is_some() || kid.due_at.is_some())
+            {
+                self.work.push(item());
             }
             self.walk(
                 tree,
                 kid,
-                collect_work && !blocked && kid.kind == Kind::Area,
+                Walk {
+                    top: at.top && reachable && kid.kind == Kind::Area,
+                    reachable,
+                    level,
+                },
             );
         }
     }
@@ -250,7 +439,12 @@ mod tests {
     fn empty_tree_says_what_to_do() {
         let (conn, dir) = temp_db("next-empty");
         assert_eq!(
-            next(&conn, next_args(None, None)).unwrap(),
+            next(
+                &conn,
+                next_args(None, None),
+                crate::format::today_in(chrono_tz::UTC)
+            )
+            .unwrap(),
             "Nothing actionable under SPOKE-1 To do. Add a task with add."
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -271,12 +465,22 @@ mod tests {
         add(&mut conn, urgent).unwrap();
         add(&mut conn, args(Some(2), "Someday", Kind::Task)).unwrap(); // 7
 
-        let out = next(&conn, next_args(None, None)).unwrap();
+        let out = next(
+            &conn,
+            next_args(None, None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert_eq!(
             out,
-            "UP NEXT\n  SPOKE-6  p1  Pay bill  unplanned\n  SPOKE-3  p2  Fix garage (0/2)  next: SPOKE-4 Buy parts\n  SPOKE-7  Someday  unplanned"
+            "UP NEXT\n  SPOKE-6  p1  Pay bill  unplanned\n  SPOKE-3  p2  Fix garage (0/2)  next: SPOKE-4 Buy parts\n  SPOKE-7      Someday  unplanned"
         );
-        let out = next(&conn, next_args(None, Some(1))).unwrap();
+        let out = next(
+            &conn,
+            next_args(None, Some(1)),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert!(
             out.ends_with("(+2 more open. Pass scope or limit.)"),
             "{out}"
@@ -292,7 +496,12 @@ mod tests {
         add(&mut conn, area).unwrap(); // 2
         add(&mut conn, args(Some(2), "First", Kind::Task)).unwrap();
         add(&mut conn, args(Some(2), "Second", Kind::Task)).unwrap();
-        let out = next(&conn, next_args(Some(2), None)).unwrap();
+        let out = next(
+            &conn,
+            next_args(Some(2), None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
         assert_eq!(out, "UP NEXT\n  SPOKE-3  First  unplanned");
         let _ = std::fs::remove_dir_all(dir);
     }

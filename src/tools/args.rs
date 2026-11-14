@@ -62,7 +62,7 @@ pub struct NextArgs {
     /// Only look under this node, e.g. "SPOKE-3". Omit for everything.
     #[schemars(with = "Option<String>")]
     pub scope: Option<IdArg>,
-    /// Max lines (default 5).
+    /// Max lines (default 5), not counting up to 3 stale nudges.
     #[schemars(with = "Option<u32>")]
     pub limit: Option<NumArg>,
 }
@@ -120,6 +120,40 @@ pub struct MoveArgs {
     /// Place just after this sibling. Without before or after the node goes last.
     #[schemars(with = "Option<String>")]
     pub after: Option<IdArg>,
+    /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// Several keywords at once, matched as alternatives: names, synonyms, likely misspellings, e.g. "server homelab nas proxmox".
+    pub query: String,
+    /// Only search under this node, e.g. "SPOKE-3". Omit for everything.
+    #[schemars(with = "Option<String>")]
+    pub scope: Option<IdArg>,
+    /// Also find done and dropped nodes (default false).
+    pub include_done: Option<bool>,
+    /// Max results (default 10).
+    #[schemars(with = "Option<u32>")]
+    pub limit: Option<NumArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FocusArgs {
+    /// The node to place on (or take off) the focus list, at any depth, e.g. "SPOKE-12".
+    #[schemars(with = "String")]
+    pub id: IdArg,
+    /// Place it at this position, 1 = top. Without rank, before or after it goes last.
+    #[schemars(with = "Option<u32>")]
+    pub rank: Option<NumArg>,
+    /// Place it just above this focus-list entry.
+    #[schemars(with = "Option<String>")]
+    pub before: Option<IdArg>,
+    /// Place it just below this focus-list entry.
+    #[schemars(with = "Option<String>")]
+    pub after: Option<IdArg>,
+    /// true takes it off the focus list (its priority level stays).
+    pub remove: Option<bool>,
     /// Optional bookkeeping: a short label for which agent or session is acting (e.g. your model or terminal name). No need to mention it to the user.
     pub agent: Option<String>,
 }

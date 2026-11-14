@@ -27,7 +27,11 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs) -> ToolResult {
     for raw in &args.ids {
         match change_one(&tx, raw.parse(), target, agent.as_deref(), &now)? {
             Outcome::Changed(node) => {
-                lines.push(format!("{} {}  {}", node.id, target.as_str(), node.title));
+                let mut line = format!("{} {}  {}", node.id, target.as_str(), node.title);
+                if target.is_closed() && node.focus_rank.is_some() {
+                    line.push_str("  (taken off the focus list)");
+                }
+                lines.push(line);
                 changed.push(node);
             }
             Outcome::Unchanged(line) => lines.push(line),
@@ -121,10 +125,12 @@ fn change_one(
     }
 
     let completed_at = (target == Status::Done).then_some(now);
-    // Any of these endings clears a claim and an open question.
+    // Any of these endings clears a claim and an open question; closing a node also
+    // takes it off the focus list, which keeps that list short by itself.
     conn.execute(
         "UPDATE nodes SET status = ?1, completed_at = ?2, claimed_by = NULL, claim_expires = NULL,
-                          waiting_on = NULL, updated_at = ?3
+                          waiting_on = NULL, updated_at = ?3,
+                          focus_rank = CASE WHEN ?1 IN ('done', 'dropped') THEN NULL ELSE focus_rank END
          WHERE id = ?4",
         params![target.as_str(), completed_at, now, id.0],
     )

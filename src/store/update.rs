@@ -158,6 +158,7 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
         params![now, id.0],
     )
     .map_err(db_err)?;
+    super::fts::reindex(&tx, id).map_err(db_err)?;
     let detail = changed.join(", ");
     log_event(&tx, id, &now, agent.as_deref(), "updated", &detail).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
@@ -224,7 +225,7 @@ mod tests {
 
     fn get_text(conn: &Connection, id: i64, notes: bool) -> String {
         let a: GetArgs = serde_json::from_value(json!({"id": id, "notes": notes})).unwrap();
-        get(conn, a).unwrap()
+        get(conn, a, crate::format::today_in(chrono_tz::UTC)).unwrap()
     }
 
     type Row = (

@@ -62,6 +62,7 @@ fn seed_root(conn: &Connection) -> anyhow::Result<()> {
         "INSERT INTO events (node_id, at, agent, type, detail) VALUES (?1, ?2, 'spokes', 'created', 'To do')",
         rusqlite::params![ROOT_ID.0, now],
     )?;
+    crate::store::fts::reindex(&tx, ROOT_ID)?;
     tx.commit()?;
     Ok(())
 }
