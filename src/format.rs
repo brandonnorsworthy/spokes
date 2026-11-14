@@ -47,18 +47,38 @@ pub fn progress(node: &Node) -> Option<String> {
         .then(|| format!("({}/{})", node.child_done, node.child_total))
 }
 
-/// A task with no children and no notes needs research before work.
+/// A task with no children and no notes needs research before work. A step of an
+/// ordered task is already part of a written plan, so it is not flagged.
 pub fn is_unplanned(node: &Node) -> bool {
-    node.kind == Kind::Task && !node.status.is_closed() && node.child_total == 0 && !node.has_notes
+    node.kind == Kind::Task
+        && !node.status.is_closed()
+        && node.child_total == 0
+        && !node.has_notes
+        && !node.is_step
+}
+
+/// The earlier of two optional due dates (the binding deadline from above).
+pub fn earliest<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if parse_date(y) < parse_date(x) { y } else { x }),
+        (x, None) => x,
+        (None, y) => y,
+    }
 }
 
 /// Flags shared by every line style: priority, dates, order, progress, notes, plan state.
-fn detail_flags(node: &Node, today: NaiveDate, out: &mut Vec<String>) {
+/// `parent_due` is the earliest due date above the node; a later own due date gets a warning.
+fn detail_flags(node: &Node, today: NaiveDate, parent_due: Option<&str>, out: &mut Vec<String>) {
     if let Some(p) = node.priority {
         out.push(format!("p{p}"));
     }
     if let Some(due) = &node.due_at {
         out.push(format!("due {}", short_date(due, today)));
+        if let Some(bound) = parent_due
+            && parse_date(due) > parse_date(bound)
+        {
+            out.push(format!("(after parent's {})", short_date(bound, today)));
+        }
     }
     if let Some(defer) = &node.defer_until
         && parse_date(defer).is_some_and(|d| d > today)
@@ -80,24 +100,24 @@ fn detail_flags(node: &Node, today: NaiveDate, out: &mut Vec<String>) {
 }
 
 /// The first line of `get`: `SPOKE-142 task p1 due Nov 20 ordered (2/6) +notes  Title`.
-pub fn header_line(node: &Node, today: NaiveDate) -> String {
+pub fn header_line(node: &Node, today: NaiveDate, parent_due: Option<&str>) -> String {
     let mut flags = vec![node.id.to_string(), node.kind.as_str().to_string()];
     if node.status != Status::Open {
         flags.push(node.status.as_str().to_string());
     }
-    detail_flags(node, today, &mut flags);
+    detail_flags(node, today, parent_due, &mut flags);
     format!("{}  {}", flags.join(" "), node.title)
 }
 
 /// A child line in an outline: `SPOKE-145 open  Add secrets`, `SPOKE-2 area  Home`.
-pub fn child_line(node: &Node, today: NaiveDate) -> String {
+pub fn child_line(node: &Node, today: NaiveDate, parent_due: Option<&str>) -> String {
     let mut flags = vec![node.id.to_string()];
     match node.kind {
         Kind::Area if node.status == Status::Open => flags.push("area".to_string()),
         Kind::Area => flags.push(format!("area {}", node.status.as_str())),
         Kind::Task => flags.push(node.status.as_str().to_string()),
     }
-    detail_flags(node, today, &mut flags);
+    detail_flags(node, today, parent_due, &mut flags);
     format!("{}  {}", flags.join(" "), node.title)
 }
 
@@ -150,6 +170,7 @@ mod tests {
             created_at: "2026-11-01T00:00:00Z".into(),
             updated_at: "2026-11-01T00:00:00Z".into(),
             has_notes: true,
+            is_step: false,
             child_total: 6,
             child_done: 2,
         }
@@ -162,7 +183,7 @@ mod tests {
     #[test]
     fn header_matches_spec_style() {
         assert_eq!(
-            header_line(&node(), day()),
+            header_line(&node(), day(), None),
             "SPOKE-142 task p1 due Nov 20 ordered (2/6) +notes  Deploy game to production"
         );
     }
@@ -177,12 +198,36 @@ mod tests {
         n.due_at = None;
         n.ordered = false;
         assert_eq!(
-            child_line(&n, day()),
+            child_line(&n, day(), None),
             "SPOKE-142 open unplanned  Deploy game to production"
         );
         assert_eq!(
             queue_line(&n, day()),
             "SPOKE-142  Deploy game to production  unplanned"
+        );
+    }
+
+    #[test]
+    fn plan_steps_are_not_unplanned_and_late_due_warns() {
+        let mut n = node();
+        n.child_total = 0;
+        n.child_done = 0;
+        n.has_notes = false;
+        n.priority = None;
+        n.ordered = false;
+        n.is_step = true;
+        n.due_at = Some("2026-12-01".into());
+        assert_eq!(
+            child_line(&n, day(), Some("2026-11-20")),
+            "SPOKE-142 open due Dec 1 (after parent's Nov 20)  Deploy game to production"
+        );
+        assert_eq!(
+            child_line(&n, day(), Some("2026-12-05")),
+            "SPOKE-142 open due Dec 1  Deploy game to production"
+        );
+        assert_eq!(
+            earliest(Some("2026-12-05"), Some("2026-11-20")),
+            Some("2026-11-20")
         );
     }
 

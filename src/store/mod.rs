@@ -5,13 +5,17 @@
 
 mod add;
 mod get;
+mod moves;
 mod next;
 mod status;
+mod update;
 
 pub use add::add;
 pub use get::get;
+pub use moves::move_node;
 pub use next::next;
 pub use status::set_status;
+pub use update::update;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -26,7 +30,8 @@ pub(crate) const NODE_COLS: &str = "n.id, n.parent_id, n.position, n.kind, n.ord
     n.created_at, n.updated_at,
     EXISTS(SELECT 1 FROM notes t WHERE t.node_id = n.id) AS has_notes,
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status != 'dropped') AS child_total,
-    (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status = 'done') AS child_done";
+    (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status = 'done') AS child_done,
+    COALESCE((SELECT p.ordered AND p.kind = 'task' FROM nodes p WHERE p.id = n.parent_id), 0) AS is_step";
 
 pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
     let text_enum = |idx: usize, value: String| {
@@ -57,6 +62,7 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
         has_notes: r.get(15)?,
         child_total: r.get(16)?,
         child_done: r.get(17)?,
+        is_step: r.get(18)?,
     })
 }
 

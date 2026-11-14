@@ -24,20 +24,26 @@ The finished v1 is for one person (Brandon) and the models and agents working fo
 | Phase | Scope | Status |
 | --- | --- | --- |
 | **M0, walking skeleton** | `add`, `get`, `next`, `set_status` on SQLite (WAL), stateless Streamable HTTP on `/mcp`, Docker image. Done when a fresh chat can add three areas and list them | **Done** |
-| M1, the tree | Ordered/unordered children, `move`, `update`, notes apart from listings, nested `add`, breadcrumb paths, the full compact output format. Done when a model can write and walk a six-step plan in three calls | Not started (**current**) |
-| M2, finding and ranking | `search` (aliases, trigram FTS5), priority inheritance, `focus`, due dates, the full `next` ordering | Not started |
+| **M1, the tree** | Ordered/unordered children, `move`, `update`, notes apart from listings, nested `add`, breadcrumb paths, the full compact output format. Done when a model can write and walk a six-step plan in three calls | **Done** |
+| M2, finding and ranking | `search` (aliases, trigram FTS5), priority inheritance, `focus`, due dates, the full `next` ordering. Done when "priority tasks for my server" finds the right project from a blank context | Not started (**current**) |
 | M3, agents | `claim`, `release`, `ask`, `answer`, leases, event log surfaced. Done when two terminals asking "what's next" get different tasks | Not started |
 | M4, time and reach | Recurrence, `defer_until`, staleness, nightly backup. Done when a restore from backup works | Not started |
 | After v1 | Auth and multiple users (OAuth, `user_id` already on every row), links (blocks/related), notifications, read-only web view, semantic search | Not started |
 
-### What M0 does today
+### What works today (M0 + M1)
 
-- `add`: one node under a parent (default the root), with `kind`, `ordered`, `priority`, `due`, `defer_until`, `aliases`, `notes`, `agent`.
-- `get`: a node, its breadcrumb and its children (`depth` up to 5, `notes: true` for the body).
-- `next`: questions/stalled claims first, then top-level open tasks (not inside another task) sorted by priority, due date and age, with progress and the next step. Respects ordered parents and `defer_until`.
-- `set_status`: `done`, `dropped` or `open` on several ids at once. Areas cannot be done. Suggests closing a parent when its last step is done.
-- IDs are shown as `SPOKE-<n>`; `SPOKE-12`, `12` and `"12"` are all accepted.
-- Every write logs an event with the optional `agent` label.
+Six of the twelve tools: `next`, `get`, `add`, `update`, `set_status`, `move`.
+
+- `add`: one node, or a whole plan in one call with nested `children` (any depth up to 8, at most 200 nodes, one transaction). Returns one line with every new id, e.g. `Added SPOKE-5 task  Deploy  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11`. A bad child names itself (`children[3] ("Push"): ...`) and nothing is written.
+- `get`: the node's header line, its breadcrumb (`Hobbies / Programming / Skyforge`) and an outline `depth` levels deep (default 1, max 10), indented per level. Ordered children are numbered and the actionable step is marked `<- next`; unordered children are bulleted. The outline is capped at 60 lines and ends with `(+N more ...)` lines for what was cut by the cap or lies below the depth, plus a count of hidden dropped nodes. A child whose due date is later than a parent's shows `(after parent's Nov 20)`. `notes: true` appends the body.
+- `update`: title, kind, ordered, priority (`0` clears), due / defer_until (`""` clears), aliases (`[]` clears), `notes` (replace; `""` clears) or `notes_append` (adds a paragraph). Kind changes keep the rule that areas only live under areas and never finish.
+- `move`: reparent (`parent`) and/or reorder (`before` / `after` a sibling; without either it goes last). Writes one row via fractional positions. Refuses moving the root, cycles, areas under tasks and closed parents.
+- `next`: questions/stalled claims first, then work items (open tasks not inside another task) by priority, due date and age, with progress and the next actionable step (`next: SPOKE-7 ...`, honouring ordered vs unordered and `defer_until`). Focus, due-soon and stale sections come in M2/M4.
+- `set_status`: `done`, `dropped` or `open` on several ids at once. Areas cannot be done. After closing a step it names the next step of an ordered parent, or, when it was the last open step, suggests closing the parent (it never closes it itself).
+- Notes live in their own table and never appear in listings; `+notes` says a body exists.
+- `unplanned` marks a task with no children and no notes, except steps of an ordered task (the parent is their plan).
+- IDs are shown as `SPOKE-<n>`; `SPOKE-12`, `12` and `"12"` are all accepted, and numeric arguments also accept numeric strings (`"depth": "3"`).
+- Every write logs an event with the optional `agent` label (bookkeeping only).
 
 ## Running locally
 
@@ -104,7 +110,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP (initialize, tools/list, tools/call, error paths, the 2026-07-28 stateless form, Origin refusal, restart persistence).
+`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence) and the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths).
 
 ### Layout
 
@@ -114,7 +120,7 @@ cargo test
 | `src/config.rs` | Environment variables |
 | `src/server.rs` | axum router: `/mcp` (rmcp Streamable HTTP, stateless) and `/health` |
 | `src/tools/` | MCP surface: tool definitions, argument schemas, server instructions |
-| `src/store/` | One file per operation (`add`, `get`, `next`, `status`) plus shared queries |
+| `src/store/` | One file per operation (`add`, `get`, `next`, `status`, `update`, `moves`) plus shared queries |
 | `src/db/` | Opening SQLite (WAL), migrations (`PRAGMA user_version` steps), root seed, fractional position keys |
 | `src/model.rs`, `src/format.rs` | Domain types and the one-line-per-node text format |
 

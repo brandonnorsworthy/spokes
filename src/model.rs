@@ -64,6 +64,26 @@ impl IdArg {
     }
 }
 
+/// A number as a tool argument: models send `5` or, now and then, `"5"`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum NumArg {
+    Number(i64),
+    Text(String),
+}
+
+impl NumArg {
+    pub fn parse(&self, field: &str) -> Result<i64, String> {
+        match self {
+            NumArg::Number(n) => Ok(*n),
+            NumArg::Text(s) => s
+                .trim()
+                .parse()
+                .map_err(|_| format!("{field} must be a whole number, not '{s}'.")),
+        }
+    }
+}
+
 /// `area` holds work forever and never finishes; `task` can be finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -177,6 +197,8 @@ pub struct Node {
     pub created_at: String,
     pub updated_at: String,
     pub has_notes: bool,
+    /// A step of a written plan: the parent is a task with ordered children.
+    pub is_step: bool,
     /// Direct children that are not dropped.
     pub child_total: i64,
     /// Direct children that are done.
@@ -198,6 +220,8 @@ mod tests {
         assert!("abc".parse::<NodeId>().is_err());
         assert_eq!(IdArg::Number(5).parse(), Ok(NodeId(5)));
         assert!(IdArg::Number(-1).parse().is_err());
+        assert_eq!(NumArg::Text(" 5 ".into()).parse("depth"), Ok(5));
+        assert!(NumArg::Text("five".into()).parse("depth").is_err());
     }
 
     #[test]

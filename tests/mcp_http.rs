@@ -167,7 +167,10 @@ async fn walking_skeleton_over_http() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, ["add", "get", "next", "set_status"]);
+    assert_eq!(
+        names,
+        ["add", "get", "move", "next", "set_status", "update"]
+    );
 
     // The M0 "done when": add three areas and list them.
     for area in ["Home", "Work", "Hobbies"] {
@@ -257,6 +260,281 @@ async fn walking_skeleton_over_http() {
         added.starts_with("Added SPOKE-6 "),
         "ids are never reused: {added}"
     );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The M1 "done when": a six-step plan is written and walked in three calls, then
+/// move, update and notes round-trip and the tree's error paths answer usefully.
+#[tokio::test]
+async fn tree_over_http() {
+    let dir = temp_dir("tree");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    mcp.ok(
+        "add",
+        json!({"title": "Hobbies", "kind": "area", "children": [
+            {"title": "Programming", "kind": "area", "children": [{"title": "Skyforge", "kind": "area"}]}
+        ]}),
+    )
+    .await; // SPOKE-2..4
+
+    // Call 1: the whole plan in one add.
+    let steps = [
+        "Map the pipeline",
+        "Write the pipeline",
+        "Add secrets",
+        "Push and run the deployment",
+        "Verify in production",
+        "Retro",
+    ];
+    let children: Vec<Value> = steps.iter().map(|t| json!({"title": t})).collect();
+    let added = mcp
+        .ok(
+            "add",
+            json!({"parent": "SPOKE-4", "title": "Deploy game to production", "ordered": true,
+                   "priority": 1, "due": "2030-11-20", "notes": "Target: the VPS.",
+                   "agent": "it", "children": children}),
+        )
+        .await;
+    assert_eq!(
+        added,
+        "Added SPOKE-5 task  Deploy game to production  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11"
+    );
+
+    // Call 2: the plan with its next step.
+    let plan = "SPOKE-5 task p1 due Nov 20 2030 ordered (0/6) +notes  Deploy game to production\n\
+                Hobbies / Programming / Skyforge\n  \
+                1. SPOKE-6 open  Map the pipeline  <- next\n  \
+                2. SPOKE-7 open  Write the pipeline\n  \
+                3. SPOKE-8 open  Add secrets\n  \
+                4. SPOKE-9 open  Push and run the deployment\n  \
+                5. SPOKE-10 open  Verify in production\n  \
+                6. SPOKE-11 open  Retro";
+    assert_eq!(mcp.ok("get", json!({"id": "SPOKE-5"})).await, plan);
+
+    // Call 3: finish step 1; the reply and the outline both point at step 2.
+    assert_eq!(
+        mcp.ok("set_status", json!({"ids": ["SPOKE-6"], "status": "done"}))
+            .await,
+        "SPOKE-6 done  Map the pipeline\nNext step of SPOKE-5 Deploy game to production: SPOKE-7 Write the pipeline"
+    );
+    let walked = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+    assert!(walked.contains("(1/6)"), "{walked}");
+    assert!(
+        walked.contains("1. SPOKE-6 done  Map the pipeline\n"),
+        "{walked}"
+    );
+    assert!(
+        walked.contains("2. SPOKE-7 open  Write the pipeline  <- next"),
+        "{walked}"
+    );
+    assert_eq!(walked.matches("<- next").count(), 1, "{walked}");
+    assert_eq!(
+        mcp.ok("next", json!({})).await,
+        "UP NEXT\n  SPOKE-5  p1 due Nov 20 2030  Deploy game to production (1/6)  next: SPOKE-7 Write the pipeline"
+    );
+
+    // Depth: the root outline grows one level per step and says what it left out.
+    let d1 = mcp.ok("get", json!({})).await;
+    assert_eq!(
+        d1,
+        "SPOKE-1 area  To do\n  - SPOKE-2 area  Hobbies\n(+9 more below depth 1. Pass a larger depth, or get a child.)"
+    );
+    let d5 = mcp.ok("get", json!({"depth": "5"})).await;
+    assert!(
+        d5.contains("\n        - SPOKE-5 open p1 due Nov 20 2030 ordered (1/6) +notes  Deploy game to production\n          1. SPOKE-6 done"),
+        "{d5}"
+    );
+    assert!(!d5.contains("more below depth"), "{d5}");
+
+    // A later due date on a step warns about the parent's deadline.
+    mcp.ok("update", json!({"id": "SPOKE-8", "due": "2030-12-01"}))
+        .await;
+    let warned = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+    assert!(
+        warned.contains("SPOKE-8 open due Dec 1 2030 (after parent's Nov 20 2030)  Add secrets"),
+        "{warned}"
+    );
+
+    // Notes: flagged in listings, the body only with notes: true.
+    assert_eq!(
+        mcp.ok(
+            "update",
+            json!({"id": "SPOKE-7", "notes_append": "Used deploy.yml.", "agent": "it"})
+        )
+        .await,
+        "Updated SPOKE-7  Write the pipeline  (notes appended)"
+    );
+    mcp.ok(
+        "update",
+        json!({"id": "SPOKE-7", "notes_append": "Added a cache step."}),
+    )
+    .await;
+    let listing = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+    assert!(
+        listing.contains("SPOKE-7 open +notes  Write the pipeline"),
+        "{listing}"
+    );
+    assert!(!listing.contains("Used deploy.yml"), "{listing}");
+    assert!(!listing.contains("Target: the VPS"), "{listing}");
+    let body = mcp.ok("get", json!({"id": "SPOKE-7", "notes": true})).await;
+    assert!(
+        body.ends_with("NOTES\nUsed deploy.yml.\n\nAdded a cache step."),
+        "{body}"
+    );
+    mcp.ok("update", json!({"id": "SPOKE-7", "notes": "Replaced."}))
+        .await;
+    let body = mcp.ok("get", json!({"id": "SPOKE-7", "notes": true})).await;
+    assert!(body.ends_with("NOTES\nReplaced."), "{body}");
+    mcp.ok("update", json!({"id": "SPOKE-7", "notes": ""}))
+        .await;
+    let body = mcp.ok("get", json!({"id": "SPOKE-7", "notes": true})).await;
+    assert!(
+        body.ends_with("(no notes)") && !body.contains("+notes"),
+        "{body}"
+    );
+
+    // Fields round-trip.
+    assert_eq!(
+        mcp.ok(
+            "update",
+            json!({"id": "SPOKE-11", "title": "Retro and write-up", "priority": 2})
+        )
+        .await,
+        "Updated SPOKE-11  Retro and write-up  (title, priority)"
+    );
+    mcp.ok("update", json!({"id": "SPOKE-11", "priority": 0}))
+        .await;
+    let listing = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+    assert!(
+        listing.contains("6. SPOKE-11 open  Retro and write-up"),
+        "{listing}"
+    );
+
+    // Move: reorder within the plan, then reparent.
+    assert_eq!(
+        mcp.ok("move", json!({"id": "SPOKE-8", "before": "SPOKE-7"}))
+            .await,
+        "Moved SPOKE-8  Add secrets  (under SPOKE-5 Deploy game to production, 2 of 6)"
+    );
+    let listing = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+    assert!(
+        listing.contains("2. SPOKE-8 open due Dec 1 2030 (after parent's Nov 20 2030)  Add secrets  <- next\n  3. SPOKE-7 open  Write the pipeline\n"),
+        "{listing}"
+    );
+    mcp.ok("move", json!({"id": "SPOKE-11", "after": "SPOKE-6"}))
+        .await;
+    assert_eq!(
+        mcp.ok("move", json!({"id": "SPOKE-11", "parent": "SPOKE-4"}))
+            .await,
+        "Moved SPOKE-11  Retro and write-up  (under SPOKE-4 Skyforge, 2 of 2)"
+    );
+    let sky = mcp.ok("get", json!({"id": "SPOKE-4"})).await;
+    assert!(
+        sky.contains("(1/5) +notes  Deploy game to production\n  - SPOKE-11 open unplanned  Retro and write-up\n"),
+        "{sky}"
+    );
+
+    // Error paths say what to do next.
+    mcp.ok("add", json!({"title": "Garden", "kind": "area"}))
+        .await; // SPOKE-12
+    for (tool, args, fragment) in [
+        (
+            "move",
+            json!({"id": "SPOKE-1", "parent": "SPOKE-2"}),
+            "is the root",
+        ),
+        (
+            "move",
+            json!({"id": "SPOKE-2", "parent": "SPOKE-5"}),
+            "cannot move under itself",
+        ),
+        (
+            "move",
+            json!({"id": "SPOKE-5", "parent": "SPOKE-5"}),
+            "own parent",
+        ),
+        (
+            "move",
+            json!({"id": "SPOKE-12", "parent": "SPOKE-5"}),
+            "areas can only go under areas",
+        ),
+        (
+            "move",
+            json!({"id": "SPOKE-7", "parent": "SPOKE-6"}),
+            "is done",
+        ),
+        ("move", json!({"id": "SPOKE-7"}), "nothing to do"),
+        (
+            "move",
+            json!({"id": "SPOKE-7", "before": "SPOKE-8", "after": "SPOKE-9"}),
+            "not both",
+        ),
+        (
+            "move",
+            json!({"id": "SPOKE-7", "parent": "SPOKE-4", "before": "SPOKE-9"}),
+            "is not under SPOKE-4",
+        ),
+        (
+            "move",
+            json!({"id": "SPOKE-404", "parent": "SPOKE-2"}),
+            "does not exist",
+        ),
+        ("update", json!({"id": "SPOKE-7"}), "nothing to update"),
+        (
+            "update",
+            json!({"id": "SPOKE-7", "notes": "a", "notes_append": "b"}),
+            "not both",
+        ),
+        (
+            "update",
+            json!({"id": "SPOKE-7", "kind": "area"}),
+            "areas can only go under areas",
+        ),
+        (
+            "update",
+            json!({"id": "SPOKE-7", "due": "friday"}),
+            "YYYY-MM-DD",
+        ),
+        (
+            "get",
+            json!({"id": "SPOKE-5", "depth": "lots"}),
+            "whole number",
+        ),
+        (
+            "add",
+            json!({"parent": "SPOKE-5", "title": "Plan", "children": [{"title": "ok"}, {"title": "Bad", "kind": "area"}]}),
+            "children[1] (\"Bad\")",
+        ),
+    ] {
+        let (text, is_error) = mcp.call(tool, args.clone()).await;
+        assert!(is_error && text.contains(fragment), "{tool} {args}: {text}");
+    }
+    // The refused nested add wrote nothing; ids continue from the last real node.
+    let added = mcp
+        .ok("add", json!({"parent": "SPOKE-4", "title": "Later"}))
+        .await;
+    assert!(added.starts_with("Added SPOKE-13 "), "{added}");
+
+    // Finishing the last open step suggests closing the parent, but never closes it.
+    let done = mcp
+        .ok(
+            "set_status",
+            json!({"ids": ["SPOKE-8", "SPOKE-7", "SPOKE-9", "SPOKE-10"], "status": "done"}),
+        )
+        .await;
+    assert!(
+        done.ends_with("All steps of SPOKE-5 Deploy game to production are done. If it is finished too, mark it done with set_status."),
+        "{done}"
+    );
+    let parent = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+    assert!(
+        parent.starts_with("SPOKE-5 task p1"),
+        "still open: {parent}"
+    );
+
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, params};
 
-use super::{ToolResult, clean_agent, db_err, load, log_event, require, touch};
+use super::{ToolResult, children, clean_agent, db_err, load, log_event, require, touch};
 use crate::db::now;
 use crate::model::{Kind, Node, NodeId, Status};
 use crate::tools::args::SetStatusArgs;
@@ -38,24 +38,34 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs) -> ToolResult {
         }
     }
 
-    // Hints about parents whose children are now all finished.
-    if target == Status::Done {
+    // Hints about parents: the next step of an ordered parent, or that all are finished.
+    if target.is_closed() {
         let mut hinted: Vec<NodeId> = Vec::new();
         for node in &changed {
             let Some(pid) = node.parent_id else { continue };
             if hinted.contains(&pid) {
                 continue;
             }
-            if let Some(parent) = load(&tx, pid)?
-                && parent.kind == Kind::Task
-                && !parent.status.is_closed()
-                && parent.child_total > 0
-                && parent.child_done == parent.child_total
-            {
-                hinted.push(pid);
+            hinted.push(pid);
+            let Some(parent) = load(&tx, pid)? else {
+                continue;
+            };
+            if parent.kind != Kind::Task || parent.status.is_closed() {
+                continue;
+            }
+            if parent.child_total > 0 && parent.child_done == parent.child_total {
                 lines.push(format!(
                     "All steps of {} {} are done. If it is finished too, mark it done with set_status.",
                     parent.id, parent.title
+                ));
+            } else if parent.ordered
+                && let Some(step) = children(&tx, pid)?
+                    .into_iter()
+                    .find(|c| !c.status.is_closed())
+            {
+                lines.push(format!(
+                    "Next step of {} {}: {} {}",
+                    parent.id, parent.title, step.id, step.title
                 ));
             }
         }
@@ -189,6 +199,25 @@ mod tests {
         )
         .unwrap();
         assert!(out.starts_with("SPOKE-3 dropped  Task"), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ordered_parent_names_the_next_step() {
+        let (mut conn, dir) = temp_db("status-next");
+        let mut p = args(None, "Plan", Kind::Task); // 2
+        p.node.ordered = Some(true);
+        add(&mut conn, p).unwrap();
+        for t in ["One", "Two", "Three"] {
+            add(&mut conn, args(Some(2), t, Kind::Task)).unwrap(); // 3, 4, 5
+        }
+        let out = set_status(&mut conn, status_args(&["SPOKE-3"], SettableStatus::Done)).unwrap();
+        assert_eq!(
+            out,
+            "SPOKE-3 done  One\nNext step of SPOKE-2 Plan: SPOKE-4 Two"
+        );
+        let out = set_status(&mut conn, status_args(&["4", "5"], SettableStatus::Done)).unwrap();
+        assert!(out.ends_with("All steps of SPOKE-2 Plan are done. If it is finished too, mark it done with set_status."), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

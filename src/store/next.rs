@@ -14,15 +14,18 @@ use crate::format::{ago, parse_date, queue_line, today};
 use crate::model::{DEFAULT_USER, Kind, Node, NodeId, ROOT_ID, Status};
 use crate::tools::args::NextArgs;
 
-const DEFAULT_LIMIT: u32 = 5;
-const MAX_LIMIT: u32 = 50;
+const DEFAULT_LIMIT: i64 = 5;
+const MAX_LIMIT: i64 = 50;
 
 pub fn next(conn: &Connection, args: NextArgs) -> ToolResult {
     let scope_id = match &args.scope {
         Some(s) => s.parse()?,
         None => ROOT_ID,
     };
-    let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
+    let limit = match &args.limit {
+        Some(l) => l.parse("limit")?.clamp(1, MAX_LIMIT),
+        None => DEFAULT_LIMIT,
+    } as usize;
     let scope = require(conn, scope_id)?;
     if scope.status.is_closed() {
         return Err(format!(
@@ -75,7 +78,7 @@ pub fn next(conn: &Connection, args: NextArgs) -> ToolResult {
         out.push("UP NEXT".to_string());
         for n in queue.work.iter().take(limit - shown) {
             let mut line = format!("  {}", queue_line(n, queue.today));
-            if let Some(step) = tree.next_step(n.id) {
+            if let Some(step) = tree.next_step(n.id, n.ordered, queue.today) {
                 line.push_str(&format!("  next: {} {}", step.id, step.title));
             }
             out.push(line);
@@ -149,17 +152,28 @@ impl Tree {
         self.children.get(&id).map_or(&[], Vec::as_slice)
     }
 
-    /// The first actionable leaf beneath a work item, for the `next:` hint.
-    fn next_step(&self, id: NodeId) -> Option<&Node> {
-        let mut current = self.kids(id).iter().find(|k| k.status == Status::Open)?;
-        while let Some(k) = self
-            .kids(current.id)
-            .iter()
-            .find(|k| k.status == Status::Open)
-        {
-            current = k;
+    /// The first actionable step beneath a work item, for the `next:` hint. An ordered
+    /// node offers only its first unfinished child; an unordered one, its first open one.
+    fn next_step(&self, id: NodeId, ordered: bool, today: NaiveDate) -> Option<&Node> {
+        for kid in self.kids(id) {
+            let deferred = kid
+                .defer_until
+                .as_deref()
+                .and_then(parse_date)
+                .is_some_and(|d| d > today);
+            if kid.status == Status::Open && !deferred {
+                if self.kids(kid.id).is_empty() {
+                    return Some(kid);
+                }
+                if let Some(step) = self.next_step(kid.id, kid.ordered, today) {
+                    return Some(step);
+                }
+            }
+            if ordered {
+                return None;
+            }
         }
-        Some(current)
+        None
     }
 }
 
@@ -225,10 +239,10 @@ mod tests {
     use crate::store::add::tests::args;
     use crate::store::test_support::temp_db;
 
-    fn next_args(scope: Option<i64>, limit: Option<u32>) -> NextArgs {
+    fn next_args(scope: Option<i64>, limit: Option<i64>) -> NextArgs {
         NextArgs {
             scope: scope.map(IdArg::Number),
-            limit,
+            limit: limit.map(crate::model::NumArg::Number),
         }
     }
 
@@ -247,13 +261,13 @@ mod tests {
         let (mut conn, dir) = temp_db("next");
         add(&mut conn, args(None, "Home", Kind::Area)).unwrap(); // 2
         let mut project = args(Some(2), "Fix garage", Kind::Task); // 3
-        project.ordered = Some(true);
-        project.priority = Some(2);
+        project.node.ordered = Some(true);
+        project.node.priority = Some(crate::model::NumArg::Number(2));
         add(&mut conn, project).unwrap();
         add(&mut conn, args(Some(3), "Buy parts", Kind::Task)).unwrap(); // 4
         add(&mut conn, args(Some(3), "Install", Kind::Task)).unwrap(); // 5
         let mut urgent = args(Some(2), "Pay bill", Kind::Task); // 6
-        urgent.priority = Some(1);
+        urgent.node.priority = Some(crate::model::NumArg::Number(1));
         add(&mut conn, urgent).unwrap();
         add(&mut conn, args(Some(2), "Someday", Kind::Task)).unwrap(); // 7
 
@@ -274,7 +288,7 @@ mod tests {
     fn ordered_area_only_offers_first_step() {
         let (mut conn, dir) = temp_db("next-ordered");
         let mut area = args(None, "Pipeline", Kind::Area);
-        area.ordered = Some(true);
+        area.node.ordered = Some(true);
         add(&mut conn, area).unwrap(); // 2
         add(&mut conn, args(Some(2), "First", Kind::Task)).unwrap();
         add(&mut conn, args(Some(2), "Second", Kind::Task)).unwrap();
