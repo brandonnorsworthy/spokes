@@ -1,0 +1,55 @@
+# CI for spokes: format check, clippy, tests and a non-pushing Docker build.
+# Also called by release.yml so a release only publishes what passed these checks.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly sweep to catch upstream breakage when nobody is pushing
+    - cron: "17 3 * * 1"
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Stable name so branch protection has one required status check to point at
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Review dependency changes
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+
+      # rustup is preinstalled on the runner, so no third-party toolchain action
+      - name: Install Rust (stable, rustfmt, clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # --locked: the committed Cargo.lock is the dependency set, a PR can't drift it
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      # Build the image without pushing so a broken Dockerfile fails the PR
+      - name: Build Docker image (no push)
+        run: docker build --tag spokes:ci --file Dockerfile .

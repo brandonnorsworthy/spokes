@@ -2401,3 +2401,62 @@ async fn orchestrator_workers_and_local_history_over_http() {
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// M4 retro: a worker finishing a step inside an ordered project that the orchestrator
+/// holds claimed gets the same "Next step of ..." hint as in an unclaimed project.
+#[tokio::test]
+async fn next_step_hint_inside_a_claimed_project_over_http() {
+    let dir = temp_dir("hint-claimed");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let proj = add_node(
+        &mcp,
+        json!({"title": "Deploy", "ordered": true,
+               "children": [{"title": "Map"}, {"title": "Write"}, {"title": "Secrets"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": proj})).await;
+    let map = first_id(line_with(&g, "Map"));
+    let write = first_id(line_with(&g, "Write"));
+    let secrets = first_id(line_with(&g, "Secrets"));
+    mcp.ok("claim", json!({"id": proj, "agent": "opus-orch"}))
+        .await;
+
+    // A worker claims its step, notes progress and finishes it.
+    for (step, next, worker) in [(&map, &write, "sonnet-w1"), (&write, &secrets, "sonnet-w2")] {
+        mcp.ok("claim", json!({"id": step, "agent": worker})).await;
+        mcp.ok(
+            "update",
+            json!({"id": step, "notes_append": "Done.", "agent": worker}),
+        )
+        .await;
+        let out = mcp
+            .ok(
+                "set_status",
+                json!({"ids": [step], "status": "done", "agent": worker}),
+            )
+            .await;
+        assert!(
+            out.ends_with(&format!(
+                "\nNext step of {proj} Deploy: {next} {}",
+                if next == &write { "Write" } else { "Secrets" }
+            )),
+            "{out}"
+        );
+    }
+    // The orchestrator finishing a step itself gets the closing hint too.
+    let out = mcp
+        .ok(
+            "set_status",
+            json!({"ids": [secrets], "status": "done", "agent": "opus-orch"}),
+        )
+        .await;
+    assert!(
+        out.ends_with(&format!("All steps of {proj} Deploy are done. If it is finished too, mark it done with set_status.")),
+        "{out}"
+    );
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

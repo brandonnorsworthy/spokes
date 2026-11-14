@@ -1,5 +1,7 @@
 # Spokes Todo MCP
 
+[![ci](https://github.com/brandonnorsworthy/spokes/actions/workflows/ci.yml/badge.svg)](https://github.com/brandonnorsworthy/spokes/actions/workflows/ci.yml) [![codeql](https://github.com/brandonnorsworthy/spokes/actions/workflows/codeql.yml/badge.svg)](https://github.com/brandonnorsworthy/spokes/actions/workflows/codeql.yml)
+
 One small self-hosted server that holds one tree of to-dos, which any MCP-capable model can read, plan into and work from. A fresh chat can ask "what should I do next?" and get a short, ranked answer. Parallel agents can each take a task without colliding.
 
 The full product spec is [docs/spec.md](docs/spec.md).
@@ -134,6 +136,19 @@ docker run --rm -v spokes-data:/data spokes:dev restore /data/backups/spokes-202
 
 To undo a restore, stop the server and move the `before-restore` file(s) back.
 
+## Deployment
+
+The homelab runs the published image from the `spokes/` stack in the Arcane `stacks` repo (`~/dev/stacks/spokes`, `/srv/stacks/spokes` on the server; its README covers start/stop, clients and backups): `ghcr.io/brandonnorsworthy/spokes:<X.Y.Z>` pinned, port `10050` -> `8787`, UID `10010`, `./data` bind mount for the database and backups. The server never builds; it pulls the tag CI published.
+
+## CI and releases
+
+- `.github/workflows/ci.yml` (check name `ci`): `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --locked`, and a non-pushing `docker build`, on every PR, push to `main` and weekly. Dependency review on PRs.
+- `.github/workflows/codeql.yml`: CodeQL for Rust and for the workflows (`actions`), on PRs, `main` and weekly.
+- `.github/workflows/release.yml`: on push to `main` and on `v*` tags, reruns `ci`, then builds and pushes `ghcr.io/brandonnorsworthy/spokes` (`latest` and `sha-<short>` from `main`; `X.Y.Z` and `sha-<short>` from a tag) and scans it with Trivy (HIGH/CRITICAL fail the job).
+- `.github/dependabot.yml`: weekly cargo, GitHub Actions and Docker base image updates. Actions are pinned to commit SHAs.
+
+Release process: bump `version` in `Cargo.toml` (it is what `initialize` reports as `serverInfo.version`), merge to `main`, wait for green, then tag that commit `vX.Y.Z` and push the tag. Deploy by bumping the pinned tag in `stacks/spokes/compose.yml`; roll back by pinning the previous tag.
+
 ## Connecting clients
 
 The endpoint is `http://<host>:8787/mcp` (Streamable HTTP, stateless; both the 2026-07-28 protocol and older initialize-based clients work).
@@ -160,11 +175,11 @@ Then ask: "add Home, Work and Hobbies, then tell me what's next".
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
 
-`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence), the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths) M2 (search normalization, typos, short keywords, ranking, scope and include_done over a tree with decoys; level inheritance; focus placement and errors; due ordering and every `next` section; `SPOKES_TZ`) M3 (two clients reading `next` and claiming different tasks; claim refusals and lease renewal by every write tool; 24 concurrent claims over HTTP with exactly one winner; ask, NEEDS YOU, answer, takeover of an expired lease, `get` history; the M2 retro regression where a project and its due sub-project both pointed at the same step) and M4 (recurrence in both `from` modes with month clamping, the day-of-month anchor, late completions, the defer window, repeating checklists and the refusals; `defer_until` everywhere; STALE ordering, cap and how deferring, dropping and activity stop it; the orchestrator/worker claim pattern; history times in `SPOKES_TZ`). `tests/backup.rs` runs the server with a 1-second backup interval and `keep: 2`, checks rotation, wipes the database, restores the newest backup and reads the data back over MCP. Unit tests cover the recurrence date arithmetic (`src/recur.rs`) and backup rotation and restore validation (`src/backup.rs`). Lease expiry and question age are tested by moving timestamps into the past through a second connection to the database file. `src/store/claims.rs` also races 8 separate SQLite connections (as separate processes would) on one claim.
+`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence), the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths) M2 (search normalization, typos, short keywords, ranking, scope and include_done over a tree with decoys; level inheritance; focus placement and errors; due ordering and every `next` section; `SPOKES_TZ`) M3 (two clients reading `next` and claiming different tasks; claim refusals and lease renewal by every write tool; 24 concurrent claims over HTTP with exactly one winner; ask, NEEDS YOU, answer, takeover of an expired lease, `get` history; the M2 retro regression where a project and its due sub-project both pointed at the same step) and M4 (recurrence in both `from` modes with month clamping, the day-of-month anchor, late completions, the defer window, repeating checklists and the refusals; `defer_until` everywhere; STALE ordering, cap and how deferring, dropping and activity stop it; the orchestrator/worker claim pattern, including the next-step hint a worker gets inside the orchestrator's claimed ordered project; history times in `SPOKES_TZ`). `tests/backup.rs` runs the server with a 1-second backup interval and `keep: 2`, checks rotation, wipes the database, restores the newest backup and reads the data back over MCP. Unit tests cover the recurrence date arithmetic (`src/recur.rs`) and backup rotation and restore validation (`src/backup.rs`). Lease expiry and question age are tested by moving timestamps into the past through a second connection to the database file. `src/store/claims.rs` also races 8 separate SQLite connections (as separate processes would) on one claim.
 
 ### Layout
 
