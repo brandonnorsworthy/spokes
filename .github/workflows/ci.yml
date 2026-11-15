@@ -25,6 +25,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the version check can compare against the base branch
+          fetch-depth: 0
+
+      # Backs the version hook (.githooks/): a PR that changes code must change the version.
+      # Dependabot PRs are exempt (dependency-only merges are not bumped).
+      - name: Check the version was bumped
+        if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: .githooks/check-version-bump "origin/$BASE_REF" HEAD
 
       - name: Review dependency changes
         if: github.event_name == 'pull_request'

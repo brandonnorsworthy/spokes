@@ -147,7 +147,7 @@ The homelab runs the published image from the `spokes/` stack in the Arcane `sta
 - `.github/workflows/release.yml`: on push to `main` and on `v*` tags, reruns `ci`, then builds and pushes `ghcr.io/brandonnorsworthy/spokes` (`latest` and `sha-<short>` from `main`; `X.Y.Z` and `sha-<short>` from a tag) and scans it with Trivy (HIGH/CRITICAL fail the job).
 - `.github/dependabot.yml`: weekly cargo, GitHub Actions and Docker base image updates. Actions are pinned to commit SHAs.
 
-Release process: bump `version` in `Cargo.toml` (it is what `initialize` reports as `serverInfo.version`), merge to `main`, wait for green, then tag that commit `vX.Y.Z` and push the tag. Deploy by bumping the pinned tag in `stacks/spokes/compose.yml`; roll back by pinning the previous tag.
+Release process: the version in `Cargo.toml` (it is what `initialize` reports as `serverInfo.version`) is bumped by the git hooks, not by hand (see Development). Push to `main`, wait for green, then tag that commit `vX.Y.Z` with the version it carries and push the tag. Deploy by bumping the pinned tag in `stacks/spokes/compose.yml`; roll back by pinning the previous tag.
 
 ## Connecting clients
 
@@ -172,6 +172,14 @@ OpenCode (`opencode.json`):
 Then ask: "add Home, Work and Hobbies, then tell me what's next".
 
 ## Development
+
+Turn the version hooks on once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+They bump the version in `Cargo.toml` and `Cargo.lock` from the commit message and fold the bump into the commit: `feat:` bumps the minor version, `feat!:` (any `type!:`, or a `BREAKING CHANGE:` line) the major, any other commit that changes code the patch. Commits that touch only docs, `.github/` or `.githooks/` do not bump, and neither do merges, rebases, or a commit that already changes the version. CI fails a pull request that changes code without changing the version (`.githooks/check-version-bump`; Dependabot PRs are exempt).
 
 ```sh
 cargo fmt --check
