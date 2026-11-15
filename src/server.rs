@@ -1,4 +1,5 @@
-//! HTTP wiring: Streamable HTTP MCP on `/mcp` (stateless) and a `/health` probe.
+//! HTTP wiring: Streamable HTTP MCP on `/mcp` (stateless), the read-only JSON API on
+//! `/api` (see `api.rs`) and a `/health` probe.
 
 use std::sync::{Arc, Mutex};
 
@@ -40,8 +41,12 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
         mcp_config,
     );
 
+    // Opened after `db::open` has created and migrated the file.
+    let api = crate::api::router(config)?;
+
     Ok(Router::new()
         .nest_service("/mcp", mcp)
+        .nest("/api", api)
         .route("/health", get(move || health(db.clone()))))
 }
 

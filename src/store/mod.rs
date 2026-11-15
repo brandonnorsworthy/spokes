@@ -13,6 +13,7 @@ mod next;
 mod search;
 mod status;
 mod update;
+pub mod view;
 
 pub use add::add;
 pub use claims::{answer, ask, claim, release};

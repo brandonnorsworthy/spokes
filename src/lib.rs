@@ -1,5 +1,6 @@
 //! Spokes Todo MCP: one self-hosted tree of to-dos served over MCP Streamable HTTP.
 
+pub mod api;
 pub mod backup;
 pub mod config;
 pub mod db;
