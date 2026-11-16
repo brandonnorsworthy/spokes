@@ -184,6 +184,7 @@ async fn walking_skeleton_over_http() {
             "get",
             "move",
             "next",
+            "recent",
             "release",
             "search",
             "set_status",

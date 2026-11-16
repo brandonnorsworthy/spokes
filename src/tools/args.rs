@@ -147,6 +147,18 @@ pub struct SearchArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecentArgs {
+    /// Only look under this node, e.g. "SPOKE-3". Omit for everything.
+    #[schemars(with = "Option<String>")]
+    pub scope: Option<IdArg>,
+    /// Also list done and dropped nodes (default false).
+    pub include_done: Option<bool>,
+    /// Max results (default 10, up to 50).
+    #[schemars(with = "Option<u32>")]
+    pub limit: Option<NumArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FocusArgs {
     /// The node to place on (or take off) the focus list, at any depth, e.g. "SPOKE-12".
     #[schemars(with = "String")]

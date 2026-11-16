@@ -13,8 +13,8 @@ use rusqlite::Connection;
 use crate::format::today_in;
 use crate::store::{self, ToolResult};
 use args::{
-    AddArgs, AnswerArgs, AskArgs, ClaimArgs, FocusArgs, GetArgs, MoveArgs, NextArgs, ReleaseArgs,
-    SearchArgs, SetStatusArgs, UpdateArgs,
+    AddArgs, AnswerArgs, AskArgs, ClaimArgs, FocusArgs, GetArgs, MoveArgs, NextArgs, RecentArgs,
+    ReleaseArgs, SearchArgs, SetStatusArgs, UpdateArgs,
 };
 
 /// The one SQLite connection, shared by every request.
@@ -93,6 +93,14 @@ impl Spokes {
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> ToolResult {
         let today = today_in(self.tz);
         self.run(move |c| store::search(c, args, today)).await
+    }
+
+    #[tool(
+        description = "The most recently added nodes, newest first, by creation time, each with id, title, path and when it was added. Use for \"the last thing I added\" or \"start the spoke I just added\", then claim or get the id."
+    )]
+    async fn recent(&self, Parameters(args): Parameters<RecentArgs>) -> ToolResult {
+        let tz = self.tz;
+        self.run(move |c| store::recent(c, args, tz)).await
     }
 
     #[tool(
