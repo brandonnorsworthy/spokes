@@ -66,6 +66,13 @@ const STEPS: &[Step] = &[
     // 4: the user's raw words behind a node (SPOKE-181). Set at creation, only ever appended to.
     // A 0.6.x server refuses a database at this version, so a rollback restores a backup.
     Step::Sql("ALTER TABLE nodes ADD COLUMN source TEXT"),
+    // 5: optional work type and stage, own values only (not inherited), stored snake_case.
+    Step::Sql(
+        "ALTER TABLE nodes ADD COLUMN work_type TEXT
+       CHECK (work_type IN ('bug','feature','chore','idea','epic'));
+     ALTER TABLE nodes ADD COLUMN stage TEXT
+       CHECK (stage IN ('idea','backlog','brainstormed','understood','planned','in_progress','in_review','done'));",
+    ),
 ];
 
 fn search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -153,5 +160,42 @@ mod tests {
             .query_row("SELECT body FROM notes WHERE node_id = 2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(notes, "keep me");
+    }
+
+    /// A schema-4 database (0.7.x, with `source`) gains nullable `work_type` and `stage`,
+    /// keeps every row and its `source`, and the CHECK constraints reject unknown values.
+    #[test]
+    fn step_five_adds_type_and_stage_and_keeps_source() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_to(&mut conn, 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nodes (id, parent_id, position, kind, title, source, created_at, updated_at, touched_at)
+             VALUES (1, NULL, 'a', 'area', 'To do', NULL, 't', 't', 't'),
+                    (2, 1, 'a', 'task', 'Old', 'my words', 't', 't', 't');",
+        )
+        .unwrap();
+        apply(&mut conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, latest());
+        assert!(version >= 5);
+        let row: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source, work_type, stage FROM nodes WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (Some("my words".to_string()), None, None));
+        assert!(
+            conn.execute("UPDATE nodes SET work_type = 'nonsense' WHERE id = 2", [])
+                .is_err()
+        );
+        conn.execute(
+            "UPDATE nodes SET work_type = 'bug', stage = 'in_review' WHERE id = 2",
+            [],
+        )
+        .unwrap();
     }
 }
