@@ -1218,3 +1218,265 @@ async fn big_tree_is_fast() {
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn history_replays_a_subtree() {
+    let dir = temp_dir("history");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+
+    for t in ["Rooty", "A", "B", "Outside"] {
+        m.add(None, json!({"title": t, "kind": "area"})).await;
+    }
+    let (r, a, b, outside) = (
+        id_of(&path, "Rooty"),
+        id_of(&path, "A"),
+        id_of(&path, "B"),
+        id_of(&path, "Outside"),
+    );
+    m.add(Some(outside), json!({"title": "Elsewhere"})).await;
+    let elsewhere = id_of(&path, "Elsewhere");
+
+    // A node born under A, moved to B, then under the requested root.
+    m.add(Some(a), json!({"title": "Wanderer"})).await;
+    let w = id_of(&path, "Wanderer");
+    m.ok("move", json!({"id": sid(w), "parent": sid(b)})).await;
+    m.ok("move", json!({"id": sid(w), "parent": sid(r)})).await;
+
+    // Done and dropped nodes, with children under them.
+    m.add(
+        Some(r),
+        json!({"title": "Finished", "children": [{"title": "Finished kid"}]}),
+    )
+    .await;
+    m.add(
+        Some(r),
+        json!({"title": "Scrapped", "children": [{"title": "Scrapped kid"}]}),
+    )
+    .await;
+    let (fin, fin_kid) = (id_of(&path, "Finished"), id_of(&path, "Finished kid"));
+    let (scr, scr_kid) = (id_of(&path, "Scrapped"), id_of(&path, "Scrapped kid"));
+    m.ok(
+        "set_status",
+        json!({"ids": [sid(fin_kid)], "status": "done"}),
+    )
+    .await;
+    m.ok("set_status", json!({"ids": [sid(fin)], "status": "done"}))
+        .await;
+    m.ok(
+        "set_status",
+        json!({"ids": [sid(scr)], "status": "dropped"}),
+    )
+    .await;
+
+    // A recurring task, completed once.
+    m.add(Some(r), json!({"title": "Chore", "recur": "every 2 weeks"}))
+        .await;
+    let chore = id_of(&path, "Chore");
+    m.ok("set_status", json!({"ids": [sid(chore)], "status": "done"}))
+        .await;
+
+    // A reorder inside the same parent.
+    m.add(Some(r), json!({"title": "X"})).await;
+    m.add(Some(r), json!({"title": "Y"})).await;
+    let (x, y) = (id_of(&path, "X"), id_of(&path, "Y"));
+    m.ok("move", json!({"id": sid(x), "after": sid(y)})).await;
+
+    let v = m.j(&format!("/api/history?root={}", sid(r))).await;
+    assert_eq!(v["root"], r);
+    assert_eq!(v["node_limit"], 5000);
+    assert_eq!(v["event_limit"], 20000);
+    assert_eq!(v["truncated"], false);
+    assert_eq!(v["path"][0]["id"], 1);
+    for k in ["rev", "version", "time_zone", "today"] {
+        assert!(!v[k].is_null(), "{k}");
+    }
+
+    // Scoped to the subtree; closed nodes and what is under them are included.
+    let got = ids(&v);
+    assert_eq!(got[0], r, "root first");
+    for id in [w, fin, fin_kid, scr, scr_kid, chore, x, y] {
+        assert!(got.contains(&id), "{id} missing from {got:?}");
+    }
+    for id in [a, b, outside, elsewhere] {
+        assert!(!got.contains(&id), "{id} must be outside the subtree");
+    }
+    assert_eq!(got.len(), 9);
+    assert_eq!(node(&v, scr)["status"], "dropped");
+    assert_eq!(node(&v, scr_kid)["parent"], scr);
+    assert_eq!(node(&v, fin)["status"], "done");
+    assert_eq!(node(&v, r)["children_loaded"], true);
+    assert_eq!(count(&v, r, "child_count"), 6);
+    assert_eq!(count(&v, r, "descendant_count"), 8);
+
+    // Events: oldest first, only for nodes in the subtree.
+    let events = v["events"].as_array().unwrap();
+    let eids: Vec<i64> = events.iter().map(|e| e["id"].as_i64().unwrap()).collect();
+    assert!(eids.windows(2).all(|p| p[0] < p[1]), "{eids:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| got.contains(&e["node"].as_i64().unwrap()))
+    );
+    let of = |node: i64, kind: &str| -> Vec<&Value> {
+        events
+            .iter()
+            .filter(|e| e["node"] == node && e["type"] == kind)
+            .collect()
+    };
+
+    assert_eq!(of(w, "created").len(), 1);
+    let moves = of(w, "moved");
+    assert_eq!(moves.len(), 2);
+    assert_eq!(moves[0]["from_parent"], a);
+    assert_eq!(moves[0]["to_parent"], b);
+    assert_eq!(moves[1]["from_parent"], b);
+    assert_eq!(moves[1]["to_parent"], r);
+    assert!(moves[0]["id"].as_i64() < moves[1]["id"].as_i64());
+    assert_eq!(moves[0]["detail"], format!("SPOKE-{a} -> SPOKE-{b}"));
+    assert!(moves[0]["from_status"].is_null() && moves[0]["to_status"].is_null());
+
+    let s = of(fin, "status");
+    assert_eq!(s.len(), 1);
+    assert_eq!(s[0]["from_status"], "open");
+    assert_eq!(s[0]["to_status"], "done");
+    assert!(s[0]["from_parent"].is_null() && s[0]["to_parent"].is_null());
+    let s = of(scr, "status");
+    assert_eq!(s[0]["to_status"], "dropped");
+
+    let rec = of(chore, "recurred");
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0]["from_status"], "open");
+    assert_eq!(rec[0]["to_status"], "open");
+    assert!(rec[0]["detail"].as_str().unwrap().contains("next due"));
+
+    let re = of(x, "moved");
+    assert_eq!(re.len(), 1);
+    assert!(
+        re[0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("reordered under")
+    );
+    for k in ["from_parent", "to_parent", "from_status", "to_status"] {
+        assert!(re[0][k].is_null(), "{k}");
+    }
+    let created = of(x, "created");
+    assert_eq!(created.len(), 1);
+    assert!(created[0]["from_parent"].is_null());
+
+    // root defaults to 1 (everything); both id forms work.
+    let all = m.j("/api/history").await;
+    assert_eq!(all["root"], 1);
+    assert!(ids(&all).contains(&elsewhere) && ids(&all).contains(&w));
+    let by_num = m.j(&format!("/api/history?root={r}")).await;
+    assert_eq!(ids(&by_num), got);
+    let only = m.j(&format!("/api/history?root={elsewhere}")).await;
+    assert_eq!(ids(&only), vec![elsewhere]);
+    assert_eq!(only["path"].as_array().unwrap().len(), 2);
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn history_rules_and_etag() {
+    let dir = temp_dir("history-rules");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    m.add(None, json!({"title": "Alpha", "kind": "area"})).await;
+    let alpha = id_of(&path, "Alpha");
+
+    for q in [
+        "?depth=2",
+        "?foo=1",
+        "?root=1&root=1",
+        "?root=banana",
+        "?root=0",
+    ] {
+        let r = m.get(&format!("/api/history{q}"), &[]).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}");
+        assert!(r.json()["error"].is_string());
+    }
+    let r = m.get("/api/history?root=9999", &[]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.json()["error"].as_str().unwrap().contains("SPOKE-9999"));
+    let r = m
+        .get("/api/history", &[("origin", "http://evil.example")])
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = m.request("POST", "/api/history", &[]).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+    let r = m.get("/api/nope", &[]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let msg = r.json()["error"].as_str().unwrap().to_string();
+    assert!(msg.starts_with("no such endpoint"), "{msg}");
+    assert!(msg.contains("/api/history"), "{msg}");
+
+    let r = m.get(&format!("/api/history?root={alpha}"), &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let tag = r.etag();
+    assert!(tag.contains(&format!("h.{alpha}.")), "{tag}");
+    let r = m
+        .get(
+            &format!("/api/history?root={alpha}"),
+            &[("if-none-match", &tag)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    assert!(r.body.is_empty());
+
+    m.add(Some(alpha), json!({"title": "Child"})).await;
+    let r = m
+        .get(
+            &format!("/api/history?root={alpha}"),
+            &[("if-none-match", &tag)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_ne!(r.etag(), tag);
+    assert_eq!(r.json()["nodes"].as_array().unwrap().len(), 2);
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn history_caps_nodes_in_preorder() {
+    let dir = temp_dir("history-cap");
+    let path = dir.join("spokes.db");
+    let mut first_child = 0;
+    seed(&path, |tx| {
+        let top = ins(tx, 1, 0, "task", "Top");
+        for i in 0..50 {
+            let p = ins(tx, top, i, "task", &format!("P{i}"));
+            if i == 0 {
+                first_child = p;
+            }
+            for j in 0..110 {
+                ins(tx, p, j, "task", &format!("T{i}-{j}"));
+            }
+        }
+    });
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    let v = m.j("/api/history?root=1").await;
+    assert_eq!(v["truncated"], true);
+    let got = ids(&v);
+    assert_eq!(got.len(), 5000);
+    // Pre-order: root, Top, then P0 followed by its children before P1.
+    assert_eq!(got[0], 1);
+    assert_eq!(got[2], first_child);
+    assert_eq!(node(&v, got[3])["parent"], first_child);
+    // The cut node's children are not all in the response.
+    let last = *got.last().unwrap();
+    let cut = node(&v, node(&v, last)["parent"].as_i64().unwrap());
+    assert_eq!(cut["children_loaded"], false);
+    assert_eq!(cut["child_count"], 110);
+    assert_eq!(node(&v, 1)["descendant_count"], 5551);
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -1,10 +1,16 @@
 //! Read-only JSON views of the tree for the web API (`/api`): a slice of the tree for
-//! lazy loading, and one node in detail. Nothing here writes, renews a lease or logs.
+//! lazy loading, one node in detail, and a subtree's whole history for replay. Nothing
+//! here writes, renews a lease or logs.
 //!
 //! A slice is built from a handful of queries, not one per node: the skeleton of the
 //! root's subtree (id, parent, status, defer date) in one recursive query, which gives
 //! every count; the full rows of the nodes that go out, in one query; plus the root's
 //! ancestors and the focus list.
+//!
+//! A history is the same shape of work for a whole subtree at once: one recursive query
+//! for every node under the root (closed ones included), the full rows and the events of
+//! the nodes that go out in one query each, capped at [`HISTORY_NODE_LIMIT`] nodes and
+//! [`HISTORY_EVENT_LIMIT`] events.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -22,6 +28,9 @@ pub const DEFAULT_DEPTH: i64 = 3;
 pub const MAX_DEPTH: i64 = 10;
 /// Hard cap on nodes in one response.
 pub const NODE_LIMIT: usize = 2000;
+/// Caps on one history response: nodes (first in pre-order) and events (oldest first).
+pub const HISTORY_NODE_LIMIT: usize = 5000;
+pub const HISTORY_EVENT_LIMIT: usize = 20000;
 /// Events in a node's detail, newest first (as `get history: true`).
 const HISTORY: i64 = 10;
 
@@ -46,7 +55,7 @@ impl From<String> for ViewError {
     }
 }
 
-type ViewResult<T> = Result<T, ViewError>;
+pub type ViewResult<T> = Result<T, ViewError>;
 
 /// What a slice asks for.
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +169,34 @@ struct Sk {
     id: i64,
     status: Status,
     defer_until: Option<String>,
+}
+
+/// The actionable step among a parent's children, as `get` marks `<- next`.
+fn first_open_step(parent: &Node, siblings: &[Sk], today: NaiveDate) -> Option<i64> {
+    if !parent.ordered || parent.status.is_closed() {
+        return None;
+    }
+    siblings
+        .iter()
+        .find(|k| !k.status.is_closed())
+        .filter(|k| k.status == Status::Open && !deferred(k.defer_until.as_deref(), today))
+        .map(|k| k.id)
+}
+
+/// A parent's direct children as skeleton rows, in sibling order.
+fn sibling_skeletons(conn: &Connection, parent: NodeId) -> rusqlite::Result<Vec<Sk>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, status, defer_until FROM nodes WHERE parent_id = ?1 ORDER BY position",
+    )?;
+    stmt.query_map(params![parent.0], |r| {
+        let status: String = r.get(1)?;
+        Ok(Sk {
+            id: r.get(0)?,
+            status: status.parse().unwrap_or(Status::Open),
+            defer_until: r.get(2)?,
+        })
+    })?
+    .collect()
 }
 
 /// A slice of the tree below `q.root`, `q.depth` levels deep, capped at [`NODE_LIMIT`].
@@ -291,36 +328,14 @@ pub fn slice(conn: &Connection, q: SliceQuery, today: NaiveDate, now: &str) -> V
 
     // The actionable step of each emitted parent, as `get` marks `<- next`.
     let mut next_of: HashMap<i64, Option<i64>> = HashMap::new();
-    let first_open_step = |parent: &Node, siblings: &[Sk]| -> Option<i64> {
-        if !parent.ordered || parent.status.is_closed() {
-            return None;
-        }
-        siblings
-            .iter()
-            .find(|k| !k.status.is_closed())
-            .filter(|k| k.status == Status::Open && !deferred(k.defer_until.as_deref(), today))
-            .map(|k| k.id)
-    };
     if let Some(parent) = above.last() {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, status, defer_until FROM nodes WHERE parent_id = ?1 ORDER BY position",
-        )?;
-        let siblings: Vec<Sk> = stmt
-            .query_map(params![parent.id.0], |r| {
-                let status: String = r.get(1)?;
-                Ok(Sk {
-                    id: r.get(0)?,
-                    status: status.parse().unwrap_or(Status::Open),
-                    defer_until: r.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        next_of.insert(parent.id.0, first_open_step(parent, &siblings));
+        let siblings = sibling_skeletons(conn, parent.id)?;
+        next_of.insert(parent.id.0, first_open_step(parent, &siblings, today));
     }
     for id in &ids {
         if let Some(n) = rows.get(id) {
             let siblings = kids.get(id).map_or(&[][..], Vec::as_slice);
-            next_of.insert(*id, first_open_step(n, siblings));
+            next_of.insert(*id, first_open_step(n, siblings, today));
         }
     }
 
@@ -409,6 +424,260 @@ pub fn detail(
     })
 }
 
+/// One event of a replayed subtree: the raw [`Event`] fields plus the node it belongs to
+/// and what could be read out of `detail` (all `null` when it does not parse).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HistoryEvent {
+    pub id: i64,
+    pub node: i64,
+    pub at: String,
+    pub agent: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub detail: Option<String>,
+    pub from_parent: Option<i64>,
+    pub to_parent: Option<i64>,
+    pub from_status: Option<&'static str>,
+    pub to_status: Option<&'static str>,
+}
+
+/// A subtree with everything needed to replay its history.
+#[derive(Debug, Serialize)]
+pub struct History {
+    pub path: Vec<Crumb>,
+    pub node_limit: usize,
+    pub event_limit: usize,
+    pub truncated: bool,
+    pub nodes: Vec<ViewNode>,
+    pub events: Vec<HistoryEvent>,
+}
+
+/// What `detail` says about a move or a status change.
+#[derive(Debug, Default, PartialEq)]
+pub struct Parsed {
+    pub from_parent: Option<i64>,
+    pub to_parent: Option<i64>,
+    pub from_status: Option<&'static str>,
+    pub to_status: Option<&'static str>,
+}
+
+fn status_str(s: &str) -> Option<&'static str> {
+    s.trim().parse::<Status>().ok().map(Status::as_str)
+}
+
+/// Reads the structured part of an event's `detail` by type, with plain string handling:
+/// `moved`: `SPOKE-a -> SPOKE-b`; `status`: `x -> y`; `recurred`: `x -> done -> open; ...`.
+/// Anything else, or anything that does not parse, gives all `None`.
+pub fn parse_detail(kind: &str, detail: &str) -> Parsed {
+    let parts: Vec<&str> = detail.split(" -> ").collect();
+    match (kind, parts.as_slice()) {
+        ("moved", [a, b]) => {
+            let id = |s: &str| s.trim().parse::<NodeId>().ok().map(|n| n.0);
+            match (id(a), id(b)) {
+                (Some(a), Some(b)) => Parsed {
+                    from_parent: Some(a),
+                    to_parent: Some(b),
+                    ..Parsed::default()
+                },
+                _ => Parsed::default(),
+            }
+        }
+        ("status", [a, b]) => match (status_str(a), status_str(b)) {
+            (Some(a), Some(b)) => Parsed {
+                from_status: Some(a),
+                to_status: Some(b),
+                ..Parsed::default()
+            },
+            _ => Parsed::default(),
+        },
+        ("recurred", [a, done, rest]) => {
+            let reopened = rest.split(';').next().is_some_and(|s| s.trim() == "open");
+            match status_str(a) {
+                Some(a) if done.trim() == "done" && reopened => Parsed {
+                    from_status: Some(a),
+                    to_status: Some("open"),
+                    ..Parsed::default()
+                },
+                _ => Parsed::default(),
+            }
+        }
+        _ => Parsed::default(),
+    }
+}
+
+/// Every node under `root` (root included, closed nodes and what lies under them too) in
+/// pre-order, and every event of those nodes, oldest first. Capped at
+/// [`HISTORY_NODE_LIMIT`] nodes and [`HISTORY_EVENT_LIMIT`] events; `truncated` says a cap
+/// cut something. Counts and `children_loaded` are as in a slice with `include_closed`.
+pub fn history(
+    conn: &Connection,
+    root: NodeId,
+    today: NaiveDate,
+    now: &str,
+) -> ViewResult<History> {
+    let Some(root) = load(conn, root)? else {
+        return Err(ViewError::NotFound(format!("{root} does not exist")));
+    };
+
+    // The whole subtree's skeleton, by parent in sibling order.
+    let mut kids: HashMap<i64, Vec<Sk>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE sub(id) AS (
+               SELECT id FROM nodes WHERE parent_id = ?1 AND user_id = ?2
+               UNION ALL
+               SELECT c.id FROM sub JOIN nodes c ON c.parent_id = sub.id
+             )
+             SELECT n.id, n.parent_id, n.status, n.defer_until
+             FROM sub JOIN nodes n ON n.id = sub.id
+             ORDER BY n.parent_id, n.position",
+        )?;
+        let mut rows = stmt.query(params![root.id.0, DEFAULT_USER])?;
+        while let Some(r) = rows.next()? {
+            let status: String = r.get(2)?;
+            let status = status.parse().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    format!("bad status '{status}'").into(),
+                )
+            })?;
+            kids.entry(r.get(1)?).or_default().push(Sk {
+                id: r.get(0)?,
+                status,
+                defer_until: r.get(3)?,
+            });
+        }
+    }
+    let children = |id: i64| kids.get(&id).map_or(&[][..], Vec::as_slice);
+
+    // Pre-order over everything (parents before children), for counts and the cut.
+    let mut all: Vec<i64> = Vec::new();
+    let mut stack = vec![root.id.0];
+    while let Some(id) = stack.pop() {
+        all.push(id);
+        stack.extend(children(id).iter().rev().map(|k| k.id));
+    }
+    let mut descendants: HashMap<i64, usize> = HashMap::with_capacity(all.len());
+    for &id in all.iter().rev() {
+        let below: usize = children(id)
+            .iter()
+            .map(|k| 1 + descendants.get(&k.id).copied().unwrap_or(0))
+            .sum();
+        descendants.insert(id, below);
+    }
+    let mut truncated = all.len() > HISTORY_NODE_LIMIT;
+    let ids: Vec<i64> = all.into_iter().take(HISTORY_NODE_LIMIT).collect();
+    let included: std::collections::HashSet<i64> = ids.iter().copied().collect();
+
+    let list = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+    let mut rows: HashMap<i64, Node> = HashMap::with_capacity(ids.len());
+    {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {NODE_COLS} FROM nodes n WHERE n.id IN (SELECT value FROM json_each(?1))"
+        ))?;
+        for n in stmt.query_map(params![list], node_from_row)? {
+            let n = n?;
+            rows.insert(n.id.0, n);
+        }
+    }
+
+    let above = ancestors(conn, root.id)?;
+    let path: Vec<Crumb> = above
+        .iter()
+        .map(|a| Crumb {
+            id: a.id.0,
+            title: a.title.clone(),
+        })
+        .collect();
+    let focus = focus_numbers(conn)?;
+
+    let mut next_of: HashMap<i64, Option<i64>> = HashMap::new();
+    if let Some(parent) = above.last() {
+        let siblings = sibling_skeletons(conn, parent.id)?;
+        next_of.insert(parent.id.0, first_open_step(parent, &siblings, today));
+    }
+    for id in &ids {
+        if let Some(n) = rows.get(id) {
+            next_of.insert(*id, first_open_step(n, children(*id), today));
+        }
+    }
+
+    let inherited = above.iter().rev().find_map(|a| a.priority);
+    let mut level: HashMap<i64, Option<i64>> = HashMap::with_capacity(ids.len());
+    let mut nodes = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(n) = rows.remove(id) else { continue };
+        let from_above = match n.parent_id {
+            Some(p) if *id != root.id.0 => level.get(&p.0).copied().flatten(),
+            _ => inherited,
+        };
+        let effective = n.priority.or(from_above);
+        level.insert(*id, effective);
+        let all = children(*id);
+        let is_next = n
+            .parent_id
+            .is_some_and(|p| next_of.get(&p.0).copied().flatten() == Some(*id));
+        nodes.push(view_node(
+            n,
+            ViewCounts {
+                effective,
+                focus: focus.get(&NodeId(*id)).copied(),
+                is_next,
+                child_count: all.len(),
+                descendant_count: descendants.get(id).copied().unwrap_or(0),
+                closed_child_count: all.iter().filter(|k| k.status.is_closed()).count(),
+                children_loaded: all.iter().all(|k| included.contains(&k.id)),
+            },
+            today,
+            now,
+        ));
+    }
+
+    // Events of those nodes, oldest first; one more than the cap tells whether it cut.
+    let mut events: Vec<HistoryEvent> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, node_id, at, agent, type, detail FROM events
+             WHERE node_id IN (SELECT value FROM json_each(?1))
+             ORDER BY id LIMIT ?2",
+        )?;
+        stmt.query_map(params![list, HISTORY_EVENT_LIMIT as i64 + 1], |r| {
+            let kind: String = r.get(4)?;
+            let detail: Option<String> = r.get(5)?;
+            let p = detail
+                .as_deref()
+                .map(|d| parse_detail(&kind, d))
+                .unwrap_or_default();
+            Ok(HistoryEvent {
+                id: r.get(0)?,
+                node: r.get(1)?,
+                at: r.get(2)?,
+                agent: r.get(3)?,
+                kind,
+                detail,
+                from_parent: p.from_parent,
+                to_parent: p.to_parent,
+                from_status: p.from_status,
+                to_status: p.to_status,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    if events.len() > HISTORY_EVENT_LIMIT {
+        events.truncate(HISTORY_EVENT_LIMIT);
+        truncated = true;
+    }
+
+    Ok(History {
+        path,
+        node_limit: HISTORY_NODE_LIMIT,
+        event_limit: HISTORY_EVENT_LIMIT,
+        truncated,
+        nodes,
+        events,
+    })
+}
+
 fn deferred(defer_until: Option<&str>, today: NaiveDate) -> bool {
     defer_until.and_then(parse_date).is_some_and(|d| d > today)
 }
@@ -466,5 +735,78 @@ fn view_node(n: Node, c: ViewCounts, today: NaiveDate, now: &str) -> ViewNode {
         descendant_count: c.descendant_count,
         closed_child_count: c.closed_child_count,
         children_loaded: c.children_loaded,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_move_status_and_recurred_details() {
+        let p = parse_detail("moved", "SPOKE-3 -> SPOKE-12");
+        assert_eq!((p.from_parent, p.to_parent), (Some(3), Some(12)));
+        assert_eq!(
+            parse_detail("moved", "reordered under SPOKE-4"),
+            Parsed::default()
+        );
+        assert_eq!(
+            parse_detail("moved", "SPOKE-x -> SPOKE-2"),
+            Parsed::default()
+        );
+
+        let p = parse_detail("status", "open -> done");
+        assert_eq!((p.from_status, p.to_status), (Some("open"), Some("done")));
+        assert_eq!(parse_detail("status", "open -> bogus"), Parsed::default());
+        assert_eq!(parse_detail("status", "open"), Parsed::default());
+
+        let p = parse_detail(
+            "recurred",
+            "in_progress -> done -> open; next due 2026-12-01, hidden until 2026-11-25, 2 steps reopened",
+        );
+        assert_eq!(
+            (p.from_status, p.to_status),
+            (Some("in_progress"), Some("open"))
+        );
+        let p = parse_detail("recurred", "open -> done -> open");
+        assert_eq!((p.from_status, p.to_status), (Some("open"), Some("open")));
+        assert_eq!(parse_detail("recurred", "open -> done"), Parsed::default());
+        assert_eq!(
+            parse_detail("recurred", "open -> done -> waiting"),
+            Parsed::default()
+        );
+
+        assert_eq!(parse_detail("created", "A -> B"), Parsed::default());
+        assert_eq!(parse_detail("moved", ""), Parsed::default());
+    }
+
+    #[test]
+    fn history_caps_events_oldest_first() {
+        let (mut conn, dir) = crate::store::test_support::temp_db("history-events");
+        let tx = conn.transaction().unwrap();
+        {
+            let mut ins = tx
+                .prepare(
+                    "INSERT INTO events (node_id, at, type, detail)
+                     VALUES (1, '2026-01-01T00:00:00Z', 'updated', ?1)",
+                )
+                .unwrap();
+            for i in 0..HISTORY_EVENT_LIMIT + 5 {
+                ins.execute([i.to_string()]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let h = history(&conn, NodeId(1), today, "2026-11-23T00:00:00Z").unwrap();
+        assert!(h.truncated);
+        assert_eq!(h.nodes.len(), 1);
+        assert_eq!(h.events.len(), HISTORY_EVENT_LIMIT);
+        assert!(h.events.windows(2).all(|w| w[0].id < w[1].id));
+        let oldest: i64 = conn
+            .query_row("SELECT MIN(id) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(h.events[0].id, oldest);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

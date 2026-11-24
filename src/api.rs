@@ -3,6 +3,8 @@
 //!
 //! - `GET /api/tree?root=&depth=&include_closed=`: a slice of the tree for lazy loading.
 //! - `GET /api/nodes/{id}`: one node with its notes, breadcrumb and last events.
+//! - `GET /api/history?root=`: a subtree's nodes (closed ones too) and all their events,
+//!   oldest first, for replaying its history.
 //!
 //! It reads through its own read-only SQLite connection (WAL lets it read while MCP
 //! writes), so it can neither write nor hold the MCP connection's lock. Responses carry
@@ -31,7 +33,7 @@ use crate::config::Config;
 use crate::format::today_in;
 use crate::model::NodeId;
 use crate::store::view::{
-    self, DEFAULT_DEPTH, Detail, MAX_DEPTH, NODE_LIMIT, Slice, SliceQuery, ViewError,
+    self, DEFAULT_DEPTH, Detail, History, MAX_DEPTH, NODE_LIMIT, Slice, SliceQuery, ViewError,
 };
 
 #[derive(Clone)]
@@ -65,10 +67,11 @@ pub fn router(config: &Config) -> anyhow::Result<Router> {
     Ok(Router::new()
         .route("/tree", get(tree))
         .route("/nodes/{id}", get(node))
+        .route("/history", get(history))
         .fallback(|| async {
             error(
                 StatusCode::NOT_FOUND,
-                "no such endpoint; use /api/tree or /api/nodes/{id}",
+                "no such endpoint; use /api/tree, /api/nodes/{id} or /api/history",
             )
         })
         .method_not_allowed_fallback(|| async {
@@ -283,6 +286,15 @@ struct NodeBody {
     detail: Detail,
 }
 
+#[derive(Serialize)]
+struct HistoryBody {
+    #[serde(flatten)]
+    meta: Meta,
+    root: i64,
+    #[serde(flatten)]
+    history: History,
+}
+
 async fn tree(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -340,6 +352,28 @@ async fn node(
     Ok(respond(api, headers, tag, move |conn, meta, today, now| {
         let detail = view::detail(conn, id, include_closed, today, now)?;
         Ok(NodeBody { meta, detail })
+    })
+    .await)
+}
+
+async fn history(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let p = params(query, &["root"])?;
+    let root = match p.get("root") {
+        None => crate::model::ROOT_ID,
+        Some(v) => parse_id(v, "root")?,
+    };
+    let tag = format!("h.{}", root.0);
+    Ok(respond(api, headers, tag, move |conn, meta, today, now| {
+        let history = view::history(conn, root, today, now)?;
+        Ok(HistoryBody {
+            meta,
+            root: root.0,
+            history,
+        })
     })
     .await)
 }
