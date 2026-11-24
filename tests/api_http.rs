@@ -1480,3 +1480,159 @@ async fn history_caps_nodes_in_preorder() {
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn search_finds_by_typo_alias_and_notes_with_paths() {
+    let dir = temp_dir("search");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    m.add(None, json!({"title": "Projects", "kind": "area"}))
+        .await;
+    let projects = id_of(&path, "Projects");
+    m.add(
+        Some(projects),
+        json!({"title": "Spokes View", "kind": "area"}),
+    )
+    .await;
+    let view = id_of(&path, "Spokes View");
+    m.add(
+        Some(view),
+        json!({"title": "Fuzzy-find search in the view", "priority": 1,
+               "aliases": ["finder box"], "notes": "uses trigram matching"}),
+    )
+    .await;
+    let fuzzy = id_of(&path, "Fuzzy-find search in the view");
+    m.add(Some(view), json!({"title": "Old search idea"})).await;
+    let old = id_of(&path, "Old search idea");
+    m.ok(
+        "set_status",
+        json!({"ids": [sid(old)], "status": "dropped"}),
+    )
+    .await;
+
+    // A typo in every word still finds it, with its breadcrumb ids from the root down.
+    let r = m.get("/api/search?q=fuzy%20serch", &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let v = r.json();
+    assert_eq!(v["query"], "fuzy serch");
+    assert_eq!(v["keywords"], json!(["fuzy", "serch"]));
+    let first = &v["results"][0];
+    assert_eq!(first["id"].as_i64(), Some(fuzzy));
+    assert_eq!(first["kind"], "task");
+    assert_eq!(first["status"], "open");
+    assert_eq!(first["effective_priority"], 1);
+    assert_eq!(first["via"], Value::Null);
+    let crumbs: Vec<i64> = first["path"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(crumbs, vec![1, projects, view]);
+    assert_eq!(first["path"][2]["title"], "Spokes View");
+    // The dropped node is hidden and counted.
+    assert_eq!(v["hidden_closed"], 1);
+    assert!(ids_of_results(&v).iter().all(|&i| i != old));
+
+    // Alias and notes matches say why.
+    let v = m.get("/api/search?q=finder", &[]).await.json();
+    assert_eq!(v["results"][0]["id"].as_i64(), Some(fuzzy));
+    assert_eq!(v["results"][0]["via"], "alias \"finder box\"");
+    let v = m.get("/api/search?q=trigram", &[]).await.json();
+    assert_eq!(v["results"][0]["via"], "in notes");
+
+    // Closed nodes on request; limit and total; scope.
+    let v = m
+        .get("/api/search?q=search&include_closed=true", &[])
+        .await
+        .json();
+    assert!(ids_of_results(&v).contains(&old));
+    assert_eq!(v["hidden_closed"], 0);
+    let v = m
+        .get("/api/search?q=search&include_closed=1&limit=1", &[])
+        .await
+        .json();
+    assert_eq!(v["results"].as_array().unwrap().len(), 1);
+    assert_eq!(v["total"], 2);
+    let v = m
+        .get(&format!("/api/search?q=spokes&scope={view}"), &[])
+        .await
+        .json();
+    assert!(!ids_of_results(&v).contains(&view), "scope excludes itself");
+
+    // Nothing found is still 200.
+    let v = m.get("/api/search?q=zzqqxx", &[]).await.json();
+    assert_eq!(v["total"], 0);
+    assert_eq!(v["results"], json!([]));
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn ids_of_results(v: &Value) -> Vec<i64> {
+    v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn search_rules_and_etag() {
+    let dir = temp_dir("search-rules");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    m.add(None, json!({"title": "Alpha", "kind": "area"})).await;
+
+    let long = "a".repeat(201);
+    for q in [
+        "",
+        "?q=",
+        "?q=%20%20",
+        "?q=a&q=b",
+        "?q=alpha&foo=1",
+        "?q=alpha&limit=0",
+        "?q=alpha&limit=51",
+        "?q=alpha&limit=x",
+        "?q=alpha&include_closed=maybe",
+        "?q=alpha&scope=banana",
+        &format!("?q={long}"),
+    ] {
+        let r = m.get(&format!("/api/search{q}"), &[]).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}");
+        assert!(r.json()["error"].is_string());
+    }
+    let r = m.get("/api/search?q=alpha&scope=9999", &[]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = m
+        .get("/api/search?q=alpha", &[("origin", "http://evil.example")])
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = m.request("POST", "/api/search?q=alpha", &[]).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    let r = m.get("/api/search?q=alpha", &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let tag = r.etag();
+    let r = m
+        .get("/api/search?q=alpha", &[("if-none-match", &tag)])
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    let r = m
+        .get("/api/search?q=beta", &[("if-none-match", &tag)])
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "another query, another tag");
+    m.add(None, json!({"title": "Alphabet", "kind": "area"}))
+        .await;
+    let r = m
+        .get("/api/search?q=alpha", &[("if-none-match", &tag)])
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "a write changes the tag");
+    assert_eq!(r.json()["total"], 2);
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

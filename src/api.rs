@@ -5,6 +5,8 @@
 //! - `GET /api/nodes/{id}`: one node with its notes, breadcrumb and last events.
 //! - `GET /api/history?root=`: a subtree's nodes (closed ones too) and all their events,
 //!   oldest first, for replaying its history.
+//! - `GET /api/search?q=&limit=&include_closed=&scope=`: the `search` tool's ranked
+//!   matches as data, each with its breadcrumb ids, for finding a node in the view.
 //!
 //! It reads through its own read-only SQLite connection (WAL lets it read while MCP
 //! writes), so it can neither write nor hold the MCP connection's lock. Responses carry
@@ -32,6 +34,8 @@ use tower_http::compression::CompressionLayer;
 use crate::config::Config;
 use crate::format::today_in;
 use crate::model::NodeId;
+use crate::store::load;
+use crate::store::search as find;
 use crate::store::view::{
     self, DEFAULT_DEPTH, Detail, History, MAX_DEPTH, NODE_LIMIT, Slice, SliceQuery, ViewError,
 };
@@ -68,10 +72,11 @@ pub fn router(config: &Config) -> anyhow::Result<Router> {
         .route("/tree", get(tree))
         .route("/nodes/{id}", get(node))
         .route("/history", get(history))
+        .route("/search", get(search))
         .fallback(|| async {
             error(
                 StatusCode::NOT_FOUND,
-                "no such endpoint; use /api/tree, /api/nodes/{id} or /api/history",
+                "no such endpoint; use /api/tree, /api/nodes/{id}, /api/history or /api/search",
             )
         })
         .method_not_allowed_fallback(|| async {
@@ -373,6 +378,82 @@ async fn history(
             meta,
             root: root.0,
             history,
+        })
+    })
+    .await)
+}
+
+/// Longest `q` accepted, in characters.
+const MAX_QUERY_CHARS: usize = 200;
+
+#[derive(Serialize)]
+struct SearchBody {
+    #[serde(flatten)]
+    meta: Meta,
+    query: String,
+    scope: i64,
+    include_closed: bool,
+    #[serde(flatten)]
+    found: find::ApiSearch,
+}
+
+async fn search(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let p = params(query, &["q", "limit", "include_closed", "scope"])?;
+    let q = p.get("q").map(|v| v.trim().to_string()).unwrap_or_default();
+    if q.chars().count() > MAX_QUERY_CHARS {
+        return Err(bad(format!(
+            "q is longer than {MAX_QUERY_CHARS} characters"
+        )));
+    }
+    let kws = find::query_keywords(&q);
+    if kws.is_empty() {
+        return Err(bad(
+            "q needs at least one word, e.g. q=server homelab (words are alternatives)",
+        ));
+    }
+    let limit = match p.get("limit") {
+        None => find::API_DEFAULT_LIMIT,
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|l| (1..=find::API_MAX_LIMIT).contains(l))
+            .ok_or_else(|| {
+                bad(format!(
+                    "limit must be a whole number from 1 to {}",
+                    find::API_MAX_LIMIT
+                ))
+            })?,
+    };
+    let include_closed = parse_bool(p.get("include_closed"), "include_closed")?;
+    let scope = match p.get("scope") {
+        None => crate::model::ROOT_ID,
+        Some(v) => parse_id(v, "scope")?,
+    };
+    // The query text goes into the ETag as a hash: it is free text, a header is not.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&q, &mut hasher);
+    let tag = format!(
+        "s.{:x}.{limit}.{}.{}",
+        std::hash::Hasher::finish(&hasher),
+        u8::from(include_closed),
+        scope.0
+    );
+    Ok(respond(api, headers, tag, move |conn, meta, _today, _now| {
+        if load(conn, scope)?.is_none() {
+            return Err(ViewError::NotFound(format!("{scope} does not exist")));
+        }
+        let found = find::api_search(conn, &q, kws, scope, include_closed, limit)?;
+        Ok(SearchBody {
+            meta,
+            query: q,
+            scope: scope.0,
+            include_closed,
+            found,
         })
     })
     .await)
