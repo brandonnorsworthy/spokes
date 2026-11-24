@@ -11,7 +11,7 @@ mod get;
 mod moves;
 mod next;
 mod recent;
-mod search;
+pub(crate) mod search;
 mod status;
 mod update;
 pub mod view;

@@ -10,8 +10,10 @@ use std::collections::HashMap;
 
 use chrono::NaiveDate;
 use rusqlite::{Connection, params};
+use serde::Serialize;
 
 use super::focus::focus_numbers;
+use super::view::Crumb;
 use super::{ToolResult, db_err, require};
 use crate::format::{due_flag, is_unplanned, parse_date, progress, short_date};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
@@ -57,49 +59,49 @@ struct Hit {
     via: Option<String>,
 }
 
-pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResult {
-    let mut kws = keywords(&args.query);
-    if kws.is_empty() {
-        return Err(
-            "query has no words. Pass a few keywords as alternatives, e.g. \"server homelab nas\"."
-                .to_string(),
-        );
-    }
+/// Keywords of a query as `search` uses them (empty when it has no words).
+pub(crate) fn query_keywords(query: &str) -> Vec<String> {
+    let mut kws = keywords(query);
     kws.truncate(MAX_KEYWORDS);
-    let phrase = format!(" {} ", normalize(&args.query));
-    let limit = match &args.limit {
-        Some(l) => l.parse("limit")?.clamp(1, MAX_LIMIT),
-        None => DEFAULT_LIMIT,
-    } as usize;
-    let scope = match &args.scope {
-        Some(s) => require(conn, s.parse()?)?.id,
-        None => ROOT_ID,
-    };
-    let include_done = args.include_done.unwrap_or(false);
+    kws
+}
 
-    let docs = candidates(conn, &kws)?;
+/// Ranked matches before they are formatted: shared by the MCP tool and `/api/search`.
+struct Found {
+    /// Best first.
+    hits: Vec<Hit>,
+    hidden_closed: usize,
+    meta: HashMap<NodeId, Meta>,
+}
+
+/// Scores every candidate for `kws` (non-empty) and ranks them, keeping only nodes under
+/// `scope` and, unless `include_done`, nodes with nothing closed at or above them.
+fn find(
+    conn: &Connection,
+    query: &str,
+    kws: &[String],
+    scope: NodeId,
+    include_done: bool,
+) -> Result<Found, String> {
+    let phrase = format!(" {} ", normalize(query));
+    let docs = candidates(conn, kws)?;
     let mut hits: Vec<Hit> = docs
         .iter()
-        .filter_map(|(id, doc)| score(*id, doc, &kws, &phrase))
+        .filter_map(|(id, doc)| score(*id, doc, kws, &phrase))
         .collect();
     // Typo fallback: a keyword nothing resembles in a title or alias gets a full scan
     // of titles and aliases (short columns), since a typo may share no trigram at all.
-    let unmatched: Vec<String> = kws
-        .iter()
-        .filter(|k| k.chars().count() >= 4)
-        .filter(|k| {
-            !docs
-                .values()
-                .any(|d| best(k, &d.title, true) >= 0.6 || best(k, &d.aliases, true) >= 0.6)
-        })
-        .cloned()
-        .collect();
-    if !unmatched.is_empty() {
+    let unmatched = kws.iter().filter(|k| k.chars().count() >= 4).any(|k| {
+        !docs
+            .values()
+            .any(|d| best(k, &d.title, true) >= 0.6 || best(k, &d.aliases, true) >= 0.6)
+    });
+    if unmatched {
         for (id, doc) in scan_titles(conn)? {
             if docs.contains_key(&id) {
                 continue;
             }
-            if let Some(hit) = score(id, &doc, &kws, &phrase) {
+            if let Some(hit) = score(id, &doc, kws, &phrase) {
                 hits.push(hit);
             }
         }
@@ -126,6 +128,35 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
             })
             .then(a.id.cmp(&b.id))
     });
+    Ok(Found {
+        hits,
+        hidden_closed,
+        meta,
+    })
+}
+
+pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResult {
+    let kws = query_keywords(&args.query);
+    if kws.is_empty() {
+        return Err(
+            "query has no words. Pass a few keywords as alternatives, e.g. \"server homelab nas\"."
+                .to_string(),
+        );
+    }
+    let limit = match &args.limit {
+        Some(l) => l.parse("limit")?.clamp(1, MAX_LIMIT),
+        None => DEFAULT_LIMIT,
+    } as usize;
+    let scope = match &args.scope {
+        Some(s) => require(conn, s.parse()?)?.id,
+        None => ROOT_ID,
+    };
+    let include_done = args.include_done.unwrap_or(false);
+    let Found {
+        hits,
+        hidden_closed,
+        meta,
+    } = find(conn, &args.query, &kws, scope, include_done)?;
 
     let hidden_note = (hidden_closed > 0).then(|| {
         format!(
@@ -168,6 +199,81 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         out.push(note);
     }
     Ok(out.join("\n"))
+}
+
+/// Default and largest `limit` of `/api/search`.
+pub const API_DEFAULT_LIMIT: usize = DEFAULT_LIMIT as usize;
+pub const API_MAX_LIMIT: usize = MAX_LIMIT as usize;
+
+/// One match as `/api/search` shows it.
+#[derive(Debug, Serialize)]
+pub struct ApiHit {
+    pub id: i64,
+    pub title: String,
+    pub kind: &'static str,
+    pub status: &'static str,
+    pub effective_priority: Option<i64>,
+    pub focus: Option<usize>,
+    /// Ancestors from the root down (the root included, the node itself not).
+    pub path: Vec<Crumb>,
+    /// Why it matched when the title did not: `alias "nas"` or `in notes`.
+    pub via: Option<String>,
+}
+
+/// The `/api/search` body, apart from the common fields.
+#[derive(Debug, Serialize)]
+pub struct ApiSearch {
+    pub keywords: Vec<String>,
+    /// Matches found (before `limit`).
+    pub total: usize,
+    pub hidden_closed: usize,
+    pub results: Vec<ApiHit>,
+}
+
+/// The same ranking as the `search` tool, as data. `kws` comes from [`query_keywords`]
+/// and is non-empty; `scope` must exist (checked by the caller).
+pub fn api_search(
+    conn: &Connection,
+    query: &str,
+    kws: Vec<String>,
+    scope: NodeId,
+    include_closed: bool,
+    limit: usize,
+) -> Result<ApiSearch, String> {
+    let Found {
+        hits,
+        hidden_closed,
+        meta,
+    } = find(conn, query, &kws, scope, include_closed)?;
+    let focus = focus_numbers(conn)?;
+    let mut results = Vec::new();
+    for hit in hits.iter().take(limit) {
+        let node = require(conn, hit.id)?;
+        let mut path: Vec<Crumb> = lineage(&meta, hit.id)
+            .skip(1)
+            .map(|(id, m)| Crumb {
+                id: id.0,
+                title: m.title.clone(),
+            })
+            .collect();
+        path.reverse();
+        results.push(ApiHit {
+            id: node.id.0,
+            title: node.title,
+            kind: node.kind.as_str(),
+            status: node.status.as_str(),
+            effective_priority: effective_level(&meta, hit.id),
+            focus: focus.get(&hit.id).copied(),
+            path,
+            via: hit.via.clone(),
+        });
+    }
+    Ok(ApiSearch {
+        keywords: kws,
+        total: hits.len(),
+        hidden_closed,
+        results,
+    })
 }
 
 /// `SPOKE-30 task p1 (0/4)  Homelab server migration  in Hobbies / Homelab  (alias "nas")`.
