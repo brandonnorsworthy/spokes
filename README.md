@@ -34,7 +34,7 @@ The finished v1 is for one person (Brandon) and the models and agents working fo
 
 ### What works today (M0 to M4, plus the read-only API)
 
-All thirteen tools: `next`, `get`, `search`, `recent`, `add`, `update`, `set_status`, `move`, `focus`, `claim`, `release`, `ask`, `answer`. Plus a read-only JSON API on `/api` (`GET /api/tree`, `GET /api/nodes/{id}`) for the web view; see [Read-only JSON API](#read-only-json-api).
+All thirteen tools: `next`, `get`, `search`, `recent`, `add`, `update`, `set_status`, `move`, `focus`, `claim`, `release`, `ask`, `answer`. Plus a read-only JSON API on `/api` (`GET /api/tree`, `GET /api/nodes/{id}`, and from 0.4.0 `GET /api/history`) for the web view; see [Read-only JSON API](#read-only-json-api).
 
 - `add`: one node, or a whole plan in one call with nested `children` (any depth up to 8, at most 200 nodes, one transaction). Returns one line with every new id, e.g. `Added SPOKE-5 task  Deploy  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11`. A bad child names itself (`children[3] ("Push"): ...`) and nothing is written.
 - `get`: the node's header line, its breadcrumb (`Hobbies / Programming / Skyforge`), who holds it (`claimed by opus-red until 14:20`, `stalled: claim by ... expired ...`, `waiting on the user: "..." (asked by sonnet-2)`, `answered 14:02, ready to claim`) and an outline `depth` levels deep (default 1, max 10), indented per level. Ordered children are numbered and the actionable step is marked `<- next`; unordered children are bulleted. The outline is capped at 60 lines and ends with `(+N more ...)` lines for what was cut by the cap or lies below the depth, plus a count of hidden dropped nodes. A child whose due date is later than a parent's shows `(after parent's Nov 20)`. `notes: true` appends the body; `history: true` appends the node's last 10 events, newest first (`14:02  claimed by opus-red: until ...`).
@@ -174,13 +174,13 @@ Then ask: "add Home, Work and Hobbies, then tell me what's next".
 
 ## Read-only JSON API
 
-For the web view (the companion repo `spokes-view`), whose backend calls it server to server. Two `GET` endpoints under `/api` on the same port as `/mcp`. It is strictly read-only: it reads through its own SQLite connection opened read-only (`SQLITE_OPEN_READ_ONLY` and `query_only`), so it cannot write, renew a lease or log an event, and since WAL lets it read while MCP writes, it never holds the MCP connection's lock. Each response is built inside one read transaction (a consistent snapshot) on the blocking pool, from a handful of queries whatever the size of the tree.
+For the web view (the companion repo `spokes-view`), whose backend calls it server to server. Three `GET` endpoints under `/api` (`/api/history` arrived in 0.4.0, purely additive: no schema migration, no MCP tool changed, and `/api/tree` and `/api/nodes/{id}` answer exactly as before) on the same port as `/mcp`. It is strictly read-only: it reads through its own SQLite connection opened read-only (`SQLITE_OPEN_READ_ONLY` and `query_only`), so it cannot write, renew a lease or log an event, and since WAL lets it read while MCP writes, it never holds the MCP connection's lock. Each response is built inside one read transaction (a consistent snapshot) on the blocking pool, from a handful of queries whatever the size of the tree.
 
 ### Rules for every request
 
 - **GET only.** Any other method gets `405`; an unknown path under `/api` gets `404`.
 - **Origin and Host, as on `/mcp`.** A request that carries an `Origin` header is refused with `403` unless the origin is in `SPOKES_ALLOWED_ORIGINS` (same matching as `/mcp`: scheme and host must match; an entry with `:*` or with no port matches any port, an explicit port only that port). With `SPOKES_ALLOWED_HOSTS` set, the `Host` header must match one entry (an entry without a port matches any port), else `403`. No CORS headers are sent: the API is meant for a backend, not for a browser calling it directly.
-- **Errors** are JSON, `{"error": "..."}`, with `400` (bad parameter: unknown or repeated name, bad id, depth out of range, a boolean that is not `true`/`false`/`1`/`0`), `403`, `404` (unknown node or endpoint), `405` or `500`.
+- **Errors** are JSON, `{"error": "..."}`, with `400` (bad parameter: unknown or repeated name, bad id, depth out of range, a boolean that is not `true`/`false`/`1`/`0`), `403`, `404` (unknown node or endpoint; an unknown endpoint's message starts with `no such endpoint`, which `spokes-view` uses to spot a server older than 0.4.0), `405` or `500`.
 - **Caching.** Every `200` carries a weak `ETag` (`W/"..."`) and `Cache-Control: no-cache`. Send it back as `If-None-Match` (a single tag, a list, or `*`) and an unchanged answer is `304` with no body, which costs two small queries. The tag covers the query, the revision (any write), SQLite's change counter for the API's connection (any commit, even one made outside spokes), "today" in `SPOKES_TZ` (dates and deferrals roll over at midnight) and the number of lapsed claims (a lease running out turns a node `stalled` with no write), plus a per-start id, so a restart or a restore never answers `304` from an old tag. Treat the tag as opaque.
 - **Compression.** With `Accept-Encoding: gzip` the body is gzipped (a 2000-node slice is about 1.1 MB of JSON and 15 KB gzipped, since nodes repeat the same keys).
 
@@ -289,6 +289,39 @@ curl -s http://127.0.0.1:8787/api/nodes/SPOKE-3
            {"id":3,"at":"2026-11-15T19:08:56Z","agent":null,"type":"created","detail":"Deploy"}]}
 ```
 
+### `GET /api/history`
+
+Everything a viewer needs to replay a subtree's history from the start: every node under `root` and every event of those nodes. Read-only like the rest.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `root` | `1` | The subtree's top: `SPOKE-12` or `12`. Unknown `root` is `404`; any other parameter, or `root` twice, is `400` |
+
+| Field | Meaning |
+| --- | --- |
+| `rev`, `version`, `time_zone`, `today` | As in `/api/tree` |
+| `root` | The root's id (number) |
+| `path` | The root's ancestors, top first, `{"id", "title"}` (as in `/api/tree`) |
+| `node_limit`, `event_limit` | The caps: `5000` nodes, `20000` events |
+| `truncated` | `true` when either cap cut something |
+| `nodes` | The root and everything under it at any depth, **including done and dropped nodes and what lies under them**, in pre-order with siblings in stored order. Each node has the same fields as in `/api/tree` as if `include_closed=true` (counts cover closed children; `children_loaded` is `true` when all of a node's children are in the response). Only the first 5000 in pre-order are sent |
+| `events` | Every event whose node is in `nodes`, oldest first (by `id`), at most the first 20000. Each: `{"id", "node", "at", "agent", "type", "detail", "from_parent", "to_parent", "from_status", "to_status"}`. `node` is the node id; `at`, `agent`, `type`, `detail` are raw as in `/api/nodes/{id}` |
+
+The last four event fields are read out of `detail` and are `null` unless: `moved` with `SPOKE-a -> SPOKE-b` gives `from_parent` and `to_parent` (a plain reorder, `reordered under SPOKE-x`, gives none); `status` with `x -> y` gives `from_status` and `to_status`; `recurred` with `x -> done -> open; ...` gives `from_status` `x` and `to_status` `"open"`. Statuses are one of `open`, `in_progress`, `waiting`, `done`, `dropped`; anything unparseable is `null`, never an error. The ETag tag string is `h.<root>`. The cost grows with the subtree (a few queries, not one per node).
+
+```sh
+curl -s 'http://127.0.0.1:8787/api/history?root=SPOKE-5'
+```
+
+```json
+{"rev":296,"version":"0.4.0","time_zone":"UTC","today":"2026-11-23","root":5,
+ "path":[{"id":1,"title":"To do"}],"node_limit":5000,"event_limit":20000,"truncated":false,
+ "nodes":[{"id":5,"parent":1,"kind":"area","title":"Work","...":"..."}],
+ "events":[{"id":167,"node":108,"at":"2026-11-16T05:53:53Z","agent":null,"type":"moved",
+            "detail":"SPOKE-14 -> SPOKE-13","from_parent":14,"to_parent":13,
+            "from_status":null,"to_status":null}]}
+```
+
 ### Size and speed
 
 Measured on the dev PC with the release build and a seeded tree of 20,411 nodes (10 areas, 400 projects, 20,000 tasks): `GET /api/tree` (depth 3 from the root, capped at 1,961 nodes, `truncated: true`) answers in about 30 ms; a branch (`root=<project>&depth=1`) in about 4 ms; a `304` in under 1 ms. A slice reads the skeleton of the root's whole subtree (id, parent, status) to get exact counts, so its cost grows with the subtree, not with the response.
@@ -309,7 +342,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence), the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths) M2 (search normalization, typos, short keywords, ranking, scope and include_done over a tree with decoys; level inheritance; focus placement and errors; due ordering and every `next` section; `SPOKES_TZ`) M3 (two clients reading `next` and claiming different tasks; claim refusals and lease renewal by every write tool; 24 concurrent claims over HTTP with exactly one winner; ask, NEEDS YOU, answer, takeover of an expired lease, `get` history; the M2 retro regression where a project and its due sub-project both pointed at the same step) and M4 (recurrence in both `from` modes with month clamping, the day-of-month anchor, late completions, the defer window, repeating checklists and the refusals; `defer_until` everywhere; STALE ordering, cap and how deferring, dropping and activity stop it; the orchestrator/worker claim pattern, including the next-step hint a worker gets inside the orchestrator's claimed ordered project; history times in `SPOKES_TZ`). `tests/api_http.rs` drives `/api` the same way: slices by root and depth (pre-order, stored order after a `move`, every count, `path`), closed nodes hidden and shown, every node field (inherited level, focus rank, deferral, `is_step`/`is_next`, claims, questions, answers, repeats, notes, progress), the 2000-node cap (no node ever sends part of its children; a root with 2500 children), node detail with notes and the last 10 events, ETag/304 in every `If-None-Match` form (a write, a direct database change and a lease running out each change the tag), Origin and Host rules, 405/404, every bad parameter, that reading never changes a row, and a timed depth-3 slice of a 20,410-node tree seeded by SQL (about 160 ms in the debug test build). `tests/backup.rs` runs the server with a 1-second backup interval and `keep: 2`, checks rotation, wipes the database, restores the newest backup and reads the data back over MCP. Unit tests cover the recurrence date arithmetic (`src/recur.rs`) and backup rotation and restore validation (`src/backup.rs`). Lease expiry and question age are tested by moving timestamps into the past through a second connection to the database file. `src/store/claims.rs` also races 8 separate SQLite connections (as separate processes would) on one claim.
+`tests/mcp_http.rs` starts the real server on a random port with a temp database and drives `/mcp` over HTTP: the M0 skeleton (initialize, tools/list, tools/call, the 2026-07-28 stateless form, Origin refusal, restart persistence), the M1 tree (a six-step plan written and walked in three calls, depth, notes, update, move, error paths) M2 (search normalization, typos, short keywords, ranking, scope and include_done over a tree with decoys; level inheritance; focus placement and errors; due ordering and every `next` section; `SPOKES_TZ`) M3 (two clients reading `next` and claiming different tasks; claim refusals and lease renewal by every write tool; 24 concurrent claims over HTTP with exactly one winner; ask, NEEDS YOU, answer, takeover of an expired lease, `get` history; the M2 retro regression where a project and its due sub-project both pointed at the same step) and M4 (recurrence in both `from` modes with month clamping, the day-of-month anchor, late completions, the defer window, repeating checklists and the refusals; `defer_until` everywhere; STALE ordering, cap and how deferring, dropping and activity stop it; the orchestrator/worker claim pattern, including the next-step hint a worker gets inside the orchestrator's claimed ordered project; history times in `SPOKES_TZ`). `tests/api_http.rs` drives `/api` the same way: slices by root and depth (pre-order, stored order after a `move`, every count, `path`), closed nodes hidden and shown, every node field (inherited level, focus rank, deferral, `is_step`/`is_next`, claims, questions, answers, repeats, notes, progress), the 2000-node cap (no node ever sends part of its children; a root with 2500 children), node detail with notes and the last 10 events, ETag/304 in every `If-None-Match` form (a write, a direct database change and a lease running out each change the tag), Origin and Host rules, 405/404, every bad parameter, that reading never changes a row, `/api/history` (moves, closed nodes, recurrence, reorders, scoping, the 5000-node cap, tag and 304, every bad parameter), and a timed depth-3 slice of a 20,410-node tree seeded by SQL (about 160 ms in the debug test build). `tests/backup.rs` runs the server with a 1-second backup interval and `keep: 2`, checks rotation, wipes the database, restores the newest backup and reads the data back over MCP. Unit tests cover the recurrence date arithmetic (`src/recur.rs`) and backup rotation and restore validation (`src/backup.rs`). Lease expiry and question age are tested by moving timestamps into the past through a second connection to the database file. `src/store/claims.rs` also races 8 separate SQLite connections (as separate processes would) on one claim.
 
 ### Layout
 
@@ -322,7 +355,7 @@ cargo test --locked
 | `src/server.rs` | axum router: `/mcp` (rmcp Streamable HTTP, stateless), `/api` and `/health` |
 | `src/api.rs` | The read-only JSON API: routes, parameters, Host/Origin guard, ETag/304, gzip; its own read-only SQLite connection |
 | `src/tools/` | MCP surface: tool definitions, argument schemas, server instructions |
-| `src/store/` | One file per operation (`add`, `get`, `next`, `search`, `focus`, `status`, `update`, `moves`, `claims` for claim/release/ask/answer), `fts.rs` (keeps the search index in step), `view.rs` (the API's tree slices and node detail, as JSON-ready structs), plus shared queries |
+| `src/store/` | One file per operation (`add`, `get`, `next`, `search`, `focus`, `status`, `update`, `moves`, `claims` for claim/release/ask/answer), `fts.rs` (keeps the search index in step), `view.rs` (the API's tree slices, node detail and subtree history, as JSON-ready structs), plus shared queries |
 | `src/text.rs` | Search normalization, keywords and fuzzy matching |
 | `src/db/` | Opening SQLite (WAL), migrations (`PRAGMA user_version` steps), root seed, fractional position keys |
 | `src/model.rs`, `src/format.rs` | Domain types and the one-line-per-node text format |
