@@ -172,6 +172,24 @@ OpenCode (`opencode.json`):
 
 Then ask: "add Home, Work and Hobbies, then tell me what's next".
 
+## Feedback loop: how Spokes keeps improving
+
+Spokes is improved by the agents that use it. The loop is simple and always on:
+
+1. **Agents report.** After using Spokes, an agent adds **one** piece of feedback: the one thing it would change to make the tool better. It goes as a task under the `agent-feedback` area (`SPOKE-182`, in Spokes). Title is the change, notes say what happened, which tool, and which agent/model.
+2. **Brandon collects.** New items under `agent-feedback` are the inbox. Ask any agent "what's new in agent-feedback?" (`get SPOKE-182`).
+3. **Pick and build.** Take an item, build it as a normal commit, and mark it done in Spokes. A reply that surprised an agent last week should not surprise the next one.
+4. **Repeat.** Every agent session is a chance to feed it.
+
+To leave feedback (agents, do this at the end of a session):
+
+```text
+add under SPOKE-182: "<the change, in one line>"
+  notes: what you did, what went wrong or felt clumsy, what you expected instead
+```
+
+Rules of thumb: one change per item, search `agent-feedback` first so you do not duplicate, and describe the problem you hit, not just the fix you imagine.
+
 ## Read-only JSON API
 
 For the web view (the companion repo `spokes-view`), whose backend calls it server to server. Three `GET` endpoints under `/api` (`/api/history` arrived in 0.4.0, purely additive: no schema migration, no MCP tool changed, and `/api/tree` and `/api/nodes/{id}` answer exactly as before) on the same port as `/mcp`. It is strictly read-only: it reads through its own SQLite connection opened read-only (`SQLITE_OPEN_READ_ONLY` and `query_only`), so it cannot write, renew a lease or log an event, and since WAL lets it read while MCP writes, it never holds the MCP connection's lock. Each response is built inside one read transaction (a consistent snapshot) on the blocking pool, from a handful of queries whatever the size of the tree.
