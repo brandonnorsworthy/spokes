@@ -63,8 +63,11 @@ pub struct SliceQuery {
     pub root: NodeId,
     /// Levels below the root (0 = the root alone).
     pub depth: i64,
-    /// Show done/dropped nodes and what lies under them.
+    /// Show done nodes and what lies under them (and dropped ones too, unless
+    /// `include_dropped` says otherwise: the API makes the two agree when it is omitted).
     pub include_closed: bool,
+    /// Show dropped nodes and what lies under them.
+    pub include_dropped: bool,
 }
 
 /// One ancestor in a breadcrumb.
@@ -113,6 +116,8 @@ pub struct ViewNode {
     pub child_count: usize,
     pub descendant_count: usize,
     pub closed_child_count: usize,
+    /// Direct children that are dropped (shown or not).
+    pub dropped_child_count: usize,
     pub children_loaded: bool,
 }
 
@@ -204,11 +209,15 @@ pub fn slice(conn: &Connection, q: SliceQuery, today: NaiveDate, now: &str) -> V
     let Some(root) = load(conn, q.root)? else {
         return Err(ViewError::NotFound(format!("{} does not exist", q.root)));
     };
-    let shown = |s: Status| q.include_closed || !s.is_closed();
+    let shown = |s: Status| match s {
+        Status::Done => q.include_closed,
+        Status::Dropped => q.include_dropped,
+        _ => true,
+    };
 
-    // Every node beneath the root, by parent in sibling order. Without include_closed
-    // the walk does not go below a closed node, which still appears (as a leaf) so its
-    // parent can count it.
+    // Every node beneath the root, by parent in sibling order. The walk does not go
+    // below a node that is not shown (a done one without include_closed, a dropped one
+    // without include_dropped), which still appears (as a leaf) so its parent can count it.
     let mut kids: HashMap<i64, Vec<Sk>> = HashMap::new();
     {
         let mut stmt = conn.prepare_cached(
@@ -216,14 +225,20 @@ pub fn slice(conn: &Connection, q: SliceQuery, today: NaiveDate, now: &str) -> V
                SELECT id FROM nodes WHERE parent_id = ?1 AND user_id = ?2
                UNION ALL
                SELECT c.id FROM sub
-               JOIN nodes p ON p.id = sub.id AND (?3 OR p.status NOT IN ('done', 'dropped'))
+               JOIN nodes p ON p.id = sub.id
+                 AND (?3 OR p.status != 'done') AND (?4 OR p.status != 'dropped')
                JOIN nodes c ON c.parent_id = sub.id
              )
              SELECT n.id, n.parent_id, n.status, n.defer_until
              FROM sub JOIN nodes n ON n.id = sub.id
              ORDER BY n.parent_id, n.position",
         )?;
-        let mut rows = stmt.query(params![q.root.0, DEFAULT_USER, q.include_closed])?;
+        let mut rows = stmt.query(params![
+            q.root.0,
+            DEFAULT_USER,
+            q.include_closed,
+            q.include_dropped
+        ])?;
         while let Some(r) = rows.next()? {
             let status: String = r.get(2)?;
             let status = status.parse().map_err(|_| {
@@ -365,6 +380,7 @@ pub fn slice(conn: &Connection, q: SliceQuery, today: NaiveDate, now: &str) -> V
                 child_count,
                 descendant_count: descendants.get(id).copied().unwrap_or(0),
                 closed_child_count: all.iter().filter(|k| k.status.is_closed()).count(),
+                dropped_child_count: all.iter().filter(|k| k.status == Status::Dropped).count(),
                 children_loaded: take.get(id).copied().unwrap_or(0) == child_count,
             },
             today,
@@ -383,6 +399,7 @@ pub fn detail(
     conn: &Connection,
     id: NodeId,
     include_closed: bool,
+    include_dropped: bool,
     today: NaiveDate,
     now: &str,
 ) -> ViewResult<Detail> {
@@ -390,6 +407,7 @@ pub fn detail(
         root: id,
         depth: 0,
         include_closed,
+        include_dropped,
     };
     let Slice { path, nodes, .. } = slice(conn, q, today, now)?;
     let Some(node) = nodes.into_iter().next() else {
@@ -627,6 +645,7 @@ pub fn history(
                 child_count: all.len(),
                 descendant_count: descendants.get(id).copied().unwrap_or(0),
                 closed_child_count: all.iter().filter(|k| k.status.is_closed()).count(),
+                dropped_child_count: all.iter().filter(|k| k.status == Status::Dropped).count(),
                 children_loaded: all.iter().all(|k| included.contains(&k.id)),
             },
             today,
@@ -690,6 +709,7 @@ struct ViewCounts {
     child_count: usize,
     descendant_count: usize,
     closed_child_count: usize,
+    dropped_child_count: usize,
     children_loaded: bool,
 }
 
@@ -734,6 +754,7 @@ fn view_node(n: Node, c: ViewCounts, today: NaiveDate, now: &str) -> ViewNode {
         child_count: c.child_count,
         descendant_count: c.descendant_count,
         closed_child_count: c.closed_child_count,
+        dropped_child_count: c.dropped_child_count,
         children_loaded: c.children_loaded,
     }
 }

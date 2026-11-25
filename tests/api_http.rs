@@ -458,6 +458,36 @@ async fn closed_nodes_are_hidden_unless_asked_for() {
     assert_eq!(count(&v, fin, "closed_child_count"), 2);
     assert_eq!(node(&v, fin)["status"], "done");
     assert_eq!(node(&v, drop)["status"], "dropped");
+    // Done shown, dropped hidden (the viewer's default): the dropped node and anything
+    // under it is left out and counted; done nodes keep their subtrees.
+    let v = m
+        .j(&format!(
+            "/api/tree?root={ar}&depth=5&include_closed=true&include_dropped=false"
+        ))
+        .await;
+    assert_eq!(v["include_closed"], true);
+    assert_eq!(v["include_dropped"], false);
+    assert_eq!(ids(&v), vec![ar, keep, keepkid, fin, finkid, finkid2]);
+    assert_eq!(count(&v, ar, "child_count"), 2);
+    assert_eq!(count(&v, ar, "descendant_count"), 5);
+    assert_eq!(count(&v, ar, "closed_child_count"), 2);
+    assert_eq!(count(&v, ar, "dropped_child_count"), 1);
+    assert_eq!(count(&v, fin, "dropped_child_count"), 0);
+    // Dropped shown, done hidden.
+    let v = m
+        .j(&format!(
+            "/api/tree?root={ar}&depth=5&include_closed=false&include_dropped=true"
+        ))
+        .await;
+    assert_eq!(ids(&v), vec![ar, keep, keepkid, drop]);
+    // Omitting include_dropped follows include_closed.
+    let v = m
+        .j(&format!("/api/tree?root={ar}&depth=5&include_closed=true"))
+        .await;
+    assert_eq!(v["include_dropped"], true);
+    let v = m.j(&format!("/api/tree?root={ar}&depth=5")).await;
+    assert_eq!(v["include_dropped"], false);
+    assert_eq!(count(&v, ar, "dropped_child_count"), 1);
     for flag in ["1", "true"] {
         let v = m
             .j(&format!(
@@ -929,6 +959,32 @@ async fn etag_and_not_modified() {
     assert_eq!(r.status, StatusCode::OK);
     let node_tag = m.get(&format!("/api/nodes/{alpha}"), &[]).await.etag();
     assert_ne!(node_tag, tag);
+    // include_dropped changes the tag on its own, for tree, node and search.
+    let shown = m
+        .get("/api/tree?include_closed=true&include_dropped=false", &[])
+        .await;
+    let all = m.get("/api/tree?include_closed=true", &[]).await;
+    assert_ne!(shown.etag(), all.etag());
+    let r = m
+        .get(
+            "/api/tree?include_closed=true&include_dropped=false",
+            &[("if-none-match", &all.etag())],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let a = m
+        .get(&format!("/api/nodes/{alpha}?include_closed=true"), &[])
+        .await;
+    let b = m
+        .get(
+            &format!("/api/nodes/{alpha}?include_closed=true&include_dropped=false"),
+            &[],
+        )
+        .await;
+    assert_ne!(a.etag(), b.etag());
+    let a = m.get("/api/search?q=alpha", &[]).await;
+    let b = m.get("/api/search?q=alpha&include_dropped=true", &[]).await;
+    assert_ne!(a.etag(), b.etag());
 
     // Any write changes the tag and the rev.
     m.add(None, json!({"title": "Beta"})).await;
@@ -1039,6 +1095,8 @@ async fn origin_host_method_and_param_rules() {
         "depth=x",
         "depth=",
         "include_closed=maybe",
+        "include_dropped=maybe",
+        "include_dropped=true&include_dropped=false",
         "foo=1",
         "depth=1&depth=2",
         "root=abc",
@@ -1054,6 +1112,7 @@ async fn origin_host_method_and_param_rules() {
         "depth=0",
         "root=SPOKE-1",
         "root=1&depth=2&include_closed=1",
+        "root=1&depth=2&include_closed=1&include_dropped=0",
     ] {
         let r = m.get(&format!("/api/tree?{q}"), &[]).await;
         assert_eq!(r.status, StatusCode::OK, "?{q}");
@@ -1545,6 +1604,24 @@ async fn search_finds_by_typo_alias_and_notes_with_paths() {
     // Closed nodes on request; limit and total; scope.
     let v = m
         .get("/api/search?q=search&include_closed=true", &[])
+        .await
+        .json();
+    assert!(ids_of_results(&v).contains(&old));
+    assert_eq!(v["hidden_closed"], 0);
+    // Done shown, dropped hidden: the dropped node stays hidden and counted.
+    let v = m
+        .get(
+            "/api/search?q=search&include_closed=true&include_dropped=false",
+            &[],
+        )
+        .await
+        .json();
+    assert!(!ids_of_results(&v).contains(&old));
+    assert_eq!(v["hidden_closed"], 1);
+    assert_eq!(v["include_dropped"], false);
+    // Dropped only.
+    let v = m
+        .get("/api/search?q=search&include_dropped=true", &[])
         .await
         .json();
     assert!(ids_of_results(&v).contains(&old));

@@ -210,7 +210,8 @@ A slice of the tree, for lazy loading: load a few levels, then fetch a branch wh
 | --- | --- | --- |
 | `root` | `1` | The node to start from: `SPOKE-12` or `12` |
 | `depth` | `3` | Levels below `root` to return, `0` (the root alone) to `10` |
-| `include_closed` | `false` | `true` also returns done and dropped nodes and everything under them. When `false` they and their whole subtrees are left out. The `root` itself is always returned, even when it is closed |
+| `include_closed` | `false` | `true` also returns done nodes and everything under them, and dropped ones too unless `include_dropped` says otherwise. When `false` done nodes and their whole subtrees are left out. The `root` itself is always returned, even when it is closed |
+| `include_dropped` | follows `include_closed` | `true` or `false`, on its own: `include_closed=true&include_dropped=false` shows done nodes but leaves out dropped ones and their subtrees (spokes-view sends both, one per checkbox). `include_closed=false&include_dropped=true` shows only the dropped ones. Since 0.6.0 |
 
 The response holds at most **2000 nodes** (`node_limit`). Nodes are expanded breadth-first, so the shallow levels fill first, and a node's children are sent all together or not at all. At the first node whose children do not fit, expansion stops and `truncated` is `true`; that node and every node not expanded have `children_loaded: false`, so fetch them with `root=<id>`. The one exception: when the root alone has more visible children than fit, its first 1999 are sent (in order) with `children_loaded: false` on the root; this version has no paging past that.
 
@@ -222,7 +223,7 @@ Top-level fields:
 | `version` | The server version (`Cargo.toml`) |
 | `time_zone` | `SPOKES_TZ`, e.g. `America/Chicago` |
 | `today` | Today in that zone, `YYYY-MM-DD` (what `deferred` and overdue are judged against) |
-| `root`, `depth`, `include_closed` | The query as applied |
+| `root`, `depth`, `include_closed`, `include_dropped` | The query as applied |
 | `node_limit` | The cap, `2000` |
 | `path` | The root's ancestors, top first, each `{"id", "title"}`, starting with `{"id": 1, "title": "To do"}`. Empty for the root node |
 | `truncated` | `true` when the cap stopped expansion |
@@ -254,9 +255,10 @@ Each node (every field is always present; `null` when unset):
 | `is_next` | bool | It is the actionable step of its ordered parent (`<- next` in `get`): the first unfinished child, if that one is open and not deferred |
 | `progress` | `{"done", "total"}` or null | For a task with children: done / not-dropped direct children (`(2/6)`) |
 | `created_at`, `updated_at`, `touched_at` | string | RFC 3339 UTC. `touched_at` bubbles up from anything beneath |
-| `child_count` | number | Direct children visible under this query (closed ones count only with `include_closed=true`) |
+| `child_count` | number | Direct children visible under this query (done ones count only with `include_closed=true`, dropped ones only with `include_dropped`, which follows `include_closed` when omitted) |
 | `descendant_count` | number | All visible nodes beneath it, at any depth |
 | `closed_child_count` | number | Direct children that are done or dropped, whether or not they are shown |
+| `dropped_child_count` | number | Direct children that are dropped, whether or not they are shown (0.6.0) |
 | `children_loaded` | bool | All of its visible children are in this response (`true` for a node with none). `false` means fetch `root=<id>` to see them |
 
 Example (trimmed):
@@ -286,7 +288,7 @@ curl -s 'http://127.0.0.1:8787/api/tree?depth=2'
 
 ### `GET /api/nodes/{id}`
 
-One node in full: `{id}` is `SPOKE-12` or `12`. Optional `include_closed` (default `false`) decides how its counts treat closed children, as above.
+One node in full: `{id}` is `SPOKE-12` or `12`. Optional `include_closed` (default `false`) and `include_dropped` (default: follows `include_closed`) decide how its counts treat closed children, as above.
 
 | Field | Meaning |
 | --- | --- |
@@ -348,7 +350,8 @@ The `search` tool's ranked matches as data, so a viewer can find a node by a hal
 | --- | --- | --- |
 | `q` | (required) | The keywords, as alternatives (`fuzy serch`). Trimmed; 1 to 200 characters and at least one word, else `400` |
 | `limit` | `10` | Results to send, `1` to `50` |
-| `include_closed` | `false` | Also match done/dropped nodes and what lies under them |
+| `include_closed` | `false` | Also match done nodes and what lies under them (and dropped ones, unless `include_dropped` says otherwise) |
+| `include_dropped` | follows `include_closed` | Also match dropped nodes and what lies under them. Since 0.6.0 |
 | `scope` | `1` | Only nodes under this one (`SPOKE-12` or `12`; the node itself is not a match). Unknown is `404` |
 
 Any other parameter, or one given twice, is `400`.
@@ -356,13 +359,13 @@ Any other parameter, or one given twice, is `400`.
 | Field | Meaning |
 | --- | --- |
 | `rev`, `version`, `time_zone`, `today` | As in `/api/tree` |
-| `query`, `scope`, `include_closed` | What was asked (`query` trimmed) |
+| `query`, `scope`, `include_closed`, `include_dropped` | What was asked (`query` trimmed) |
 | `keywords` | The words searched for after normalization (filler words dropped, at most 12) |
 | `total` | Matches found, before `limit` |
-| `hidden_closed` | Matches hidden because they are closed or under a closed node (0 with `include_closed`) |
+| `hidden_closed` | Matches hidden because they are closed or under a closed node (0 when both are shown) |
 | `results` | Best first, each `{"id", "title", "kind", "status", "effective_priority", "focus", "path", "via"}`. `path` is the ancestors from the root down (`{"id", "title"}`, the root included, the node itself not), so a viewer can load the branches down to it. `via` says why a node matched when its title did not (`alias "nas"`, `in notes`), else `null` |
 
-The ETag tag string is `s.<hash of q>.<limit>.<include_closed>.<scope>`. Nothing found is a `200` with empty `results`.
+The ETag tag string is `s.<hash of q>.<limit>.<include_closed><include_dropped>.<scope>`. Nothing found is a `200` with empty `results`.
 
 ```sh
 curl -s 'http://127.0.0.1:8787/api/search?q=fuzy%20serch&limit=1'
