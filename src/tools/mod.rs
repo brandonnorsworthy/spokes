@@ -30,6 +30,7 @@ An ordered parent's children are steps: only the first unfinished one is actiona
 - Search before adding, so you don't create duplicates and the node lands under the right parent.
 - Write a whole plan in one add with nested children. Give every new node 2 to 5 aliases (synonyms, plain spelling, what you'd call it out loud). Long detail goes in notes, not the title.
 - Priority: level 1-4 (inherits downward) for \"this matters\"; focus for the short ranked top list.
+- When the user's own words started a node, pass them exactly as typed in source (never a summary). It is kept apart from notes and only grows (source_append). +source means it exists; get notes: true shows it.
 - +notes means a body exists; read it with get notes: true. Record progress with update notes_append.
 - Before working on a task, claim it so other agents skip it; finish with set_status done, or release it with a note. Pass the same agent label (e.g. opus-red) on every call this session; it renews your claim. Don't mention it to the user.
 - Orchestrating: claim the project, write the plan as children, hand step ids to workers; each worker claims its own step with its own agent label.
@@ -126,7 +127,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Change a node's fields (title, kind, ordered, priority, due, defer_until, aliases), replace its notes, or append to them with notes_append."
+        description = "Change a node's fields (title, kind, ordered, priority, due, defer_until, aliases), replace its notes, append to them with notes_append, or append the user's words with source_append (the source itself is never replaced)."
     )]
     async fn update(&self, Parameters(args): Parameters<UpdateArgs>) -> ToolResult {
         self.run(move |c| store::update(c, args)).await

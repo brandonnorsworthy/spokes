@@ -313,6 +313,9 @@ fn result_line(
     if node.has_notes {
         flags.push("+notes".to_string());
     }
+    if node.has_source {
+        flags.push("+source".to_string());
+    }
     if is_unplanned(node) {
         flags.push("unplanned".to_string());
     }

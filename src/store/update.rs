@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::add::{
     AREA_RECUR, MAX_NOTES, clean_aliases, clean_date, clean_notes, clean_priority,
-    clean_recur_change, clean_title, recur_step_error,
+    clean_recur_change, clean_source, clean_title, recur_step_error,
 };
 use super::{ToolResult, children, clean_agent, db_err, log_event, renew_leases, require, touch};
 use crate::db::now;
@@ -19,6 +19,17 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
         return Err(
             "pass notes (replace the body) or notes_append (add to it), not both.".to_string(),
         );
+    }
+
+    if args.source.is_some() {
+        return Err(
+            "source can't be replaced or cleared: it is the user's original words. Use source_append to add a later message."
+                .to_string(),
+        );
+    }
+    let source_append = clean_source(args.source_append.as_deref())?;
+    if args.source_append.is_some() && source_append.is_none() {
+        return Err("source_append is empty. Pass the user's words to add.".to_string());
     }
 
     // Column assignments, validated before anything is written.
@@ -86,9 +97,9 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     if args.notes_append.is_some() && append.is_none() {
         return Err("notes_append is empty. Pass the text to add.".to_string());
     }
-    if sets.is_empty() && replace_notes.is_none() && append.is_none() {
+    if sets.is_empty() && replace_notes.is_none() && append.is_none() && source_append.is_none() {
         return Err(
-            "nothing to update. Pass at least one field (title, kind, ordered, priority, due, defer_until, aliases, recur, notes, notes_append). To change status use set_status; to reparent use move."
+            "nothing to update. Pass at least one field (title, kind, ordered, priority, due, defer_until, aliases, recur, notes, notes_append, source_append). To change status use set_status; to reparent use move."
                 .to_string(),
         );
     }
@@ -165,6 +176,30 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
             changed.push("notes appended");
         }
         (None, None) => {}
+    }
+    if let Some(text) = source_append {
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT source FROM nodes WHERE id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        let body = match old {
+            Some(old) => format!("{old}\n\n{text}"),
+            None => text,
+        };
+        if body.len() > MAX_NOTES {
+            return Err(format!(
+                "source would grow past {MAX_NOTES} bytes. It can't be shortened; add the rest to notes."
+            ));
+        }
+        tx.execute(
+            "UPDATE nodes SET source = ?1 WHERE id = ?2",
+            params![body, id.0],
+        )
+        .map_err(db_err)?;
+        changed.push("source appended");
     }
     tx.execute(
         "UPDATE nodes SET updated_at = ?1 WHERE id = ?2",

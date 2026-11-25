@@ -17,9 +17,14 @@ async fn main() -> ExitCode {
         Some("healthcheck") => return healthcheck(),
         Some("backup") if args.len() == 2 => return cli_backup(&args[1]),
         Some("restore") if args.len() == 2 => return cli_restore(&args[1]),
+        Some("migrate-source") if args.len() <= 2 && args.get(1).is_none_or(|a| a == "--apply") => {
+            return cli_migrate_source(args.len() == 2);
+        }
         None => {}
         Some(_) => {
-            eprintln!("usage: spokes [healthcheck | backup <dir-or-file> | restore <backup-file>]");
+            eprintln!(
+                "usage: spokes [healthcheck | backup <dir-or-file> | restore <backup-file> | migrate-source [--apply]]"
+            );
             return ExitCode::from(2);
         }
     }
@@ -120,6 +125,24 @@ fn cli_backup(target: &str) -> ExitCode {
         };
         let bytes = spokes::backup::write_backup(&config.db_path, &dest)?;
         println!("{} ({bytes} bytes)", dest.display());
+        Ok(())
+    };
+    finish(run())
+}
+
+fn cli_migrate_source(apply: bool) -> ExitCode {
+    let run = || -> anyhow::Result<()> {
+        let config = Config::from_env()?;
+        let dir = config
+            .backup
+            .as_ref()
+            .map(|b| b.dir.clone())
+            .or_else(|| config.db_path.parent().map(|p| p.join("backups")))
+            .unwrap_or_else(|| "backups".into());
+        print!(
+            "{}",
+            spokes::migrate_source::run(&config.db_path, &dir, apply)?
+        );
         Ok(())
     };
     finish(run())

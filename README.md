@@ -39,7 +39,8 @@ All thirteen tools: `next`, `get`, `search`, `recent`, `add`, `update`, `set_sta
 - `add`: one node, or a whole plan in one call with nested `children` (any depth up to 8, at most 200 nodes, one transaction). Returns one line with every new id, e.g. `Added SPOKE-5 task  Deploy  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11`. A bad child names itself (`children[3] ("Push"): ...`) and nothing is written.
 - `get`: the node's header line, its breadcrumb (`Hobbies / Programming / Skyforge`), who holds it (`claimed by opus-red until 14:20`, `stalled: claim by ... expired ...`, `waiting on the user: "..." (asked by sonnet-2)`, `answered 14:02, ready to claim`) and an outline `depth` levels deep (default 1, max 10), indented per level. Ordered children are numbered and the actionable step is marked `<- next`; unordered children are bulleted. The outline is capped at 60 lines and ends with `(+N more ...)` lines for what was cut by the cap or lies below the depth, plus a count of hidden dropped nodes. A child whose due date is later than a parent's shows `(after parent's Nov 20)`. `notes: true` appends the body; `history: true` appends the node's last 10 events, newest first (`14:02  claimed by opus-red: until ...`).
 - Levels: `priority` 1 to 4 on any node; unset nodes inherit the nearest ancestor's level. `get` shows a node's own level; `next` and `search` show the effective one.
-- `update`: title, kind, ordered, priority (`0` clears), due / defer_until (`""` clears), aliases (`[]` clears), recur (`""` stops it), `notes` (replace; `""` clears) or `notes_append` (adds a paragraph). Kind changes keep the rule that areas only live under areas and never finish.
+- `source` (0.7.0): the user's own words that led to a node, exactly as typed. Pass it on `add` (any node of a nested plan) whenever a person's message started the node. It is stored apart from notes, set once, and can only grow: `update` takes `source_append` (a later message, added after a blank line) and refuses any attempt to replace or clear `source`. `get` with `notes: true` prints it as a `SOURCE (the user's words)` block above `NOTES`; listings and `search` show `+source`; the text is searchable like notes; `/api` carries `has_source` and `node.source`. Up to 100,000 bytes. Why: if a model summarises an idea wrongly, you can start again from what was typed.
+- `update`: title, kind, ordered, priority (`0` clears), due / defer_until (`""` clears), aliases (`[]` clears), recur (`""` stops it), `notes` (replace; `""` clears) or `notes_append` (adds a paragraph), `source_append` (adds the user's words to `source`). Kind changes keep the rule that areas only live under areas and never finish.
 - `move`: reparent (`parent`) and/or reorder (`before` / `after` a sibling; without either it goes last). Writes one row via fractional positions. Refuses moving the root, cycles, areas under tasks and closed parents.
 - `next`: the queue, in sections, one line per work item, each node and each actionable step at most once:
   `NEEDS YOU` (questions with agent and age, then stalled claims whose lease ran out, then answered tasks waiting for an agent), `FOCUS` (the ranked list, numbered by global rank), `DUE SOON` (overdue first, then due within 7 days), `UP NEXT` (priority level 1 to 4, then unset, oldest first) and `STALE` (up to 3 work items untouched for 30+ days, a nudge outside `limit`). Work items are top-level tasks (directly under areas), deeper tasks that carry their own level or due date, and anything on the focus list; later steps of an ordered parent are held back. A due or up-next line whose `next:` step (or, for a leaf, the node itself) is already shown higher up is dropped, so a project and its due sub-project never both point at the same step; focus entries are always kept. A project whose open steps are all claimed or waiting is not offered. Lines show the effective level (own, or inherited from the nearest ancestor), `due Nov 20` / `due today` / `overdue Nov 10`, progress and `next: SPOKE-7 ...` (the next actionable step). Columns are aligned as in the spec sample. `scope` limits it to a subtree; `limit` (default 5) caps the first four sections, ending with `(+N more open. Pass scope or limit.)`. Warns when the focus list passes 10 entries.
@@ -137,6 +138,17 @@ docker run --rm -v spokes-data:/data spokes:dev restore /data/backups/spokes-202
 
 To undo a restore, stop the server and move the `before-restore` file(s) back.
 
+### Copying old source blocks into `source` (`migrate-source`)
+
+Before 0.7.0, agents kept the user's words in a `## Source (verbatim, DATE)` block at the top of notes. `spokes migrate-source` copies those blocks into `source`. It only adds: notes are never edited (see `docs/invariants.md`), so the words then appear in both places. A node whose `source` is already set is skipped, so it is safe to run twice.
+
+```sh
+docker exec spokes /usr/local/bin/spokes migrate-source           # dry run: lists the nodes, writes nothing
+docker exec spokes /usr/local/bin/spokes migrate-source --apply   # backup, then copy; one `updated` event per node
+```
+
+The words under each `## Source (verbatim` heading are copied, up to the next `## ` heading; the heading line itself is left out, so a migrated source reads like one written natively (the dated block stays in the notes). A note with several blocks gets them joined by a blank line. `--apply` first writes `pre-migrate-source-<time>.db` next to the other backups (the rotation never touches that name).
+
 ## Deployment
 
 The homelab runs the published image from the `spokes/` stack in the Arcane `stacks` repo (`~/dev/stacks/spokes`, `/srv/stacks/spokes` on the server; its README covers start/stop, clients and backups): `ghcr.io/brandonnorsworthy/spokes:<X.Y.Z>` pinned, port `10050` -> `8787`, UID `10010`, `./data` bind mount for the database and backups. The server never builds; it pulls the tag CI published.
@@ -148,7 +160,7 @@ The homelab runs the published image from the `spokes/` stack in the Arcane `sta
 - `.github/workflows/release.yml`: on push to `main` and on `v*` tags, reruns `ci`, then builds and pushes `ghcr.io/brandonnorsworthy/spokes` (`latest` and `sha-<short>` from `main`; `X.Y.Z` and `sha-<short>` from a tag) and scans it with Trivy (HIGH/CRITICAL fail the job).
 - `.github/dependabot.yml`: weekly cargo, GitHub Actions and Docker base image updates. Actions are pinned to commit SHAs.
 
-Release process: the version in `Cargo.toml` (it is what `initialize` reports as `serverInfo.version`) is bumped by the git hooks, not by hand (see Development). Push to `main`, wait for green, then tag that commit `vX.Y.Z` with the version it carries and push the tag. Deploy by bumping the pinned tag in `stacks/spokes/compose.yml`; roll back by pinning the previous tag.
+Release process: the version in `Cargo.toml` (it is what `initialize` reports as `serverInfo.version`) is bumped by the git hooks, not by hand (see Development). Push to `main`, wait for green, then tag that commit `vX.Y.Z` with the version it carries and push the tag. Deploy by bumping the pinned tag in `stacks/spokes/compose.yml`. Rolling back is usually pinning the previous tag, **except across a schema change**: a server refuses a database whose schema is newer than it knows (0.7.0 moved it to version 4), so going back to 0.6.x means `spokes restore` of a backup taken before the upgrade (writes made since are lost).
 
 ## Connecting clients
 
@@ -250,6 +262,7 @@ Each node (every field is always present; `null` when unset):
 | `answered` | bool | The user answered a question and no agent has claimed it since |
 | `repeat` | string or null | The repeat rule in words, e.g. `every 2 weeks, counted from completion` |
 | `has_notes` | bool | A notes body exists (bodies are never in `/api/tree`) |
+| `has_source` | bool | The user's raw words are stored on the node (0.7.0; the words are in `/api/nodes/{id}` only) |
 | `unplanned` | bool | An open task with no children and no notes, as `+unplanned` in the tools |
 | `is_step` | bool | Its parent is an ordered task |
 | `is_next` | bool | It is the actionable step of its ordered parent (`<- next` in `get`): the first unfinished child, if that one is open and not deferred |
@@ -294,7 +307,7 @@ One node in full: `{id}` is `SPOKE-12` or `12`. Optional `include_closed` (defau
 | --- | --- |
 | `rev`, `version`, `time_zone`, `today` | As in `/api/tree` |
 | `path` | Its ancestors, top first, `{"id", "title"}` |
-| `node` | Every node field above, plus `notes`: the notes body, or `null` |
+| `node` | Every node field above, plus `notes`: the notes body, or `null`, and `source` (0.7.0): the user's raw words, or `null` |
 | `events` | Its last 10 events, newest first (what `get history: true` shows), each `{"id", "at", "agent", "type", "detail"}`: `at` is RFC 3339 UTC, `agent` may be `null`, `type` is one of `created`, `updated`, `status`, `moved`, `focus`, `claimed`, `released`, `asked`, `answered`, `recurred`; `detail` is the full text (timestamps in it are UTC) |
 
 ```sh
@@ -417,6 +430,6 @@ cargo test --locked
 | `src/db/` | Opening SQLite (WAL), migrations (`PRAGMA user_version` steps), root seed, fractional position keys |
 | `src/model.rs`, `src/format.rs` | Domain types and the one-line-per-node text format |
 
-Schema changes: append a step to `STEPS` in `src/db/migrations.rs` (SQL, or a Rust function for backfills); never edit a shipped step. Step 2 creates `node_fts` and backfills it; step 3 adds `nodes.answered_at`. The index is written from Rust (`store::fts::reindex`) by `add` and `update`, not by triggers, because the text is normalized in Rust; status and position live only in `nodes`, which search joins.
+Schema changes: append a step to `STEPS` in `src/db/migrations.rs` (SQL, or a Rust function for backfills); never edit a shipped step. Step 2 creates `node_fts` and backfills it; step 3 adds `nodes.answered_at`; step 4 adds `nodes.source` (the index folds it into its notes column, so it needed no new index column). The index is written from Rust (`store::fts::reindex`) by `add` and `update`, not by triggers, because the text is normalized in Rust; status and position live only in `nodes`, which search joins.
 
 The MCP SDK (`rmcp`) is pinned to an exact version; read its changelog before bumping.

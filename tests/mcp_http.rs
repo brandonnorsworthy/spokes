@@ -2461,3 +2461,140 @@ async fn next_step_hint_inside_a_claimed_project_over_http() {
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// SPOKE-181: the user's raw words live apart from notes, are kept as typed, and only grow.
+#[tokio::test]
+async fn source_field_over_http() {
+    let dir = temp_dir("source");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+
+    // Nested add: the parent and a child each carry their own source.
+    let out = m
+        .ok(
+            "add",
+            json!({"title": "Idea", "source": "  can you make a zebra thing?  ", "notes": "my plan",
+                   "children": [{"title": "Step", "source": "and also stripes"}]}),
+        )
+        .await;
+    let idea = first_id(&out);
+    let step = format!("SPOKE-{}", idea[6..].parse::<i64>().unwrap() + 1);
+
+    // Listings only flag it; `get` shows it with notes:true, apart from the notes and untouched.
+    let plain = m.ok("get", json!({"id": idea})).await;
+    assert!(plain.contains("+notes +source"), "{plain}");
+    assert!(!plain.contains("zebra"), "{plain}");
+    let full = m.ok("get", json!({"id": idea, "notes": true})).await;
+    assert!(
+        full.contains("SOURCE (the user's words)\ncan you make a zebra thing?\nNOTES\nmy plan"),
+        "{full}"
+    );
+    let kid = m.ok("get", json!({"id": step, "notes": true})).await;
+    assert!(
+        kid.contains("SOURCE (the user's words)\nand also stripes"),
+        "{kid}"
+    );
+
+    // A node without a source shows no SOURCE block and no flag.
+    let bare = add_node(&m, json!({"title": "Bare"})).await;
+    let bare_full = m.ok("get", json!({"id": bare, "notes": true})).await;
+    assert!(
+        !bare_full.contains("SOURCE") && !bare_full.contains("+source"),
+        "{bare_full}"
+    );
+
+    // Append only: a later message is added after a blank line; the first words stay.
+    let out = m
+        .ok(
+            "update",
+            json!({"id": idea, "source_append": "follow-up: make it blue"}),
+        )
+        .await;
+    assert!(out.contains("source appended"), "{out}");
+    let full = m.ok("get", json!({"id": idea, "notes": true})).await;
+    assert!(
+        full.contains("can you make a zebra thing?\n\nfollow-up: make it blue\nNOTES"),
+        "{full}"
+    );
+    // A node with no source can start one by appending.
+    m.ok("update", json!({"id": bare, "source_append": "late words"}))
+        .await;
+    let bare_full = m.ok("get", json!({"id": bare, "notes": true})).await;
+    assert!(
+        bare_full.contains("SOURCE (the user's words)\nlate words"),
+        "{bare_full}"
+    );
+
+    // Never replaced or cleared, never empty-appended, and notes tools do not touch it.
+    for args in [
+        json!({"id": idea, "source": "rewritten"}),
+        json!({"id": idea, "source": ""}),
+    ] {
+        let e = err(&m, "update", args).await;
+        assert!(e.contains("source_append"), "{e}");
+    }
+    let e = err(&m, "update", json!({"id": idea, "source_append": "   "})).await;
+    assert!(e.contains("empty"), "{e}");
+    m.ok("update", json!({"id": idea, "notes": ""})).await;
+    let full = m.ok("get", json!({"id": idea, "notes": true})).await;
+    assert!(
+        full.contains("zebra") && full.contains("follow-up"),
+        "{full}"
+    );
+
+    // Too long is refused on add and on append, naming the child that failed.
+    let huge = "x".repeat(100_001);
+    let e = err(&m, "add", json!({"title": "Big", "source": huge})).await;
+    assert!(e.contains("source is longer"), "{e}");
+    let e = err(
+        &m,
+        "add",
+        json!({"title": "P", "children": [{"title": "Kid", "source": "x".repeat(100_001)}]}),
+    )
+    .await;
+    assert!(
+        e.contains("children[0]") && e.contains("source is longer"),
+        "{e}"
+    );
+
+    // Search finds a node by a phrase from its source, and shows the +source flag.
+    let found = search(&m, "zebra").await;
+    assert!(line_with(&found, &idea).contains("+source"), "{found}");
+
+    // The read-only API: has_source on tree nodes, the words on node detail.
+    let (_, body) = m.get_path(&format!("/api/nodes/{idea}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["node"]["has_source"], true);
+    assert_eq!(
+        v["node"]["source"],
+        "can you make a zebra thing?\n\nfollow-up: make it blue"
+    );
+    let (_, body) = m.get_path("/api/tree?depth=3").await;
+    let tree: Value = serde_json::from_str(&body).unwrap();
+    let flag = |title: &str| {
+        tree["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["title"] == title)
+            .map(|n| n["has_source"].clone())
+    };
+    assert_eq!(flag("Idea"), Some(json!(true)));
+    assert_eq!(flag("Step"), Some(json!(true)));
+    let (_, body) = m.get_path(&format!("/api/nodes/{bare}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["node"]["source"], "late words");
+
+    // The words survive a restart.
+    server.shutdown().await;
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    let full = m.ok("get", json!({"id": idea, "notes": true})).await;
+    assert!(
+        full.contains("zebra") && full.contains("follow-up"),
+        "{full}"
+    );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
