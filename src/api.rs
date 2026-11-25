@@ -1,11 +1,11 @@
 //! The read-only JSON API under `/api`, for the web view (`spokes-view`), which calls it
 //! server to server:
 //!
-//! - `GET /api/tree?root=&depth=&include_closed=`: a slice of the tree for lazy loading.
+//! - `GET /api/tree?root=&depth=&include_closed=&include_dropped=`: a slice of the tree for lazy loading.
 //! - `GET /api/nodes/{id}`: one node with its notes, breadcrumb and last events.
 //! - `GET /api/history?root=`: a subtree's nodes (closed ones too) and all their events,
 //!   oldest first, for replaying its history.
-//! - `GET /api/search?q=&limit=&include_closed=&scope=`: the `search` tool's ranked
+//! - `GET /api/search?q=&limit=&include_closed=&include_dropped=&scope=`: the `search` tool's ranked
 //!   matches as data, each with its breadcrumb ids, for finding a node in the view.
 //!
 //! It reads through its own read-only SQLite connection (WAL lets it read while MCP
@@ -253,6 +253,17 @@ fn parse_id(value: &str, name: &str) -> Result<NodeId, ApiError> {
     })
 }
 
+/// `include_closed` (done nodes, and dropped ones too when `include_dropped` is absent)
+/// and `include_dropped`.
+fn visibility(p: &std::collections::HashMap<String, String>) -> Result<(bool, bool), ApiError> {
+    let include_closed = parse_bool(p.get("include_closed"), "include_closed")?;
+    let include_dropped = match p.get("include_dropped") {
+        None => include_closed,
+        v => parse_bool(v, "include_dropped")?,
+    };
+    Ok((include_closed, include_dropped))
+}
+
 fn parse_bool(value: Option<&String>, name: &str) -> Result<bool, ApiError> {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         None => Ok(false),
@@ -278,6 +289,7 @@ struct TreeBody {
     root: i64,
     depth: i64,
     include_closed: bool,
+    include_dropped: bool,
     node_limit: usize,
     #[serde(flatten)]
     slice: Slice,
@@ -305,7 +317,10 @@ async fn tree(
     headers: HeaderMap,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<Response, ApiError> {
-    let p = params(query, &["root", "depth", "include_closed"])?;
+    let p = params(
+        query,
+        &["root", "depth", "include_closed", "include_dropped"],
+    )?;
     let root = match p.get("root") {
         None => crate::model::ROOT_ID,
         Some(v) => parse_id(v, "root")?,
@@ -323,13 +338,19 @@ async fn tree(
                 ))
             })?,
     };
-    let include_closed = parse_bool(p.get("include_closed"), "include_closed")?;
+    let (include_closed, include_dropped) = visibility(&p)?;
     let q = SliceQuery {
         root,
         depth,
         include_closed,
+        include_dropped,
     };
-    let tag = format!("t.{}.{depth}.{}", root.0, u8::from(include_closed));
+    let tag = format!(
+        "t.{}.{depth}.{}{}",
+        root.0,
+        u8::from(include_closed),
+        u8::from(include_dropped)
+    );
     Ok(respond(api, headers, tag, move |conn, meta, today, now| {
         let slice = view::slice(conn, q, today, now)?;
         Ok(TreeBody {
@@ -337,6 +358,7 @@ async fn tree(
             root: root.0,
             depth,
             include_closed,
+            include_dropped,
             node_limit: NODE_LIMIT,
             slice,
         })
@@ -350,12 +372,17 @@ async fn node(
     UrlPath(id): UrlPath<String>,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<Response, ApiError> {
-    let p = params(query, &["include_closed"])?;
+    let p = params(query, &["include_closed", "include_dropped"])?;
     let id = parse_id(&id, "id")?;
-    let include_closed = parse_bool(p.get("include_closed"), "include_closed")?;
-    let tag = format!("n.{}.{}", id.0, u8::from(include_closed));
+    let (include_closed, include_dropped) = visibility(&p)?;
+    let tag = format!(
+        "n.{}.{}{}",
+        id.0,
+        u8::from(include_closed),
+        u8::from(include_dropped)
+    );
     Ok(respond(api, headers, tag, move |conn, meta, today, now| {
-        let detail = view::detail(conn, id, include_closed, today, now)?;
+        let detail = view::detail(conn, id, include_closed, include_dropped, today, now)?;
         Ok(NodeBody { meta, detail })
     })
     .await)
@@ -393,6 +420,7 @@ struct SearchBody {
     query: String,
     scope: i64,
     include_closed: bool,
+    include_dropped: bool,
     #[serde(flatten)]
     found: find::ApiSearch,
 }
@@ -402,7 +430,10 @@ async fn search(
     headers: HeaderMap,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<Response, ApiError> {
-    let p = params(query, &["q", "limit", "include_closed", "scope"])?;
+    let p = params(
+        query,
+        &["q", "limit", "include_closed", "include_dropped", "scope"],
+    )?;
     let q = p.get("q").map(|v| v.trim().to_string()).unwrap_or_default();
     if q.chars().count() > MAX_QUERY_CHARS {
         return Err(bad(format!(
@@ -429,7 +460,7 @@ async fn search(
                 ))
             })?,
     };
-    let include_closed = parse_bool(p.get("include_closed"), "include_closed")?;
+    let (include_closed, include_dropped) = visibility(&p)?;
     let scope = match p.get("scope") {
         None => crate::model::ROOT_ID,
         Some(v) => parse_id(v, "scope")?,
@@ -438,21 +469,23 @@ async fn search(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&q, &mut hasher);
     let tag = format!(
-        "s.{:x}.{limit}.{}.{}",
+        "s.{:x}.{limit}.{}{}.{}",
         std::hash::Hasher::finish(&hasher),
         u8::from(include_closed),
+        u8::from(include_dropped),
         scope.0
     );
     Ok(respond(api, headers, tag, move |conn, meta, _today, _now| {
         if load(conn, scope)?.is_none() {
             return Err(ViewError::NotFound(format!("{scope} does not exist")));
         }
-        let found = find::api_search(conn, &q, kws, scope, include_closed, limit)?;
+        let found = find::api_search(conn, &q, kws, scope, include_closed, include_dropped, limit)?;
         Ok(SearchBody {
             meta,
             query: q,
             scope: scope.0,
             include_closed,
+            include_dropped,
             found,
         })
     })

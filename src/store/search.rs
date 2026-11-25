@@ -82,6 +82,7 @@ fn find(
     kws: &[String],
     scope: NodeId,
     include_done: bool,
+    include_dropped: bool,
 ) -> Result<Found, String> {
     let phrase = format!(" {} ", normalize(query));
     let docs = candidates(conn, kws)?;
@@ -113,7 +114,7 @@ fn find(
         if h.id == ROOT_ID || !within(&meta, h.id, scope) {
             return false;
         }
-        if !include_done && closed_here_or_above(&meta, h.id) {
+        if hidden_here_or_above(&meta, h.id, include_done, include_dropped) {
             hidden_closed += 1;
             return false;
         }
@@ -156,7 +157,7 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         hits,
         hidden_closed,
         meta,
-    } = find(conn, &args.query, &kws, scope, include_done)?;
+    } = find(conn, &args.query, &kws, scope, include_done, include_done)?;
 
     let hidden_note = (hidden_closed > 0).then(|| {
         format!(
@@ -238,13 +239,14 @@ pub fn api_search(
     kws: Vec<String>,
     scope: NodeId,
     include_closed: bool,
+    include_dropped: bool,
     limit: usize,
 ) -> Result<ApiSearch, String> {
     let Found {
         hits,
         hidden_closed,
         meta,
-    } = find(conn, query, &kws, scope, include_closed)?;
+    } = find(conn, query, &kws, scope, include_closed, include_dropped)?;
     let focus = focus_numbers(conn)?;
     let mut results = Vec::new();
     for hit in hits.iter().take(limit) {
@@ -516,8 +518,19 @@ fn within(meta: &HashMap<NodeId, Meta>, id: NodeId, scope: NodeId) -> bool {
     scope == ROOT_ID || lineage(meta, id).skip(1).any(|(a, _)| a == scope)
 }
 
-fn closed_here_or_above(meta: &HashMap<NodeId, Meta>, id: NodeId) -> bool {
-    lineage(meta, id).any(|(_, m)| m.status.is_closed())
+/// A done node (unless `include_done`) or a dropped one (unless `include_dropped`) at or
+/// above `id`.
+fn hidden_here_or_above(
+    meta: &HashMap<NodeId, Meta>,
+    id: NodeId,
+    include_done: bool,
+    include_dropped: bool,
+) -> bool {
+    lineage(meta, id).any(|(_, m)| match m.status {
+        Status::Done => !include_done,
+        Status::Dropped => !include_dropped,
+        _ => false,
+    })
 }
 
 /// The node's own level, or the nearest ancestor's.
