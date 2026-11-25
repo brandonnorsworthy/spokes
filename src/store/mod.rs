@@ -34,6 +34,17 @@ use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID};
 /// What a tool call yields: text for the model, or an actionable error message.
 pub type ToolResult = Result<String, String>;
 
+/// Refuses the `stage` argument, so a caller using the old name learns the value was not saved.
+pub(crate) fn refuse_stage(stage: Option<&serde_json::Value>) -> Result<(), String> {
+    match stage {
+        None => Ok(()),
+        Some(_) => Err(
+            "stage was renamed to refinement (idea, brainstormed, understood, planned, ready). Started and finished work is tracked by status. Nothing was changed."
+                .to_string(),
+        ),
+    }
+}
+
 /// Columns for [`Node`], selected from `nodes n`.
 pub(crate) const NODE_COLS: &str = "n.id, n.parent_id, n.position, n.kind, n.ordered, n.title, n.status,
     n.priority, n.due_at, n.defer_until, n.waiting_on, n.claimed_by, n.claim_expires,
@@ -42,7 +53,7 @@ pub(crate) const NODE_COLS: &str = "n.id, n.parent_id, n.position, n.kind, n.ord
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status != 'dropped') AS child_total,
     (SELECT COUNT(*) FROM nodes c WHERE c.parent_id = n.id AND c.status = 'done') AS child_done,
     COALESCE((SELECT p.ordered AND p.kind = 'task' FROM nodes p WHERE p.id = n.parent_id), 0) AS is_step,
-    n.answered_at, n.recur, (n.source IS NOT NULL) AS has_source, n.work_type, n.stage";
+    n.answered_at, n.recur, (n.source IS NOT NULL) AS has_source, n.work_type, n.refinement";
 
 pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
     let text_enum = |idx: usize, value: String| {
@@ -58,7 +69,7 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
         Some(v) => Some(v.parse().map_err(|_| text_enum(24, v))?),
         None => None,
     };
-    let stage = match r.get::<_, Option<String>>(25)? {
+    let refinement = match r.get::<_, Option<String>>(25)? {
         Some(v) => Some(v.parse().map_err(|_| text_enum(25, v))?),
         None => None,
     };
@@ -88,7 +99,7 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
         recur: r.get(22)?,
         has_source: r.get(23)?,
         work_type,
-        stage,
+        refinement,
     })
 }
 

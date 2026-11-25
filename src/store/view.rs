@@ -94,7 +94,7 @@ pub struct ViewNode {
     pub title: String,
     #[serde(rename = "type")]
     pub work_type: Option<&'static str>,
-    pub stage: Option<&'static str>,
+    pub refinement: Option<&'static str>,
     pub status: &'static str,
     pub priority: Option<i64>,
     pub effective_priority: Option<i64>,
@@ -741,7 +741,7 @@ fn view_node(n: Node, c: ViewCounts, today: NaiveDate, now: &str) -> ViewNode {
         kind: n.kind.as_str(),
         ordered: n.ordered,
         work_type: n.work_type.map(|t| t.as_str()),
-        stage: n.stage.map(|s| s.as_str()),
+        refinement: n.refinement.map(|s| s.as_str()),
         status: n.status.as_str(),
         priority: n.priority,
         effective_priority: c.effective,

@@ -141,7 +141,7 @@ fn detail_flags(node: &Node, today: NaiveDate, parent_due: Option<&str>, out: &m
     if let Some(t) = node.work_type {
         out.push(t.as_str().to_string());
     }
-    if let Some(s) = node.stage {
+    if let Some(s) = node.refinement {
         out.push(s.as_str().to_string());
     }
     if let Some(due) = &node.due_at {
@@ -228,7 +228,7 @@ mod tests {
             answered_at: None,
             recur: None,
             work_type: None,
-            stage: None,
+            refinement: None,
             created_at: "2026-11-01T00:00:00Z".into(),
             updated_at: "2026-11-01T00:00:00Z".into(),
             touched_at: "2026-11-01T00:00:00Z".into(),
@@ -253,20 +253,20 @@ mod tests {
     }
 
     #[test]
-    fn type_and_stage_follow_priority() {
+    fn type_and_refinement_follow_priority() {
         let mut n = node();
         n.work_type = Some(crate::model::WorkType::Bug);
-        n.stage = Some(crate::model::Stage::InReview);
+        n.refinement = Some(crate::model::Refinement::Planned);
         assert_eq!(
             header_line(&n, day(), None),
-            "SPOKE-142 task p1 bug in_review due Nov 20 ordered (2/6) +notes  Deploy game to production"
+            "SPOKE-142 task p1 bug planned due Nov 20 ordered (2/6) +notes  Deploy game to production"
         );
     }
 
     #[test]
-    fn no_type_or_stage_adds_no_flags() {
+    fn no_type_or_refinement_adds_no_flags() {
         let line = header_line(&node(), day(), None);
-        assert!(!line.contains("bug") && !line.contains("in_review"));
+        assert!(!line.contains("bug") && !line.contains("planned"));
     }
 
     #[test]

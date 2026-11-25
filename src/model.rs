@@ -179,7 +179,7 @@ impl From<SettableStatus> for Status {
 }
 
 /// Turns free-form input into the stored snake_case form: trims, lowercases and treats
-/// spaces and hyphens as underscores ("In review" -> "in_review").
+/// spaces and hyphens as underscores ("Planned" -> "planned").
 fn normalize_loose(s: &str) -> String {
     s.trim().to_lowercase().replace([' ', '-'], "_")
 }
@@ -192,15 +192,17 @@ pub enum WorkType {
     Chore,
     Idea,
     Epic,
+    Spike,
 }
 
 impl WorkType {
-    pub const ALL: [WorkType; 5] = [
+    pub const ALL: [WorkType; 6] = [
         WorkType::Bug,
         WorkType::Feature,
         WorkType::Chore,
         WorkType::Idea,
         WorkType::Epic,
+        WorkType::Spike,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -210,6 +212,7 @@ impl WorkType {
             WorkType::Chore => "chore",
             WorkType::Idea => "idea",
             WorkType::Epic => "epic",
+            WorkType::Spike => "spike",
         }
     }
 
@@ -239,41 +242,33 @@ impl FromStr for WorkType {
     }
 }
 
-/// Where a piece of work is in its life. Independent of [`Status`].
+/// How ready a piece of work is for an agent to pick up. Independent of [`Status`]
+/// (open, in progress, done...): refinement stops at `ready`; execution is status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
+pub enum Refinement {
     Idea,
-    Backlog,
     Brainstormed,
     Understood,
     Planned,
-    InProgress,
-    InReview,
-    Done,
+    Ready,
 }
 
-impl Stage {
-    pub const ALL: [Stage; 8] = [
-        Stage::Idea,
-        Stage::Backlog,
-        Stage::Brainstormed,
-        Stage::Understood,
-        Stage::Planned,
-        Stage::InProgress,
-        Stage::InReview,
-        Stage::Done,
+impl Refinement {
+    pub const ALL: [Refinement; 5] = [
+        Refinement::Idea,
+        Refinement::Brainstormed,
+        Refinement::Understood,
+        Refinement::Planned,
+        Refinement::Ready,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Stage::Idea => "idea",
-            Stage::Backlog => "backlog",
-            Stage::Brainstormed => "brainstormed",
-            Stage::Understood => "understood",
-            Stage::Planned => "planned",
-            Stage::InProgress => "in_progress",
-            Stage::InReview => "in_review",
-            Stage::Done => "done",
+            Refinement::Idea => "idea",
+            Refinement::Brainstormed => "brainstormed",
+            Refinement::Understood => "understood",
+            Refinement::Planned => "planned",
+            Refinement::Ready => "ready",
         }
     }
 
@@ -285,18 +280,21 @@ impl Stage {
             .find(|t| t.as_str() == wanted)
             .ok_or_else(|| {
                 let valid: Vec<&str> = Self::ALL.iter().map(|t| t.as_str()).collect();
-                format!("unknown stage '{s}'. Use one of: {}.", valid.join(", "))
+                format!(
+                    "unknown refinement '{s}'. Use one of: {}.",
+                    valid.join(", ")
+                )
             })
     }
 }
 
-impl fmt::Display for Stage {
+impl fmt::Display for Refinement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl FromStr for Stage {
+impl FromStr for Refinement {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse_loose(s)
@@ -328,7 +326,7 @@ pub struct Node {
     /// What sort of work it is; own value only, not inherited.
     pub work_type: Option<WorkType>,
     /// Where the work is; own value only, separate from status.
-    pub stage: Option<Stage>,
+    pub refinement: Option<Refinement>,
     pub created_at: String,
     pub updated_at: String,
     /// Last activity on the node or anything beneath it (bubbles up).
@@ -364,21 +362,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_work_type_and_stage_loosely() {
-        assert_eq!(Stage::parse_loose("In review"), Ok(Stage::InReview));
-        assert_eq!(Stage::parse_loose("in-review"), Ok(Stage::InReview));
-        assert_eq!(Stage::parse_loose("IN_REVIEW"), Ok(Stage::InReview));
+    fn parses_work_type_and_refinement_loosely() {
+        assert_eq!(Refinement::parse_loose("Planned"), Ok(Refinement::Planned));
+        assert_eq!(Refinement::parse_loose("planned "), Ok(Refinement::Planned));
+        assert_eq!(Refinement::parse_loose("READY"), Ok(Refinement::Ready));
         assert_eq!(WorkType::parse_loose("Bug"), Ok(WorkType::Bug));
         assert_eq!("feature".parse::<WorkType>(), Ok(WorkType::Feature));
         assert_eq!(
             WorkType::parse_loose("bugg"),
-            Err("unknown type 'bugg'. Use one of: bug, feature, chore, idea, epic.".into())
+            Err("unknown type 'bugg'. Use one of: bug, feature, chore, idea, epic, spike.".into())
         );
         assert_eq!(
-            Stage::parse_loose("reviewing"),
-            Err("unknown stage 'reviewing'. Use one of: idea, backlog, brainstormed, understood, planned, in_progress, in_review, done.".into())
+            Refinement::parse_loose("reviewing"),
+            Err("unknown refinement 'reviewing'. Use one of: idea, brainstormed, understood, planned, ready.".into())
         );
-        assert_eq!(Stage::InProgress.to_string(), "in_progress");
+        assert_eq!(Refinement::Ready.to_string(), "ready");
         assert_eq!(WorkType::Epic.as_str(), "epic");
     }
 

@@ -728,8 +728,8 @@ async fn node_fields_have_the_documented_values() {
 }
 
 #[tokio::test]
-async fn type_and_stage_are_in_node_and_tree() {
-    let dir = temp_dir("type_stage");
+async fn type_and_refinement_are_in_node_and_tree() {
+    let dir = temp_dir("type_refinement");
     let path = dir.join("spokes.db");
     let server = start(&path).await;
     let m = Mcp::new(server.addr);
@@ -747,23 +747,23 @@ async fn type_and_stage_are_in_node_and_tree() {
     );
     db(&path)
         .execute(
-            "UPDATE nodes SET work_type = 'bug', stage = 'in_review' WHERE id = ?1",
+            "UPDATE nodes SET work_type = 'bug', refinement = 'planned' WHERE id = ?1",
             [typed],
         )
         .unwrap();
 
     let v = m.j(&format!("/api/nodes/{}", sid(typed))).await;
     assert_eq!(v["node"]["type"], "bug");
-    assert_eq!(v["node"]["stage"], "in_review");
+    assert_eq!(v["node"]["refinement"], "planned");
     let v = m.j(&format!("/api/nodes/{}", sid(plain))).await;
     assert!(v["node"]["type"].is_null());
-    assert!(v["node"]["stage"].is_null());
+    assert!(v["node"]["refinement"].is_null());
 
     let v = m.j(&format!("/api/tree?root={top}&depth=1")).await;
     assert_eq!(node(&v, typed)["type"], "bug");
-    assert_eq!(node(&v, typed)["stage"], "in_review");
+    assert_eq!(node(&v, typed)["refinement"], "planned");
     assert!(node(&v, plain)["type"].is_null());
-    assert!(node(&v, plain)["stage"].is_null());
+    assert!(node(&v, plain)["refinement"].is_null());
 
     server.shutdown().await;
 }

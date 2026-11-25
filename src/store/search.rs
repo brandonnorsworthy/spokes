@@ -14,9 +14,9 @@ use serde::Serialize;
 
 use super::focus::focus_numbers;
 use super::view::Crumb;
-use super::{ToolResult, db_err, require};
+use super::{ToolResult, db_err, refuse_stage, require};
 use crate::format::{due_flag, is_unplanned, parse_date, progress, short_date};
-use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Stage, Status, WorkType};
+use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Refinement, Status, WorkType};
 use crate::text::{keywords, match_strength, normalize, trigrams};
 use crate::tools::args::SearchArgs;
 
@@ -44,7 +44,7 @@ struct Meta {
     status: Status,
     priority: Option<i64>,
     work_type: Option<WorkType>,
-    stage: Option<Stage>,
+    refinement: Option<Refinement>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -76,16 +76,16 @@ struct Found {
     meta: HashMap<NodeId, Meta>,
 }
 
-/// Type and stage filters: a node's own values must equal every filter given.
+/// Type and refinement filters: a node's own values must equal every filter given.
 #[derive(Clone, Copy, Default)]
 struct Filters {
     work_type: Option<WorkType>,
-    stage: Option<Stage>,
+    refinement: Option<Refinement>,
 }
 
 impl Filters {
     fn is_empty(&self) -> bool {
-        self.work_type.is_none() && self.stage.is_none()
+        self.work_type.is_none() && self.refinement.is_none()
     }
 }
 
@@ -169,35 +169,40 @@ fn keyword_hits(conn: &Connection, query: &str, kws: &[String]) -> Result<Vec<Hi
     Ok(hits)
 }
 
-/// The node's own type and stage must equal every filter given.
+/// The node's own type and refinement must equal every filter given.
 fn matches_filters(meta: &HashMap<NodeId, Meta>, id: NodeId, filters: Filters) -> bool {
     let Some(m) = meta.get(&id) else {
         return false;
     };
     filters.work_type.is_none_or(|t| m.work_type == Some(t))
-        && filters.stage.is_none_or(|s| m.stage == Some(s))
+        && filters.refinement.is_none_or(|s| m.refinement == Some(s))
 }
 
-/// `type bug, stage in_review`.
+/// `type bug, refinement planned`.
 fn filter_label(filters: Filters) -> String {
     let mut parts = Vec::new();
     if let Some(t) = filters.work_type {
         parts.push(format!("type {t}"));
     }
-    if let Some(s) = filters.stage {
-        parts.push(format!("stage {s}"));
+    if let Some(s) = filters.refinement {
+        parts.push(format!("refinement {s}"));
     }
     parts.join(", ")
 }
 
 pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResult {
+    refuse_stage(args.stage.as_ref())?;
     let filters = Filters {
         work_type: args
             .work_type
             .as_deref()
             .map(WorkType::parse_loose)
             .transpose()?,
-        stage: args.stage.as_deref().map(Stage::parse_loose).transpose()?,
+        refinement: args
+            .refinement
+            .as_deref()
+            .map(Refinement::parse_loose)
+            .transpose()?,
     };
     let kws = query_keywords(&args.query);
     if kws.is_empty() && filters.is_empty() {
@@ -382,7 +387,7 @@ fn result_line(
     if let Some(t) = node.work_type {
         flags.push(t.to_string());
     }
-    if let Some(st) = node.stage {
+    if let Some(st) = node.refinement {
         flags.push(st.to_string());
     }
     if let Some(n) = focus.get(&node.id) {
@@ -577,7 +582,7 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
 fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, parent_id, title, status, priority, work_type, stage
+            "SELECT id, parent_id, title, status, priority, work_type, refinement
              FROM nodes WHERE user_id = ?1",
         )
         .map_err(db_err)?;
@@ -593,9 +598,9 @@ fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
                 work_type: r
                     .get::<_, Option<String>>(5)?
                     .and_then(|t| WorkType::parse_loose(&t).ok()),
-                stage: r
+                refinement: r
                     .get::<_, Option<String>>(6)?
-                    .and_then(|t| Stage::parse_loose(&t).ok()),
+                    .and_then(|t| Refinement::parse_loose(&t).ok()),
             },
         ))
     })
@@ -658,14 +663,15 @@ mod tests {
     use crate::store::add::{self, tests::args};
     use crate::store::test_support::temp_db;
 
-    fn search_args(query: &str, work_type: Option<&str>, stage: Option<&str>) -> SearchArgs {
+    fn search_args(query: &str, work_type: Option<&str>, refinement: Option<&str>) -> SearchArgs {
         SearchArgs {
+            stage: None,
             query: query.into(),
             scope: None,
             include_done: None,
             limit: None,
             work_type: work_type.map(String::from),
-            stage: stage.map(String::from),
+            refinement: refinement.map(String::from),
         }
     }
 
@@ -679,12 +685,12 @@ mod tests {
         add::add(&mut conn, args(None, "Crash feature", Kind::Task)).unwrap();
         add::add(&mut conn, args(None, "Plain crash", Kind::Task)).unwrap();
         conn.execute(
-            "UPDATE nodes SET work_type = 'bug', stage = 'in_review' WHERE title = 'Crash bug'",
+            "UPDATE nodes SET work_type = 'bug', refinement = 'ready' WHERE title = 'Crash bug'",
             [],
         )
         .unwrap();
         conn.execute(
-            "UPDATE nodes SET work_type = 'feature', stage = 'idea' WHERE title = 'Crash feature'",
+            "UPDATE nodes SET work_type = 'feature', refinement = 'idea' WHERE title = 'Crash feature'",
             [],
         )
         .unwrap();
@@ -692,10 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_with_stage_lists_only_that_stage() {
-        let (conn, dir) = seeded("search-stage");
-        let out = search(&conn, search_args("", None, Some("In review")), today()).unwrap();
-        assert!(out.starts_with("1 match for stage in_review:"), "{out}");
+    fn empty_query_with_refinement_lists_only_that_refinement() {
+        let (conn, dir) = seeded("search-refinement");
+        let out = search(&conn, search_args("", None, Some("Ready")), today()).unwrap();
+        assert!(out.starts_with("1 match for refinement ready:"), "{out}");
         assert!(out.contains("Crash bug"));
         assert!(!out.contains("Crash feature") && !out.contains("Plain crash"));
         let _ = std::fs::remove_dir_all(dir);
@@ -706,17 +712,12 @@ mod tests {
         let (conn, dir) = seeded("search-and");
         let out = search(&conn, search_args("", Some("bug"), Some("idea")), today()).unwrap();
         assert!(
-            out.starts_with("No matches for type bug, stage idea."),
+            out.starts_with("No matches for type bug, refinement idea."),
             "{out}"
         );
-        let out = search(
-            &conn,
-            search_args("", Some("bug"), Some("in_review")),
-            today(),
-        )
-        .unwrap();
+        let out = search(&conn, search_args("", Some("bug"), Some("ready")), today()).unwrap();
         assert!(
-            out.starts_with("1 match for type bug, stage in_review:"),
+            out.starts_with("1 match for type bug, refinement ready:"),
             "{out}"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -752,11 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn result_lines_show_type_and_stage() {
+    fn result_lines_show_type_and_refinement() {
         let (conn, dir) = seeded("search-flags");
         let out = search(&conn, search_args("crash bug", None, None), today()).unwrap();
         let line = out.lines().find(|l| l.contains("Crash bug")).unwrap();
-        assert!(line.contains(" task bug in_review "), "{line}");
+        assert!(line.contains(" task bug ready "), "{line}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

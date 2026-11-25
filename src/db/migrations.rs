@@ -66,12 +66,13 @@ const STEPS: &[Step] = &[
     // 4: the user's raw words behind a node (SPOKE-181). Set at creation, only ever appended to.
     // A 0.6.x server refuses a database at this version, so a rollback restores a backup.
     Step::Sql("ALTER TABLE nodes ADD COLUMN source TEXT"),
-    // 5: optional work type and stage, own values only (not inherited), stored snake_case.
+    // 5: optional work type and refinement (how ready work is to pick up; execution stays in
+    // status), own values only (not inherited), stored snake_case. Only adds columns.
     Step::Sql(
         "ALTER TABLE nodes ADD COLUMN work_type TEXT
-       CHECK (work_type IN ('bug','feature','chore','idea','epic'));
-     ALTER TABLE nodes ADD COLUMN stage TEXT
-       CHECK (stage IN ('idea','backlog','brainstormed','understood','planned','in_progress','in_review','done'));",
+       CHECK (work_type IN ('bug','feature','chore','idea','epic','spike'));
+     ALTER TABLE nodes ADD COLUMN refinement TEXT
+       CHECK (refinement IN ('idea','brainstormed','understood','planned','ready'));",
     ),
 ];
 
@@ -162,10 +163,10 @@ mod tests {
         assert_eq!(notes, "keep me");
     }
 
-    /// A schema-4 database (0.7.x, with `source`) gains nullable `work_type` and `stage`,
+    /// A schema-4 database (0.7.x, with `source`) gains nullable `work_type` and `refinement`,
     /// keeps every row and its `source`, and the CHECK constraints reject unknown values.
     #[test]
-    fn step_five_adds_type_and_stage_and_keeps_source() {
+    fn step_five_adds_type_and_refinement_and_keeps_source() {
         let mut conn = Connection::open_in_memory().unwrap();
         apply_to(&mut conn, 4).unwrap();
         conn.execute_batch(
@@ -182,18 +183,18 @@ mod tests {
         assert!(version >= 5);
         let row: (Option<String>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT source, work_type, stage FROM nodes WHERE id = 2",
+                "SELECT source, work_type, refinement FROM nodes WHERE id = 2",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(row, (Some("my words".to_string()), None, None));
-        assert!(
-            conn.execute("UPDATE nodes SET work_type = 'nonsense' WHERE id = 2", [])
-                .is_err()
-        );
+        for bad in ["work_type = 'nonsense'", "refinement = 'done'"] {
+            let sql = format!("UPDATE nodes SET {bad} WHERE id = 2");
+            assert!(conn.execute(&sql, []).is_err(), "{bad}");
+        }
         conn.execute(
-            "UPDATE nodes SET work_type = 'bug', stage = 'in_review' WHERE id = 2",
+            "UPDATE nodes SET work_type = 'spike', refinement = 'ready' WHERE id = 2",
             [],
         )
         .unwrap();

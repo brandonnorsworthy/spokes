@@ -13,8 +13,8 @@ use rusqlite::Connection;
 use crate::format::today_in;
 use crate::store::{self, ToolResult};
 use args::{
-    AddArgs, AnswerArgs, AskArgs, ClaimArgs, FocusArgs, GetArgs, MoveArgs, NextArgs, RecentArgs,
-    ReleaseArgs, SearchArgs, SetStatusArgs, UpdateArgs,
+    AddArgs, AnswerArgs, AskArgs, ClaimArgs, FocusArgs, GetArgs, GuideArgs, MoveArgs, NextArgs,
+    RecentArgs, ReleaseArgs, SearchArgs, SetStatusArgs, UpdateArgs,
 };
 
 /// The one SQLite connection, shared by every request.
@@ -35,6 +35,7 @@ An ordered parent's children are steps: only the first unfinished one is actiona
 - Before working on a task, claim it so other agents skip it; finish with set_status done, or release it with a note. Pass the same agent label (e.g. opus-red) on every call this session; it renews your claim. Don't mention it to the user.
 - Orchestrating: claim the project, write the plan as children, hand step ids to workers; each worker claims its own step with its own agent label.
 - Dates are YYYY-MM-DD in the user's time zone. defer_until hides a node until then. Repeating chores and bills: add with recur (\"every 2 weeks\"); set_status done brings it back with the next due date.
+- Three independent fields: status (is it finished? open, in_progress, waiting, done, dropped; claim and ask set the middle two), refinement (can an agent start it? idea, brainstormed, understood, planned, ready) and type (bug, feature, chore, idea, epic, spike). Refinement and type are optional: leave them unset unless you know. Call guide for what every state means.
 - Ask rather than guess: if you need the user, call ask with the exact question and stop work on that task. When the user replies, record it with answer.";
 
 /// One MCP server instance. Built per request (the transport is stateless), so it only
@@ -81,7 +82,14 @@ impl Spokes {
     }
 
     #[tool(
-        description = "What to work on next, one line per work item: what needs the user, the focus list, what is due or overdue, then open work by priority level, and a few stale items. Use scope to look under one node, type or stage to filter."
+        description = "Explains every field and state in one page: status, refinement, type, ordered steps, how to work a task. Call it once if unsure what a state means; it changes nothing."
+    )]
+    async fn guide(&self, Parameters(_args): Parameters<GuideArgs>) -> ToolResult {
+        Ok(crate::guide::GUIDE.to_string())
+    }
+
+    #[tool(
+        description = "What to work on next, one line per work item: what needs the user, the focus list, what is due or overdue, then open work by priority level, and a few stale items. Use scope to look under one node, type or refinement to filter."
     )]
     async fn next(&self, Parameters(args): Parameters<NextArgs>) -> ToolResult {
         let today = today_in(self.tz);
@@ -89,7 +97,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. Each result shows its path. Search before adding. type and stage filter; with an empty query they list every match."
+        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. Each result shows its path. Search before adding. type and refinement filter; with an empty query they list every match."
     )]
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> ToolResult {
         let today = today_in(self.tz);
@@ -120,14 +128,14 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Create a task or area under a parent (default: the root), or a whole plan in one call via nested children (set ordered: true on the parent for sequential steps). Returns the new ids. Include 2 to 5 aliases. Optional type (bug, feature, chore, idea, epic) and stage (idea, backlog, brainstormed, understood, planned, in_progress, in_review, done) per node."
+        description = "Create a task or area under a parent (default: the root), or a whole plan in one call via nested children (set ordered: true on the parent for sequential steps). Returns the new ids. Include 2 to 5 aliases. Optional type (bug, feature, chore, idea, epic, spike) and refinement (idea, brainstormed, understood, planned, ready) per node."
     )]
     async fn add(&self, Parameters(args): Parameters<AddArgs>) -> ToolResult {
         self.run(move |c| store::add(c, args)).await
     }
 
     #[tool(
-        description = "Change a node's fields (title, kind, ordered, priority, type, stage, due, defer_until, aliases), replace its notes, append to them with notes_append, or append the user's words with source_append (the source itself is never replaced)."
+        description = "Change a node's fields (title, kind, ordered, priority, type, refinement, due, defer_until, aliases), replace its notes, append to them with notes_append, or append the user's words with source_append (the source itself is never replaced)."
     )]
     async fn update(&self, Parameters(args): Parameters<UpdateArgs>) -> ToolResult {
         self.run(move |c| store::update(c, args)).await

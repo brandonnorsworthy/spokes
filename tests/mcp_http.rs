@@ -182,6 +182,7 @@ async fn walking_skeleton_over_http() {
             "claim",
             "focus",
             "get",
+            "guide",
             "move",
             "next",
             "recent",
@@ -2597,4 +2598,31 @@ async fn source_field_over_http() {
     );
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The old `stage` argument is refused everywhere, so a caller never thinks it was saved.
+#[tokio::test]
+async fn old_stage_argument_is_refused_and_writes_nothing() {
+    let dir = temp_dir("stage-refused");
+    let server = start(&dir.join("spokes.db")).await;
+    let m = Mcp::new(server.addr);
+
+    let kept = first_id(&m.ok("add", json!({"title": "Kept"})).await);
+    for (tool, args) in [
+        ("add", json!({"title": "Zebra", "stage": "ready"})),
+        (
+            "add",
+            json!({"title": "Zebra", "children": [{"title": "Stripe", "stage": "ready"}]}),
+        ),
+        ("update", json!({"id": kept, "title": "Zebra", "stage": ""})),
+        ("search", json!({"query": "kept", "stage": "ready"})),
+        ("next", json!({"stage": "ready"})),
+    ] {
+        let e = err(&m, tool, args).await;
+        assert!(e.contains("renamed to refinement"), "{tool}: {e}");
+    }
+    let found = m.ok("search", json!({"query": "zebra stripe kept"})).await;
+    assert!(found.contains("Kept"), "{found}");
+    assert!(!found.contains("Zebra"), "{found}");
+    server.shutdown().await;
 }
