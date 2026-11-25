@@ -29,6 +29,7 @@ struct Clean {
     /// The repeat rule as stored JSON.
     recur: Option<String>,
     notes: Option<String>,
+    source: Option<String>,
     children: Vec<Clean>,
 }
 
@@ -110,8 +111,8 @@ fn insert(
     };
     tx.execute(
         "INSERT INTO nodes (user_id, parent_id, position, kind, ordered, title, priority,
-                            due_at, defer_until, aliases, recur, created_at, updated_at, touched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?11, ?11, ?11)",
+                            due_at, defer_until, aliases, recur, source, created_at, updated_at, touched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?11, ?11, ?11)",
         params![
             DEFAULT_USER,
             parent.0,
@@ -124,7 +125,8 @@ fn insert(
             spec.defer,
             spec.aliases,
             now,
-            spec.recur
+            spec.recur,
+            spec.source
         ],
     )
     .map_err(db_err)?;
@@ -182,6 +184,7 @@ fn clean_spec(
         .map_err(at)?;
     let aliases = clean_aliases(spec.aliases.as_deref().unwrap_or_default()).map_err(at)?;
     let notes = clean_notes(spec.notes.as_deref()).map_err(at)?;
+    let source = clean_source(spec.source.as_deref()).map_err(at)?;
     let recur = clean_recur(spec.recur.as_ref(), kind).map_err(at)?;
     let ordered = spec.ordered.unwrap_or(false);
 
@@ -224,6 +227,7 @@ fn clean_spec(
         aliases,
         recur,
         notes,
+        source,
         children,
     })
 }
@@ -272,6 +276,17 @@ pub(crate) fn clean_notes(raw: Option<&str>) -> Result<Option<String>, String> {
         ));
     }
     Ok(notes.map(str::to_string))
+}
+
+/// The user's words are kept as typed: only surrounding blank space is trimmed.
+pub(crate) fn clean_source(raw: Option<&str>) -> Result<Option<String>, String> {
+    let source = raw.map(str::trim).filter(|s| !s.is_empty());
+    if source.is_some_and(|s| s.len() > MAX_NOTES) {
+        return Err(format!(
+            "source is longer than {MAX_NOTES} bytes. Keep the user's words, but split a very long message."
+        ));
+    }
+    Ok(source.map(str::to_string))
 }
 
 pub(crate) fn clean_title(raw: &str) -> Result<String, String> {

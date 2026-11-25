@@ -205,6 +205,8 @@ pub struct Node {
     /// Last activity on the node or anything beneath it (bubbles up).
     pub touched_at: String,
     pub has_notes: bool,
+    /// The user's raw words are stored on the node (`source`).
+    pub has_source: bool,
     /// A step of a written plan: the parent is a task with ordered children.
     pub is_step: bool,
     /// Direct children that are not dropped.

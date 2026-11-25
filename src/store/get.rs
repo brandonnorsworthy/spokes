@@ -81,6 +81,17 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
     }
 
     if args.notes.unwrap_or(false) {
+        let source: Option<String> = conn
+            .query_row(
+                "SELECT source FROM nodes WHERE id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if let Some(s) = source {
+            out.push("SOURCE (the user's words)".to_string());
+            out.push(s);
+        }
         let body: Option<String> = conn
             .query_row(
                 "SELECT body FROM notes WHERE node_id = ?1",

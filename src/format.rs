@@ -163,6 +163,9 @@ fn detail_flags(node: &Node, today: NaiveDate, parent_due: Option<&str>, out: &m
     if node.has_notes {
         out.push("+notes".to_string());
     }
+    if node.has_source {
+        out.push("+source".to_string());
+    }
     if is_unplanned(node) {
         out.push("unplanned".to_string());
     }
@@ -222,6 +225,7 @@ mod tests {
             updated_at: "2026-11-01T00:00:00Z".into(),
             touched_at: "2026-11-01T00:00:00Z".into(),
             has_notes: true,
+            has_source: false,
             is_step: false,
             child_total: 6,
             child_done: 2,

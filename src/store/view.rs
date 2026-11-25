@@ -106,6 +106,7 @@ pub struct ViewNode {
     pub answered: bool,
     pub repeat: Option<String>,
     pub has_notes: bool,
+    pub has_source: bool,
     pub unplanned: bool,
     pub is_step: bool,
     pub is_next: bool,
@@ -146,6 +147,8 @@ pub struct DetailNode {
     #[serde(flatten)]
     pub node: ViewNode,
     pub notes: Option<String>,
+    /// The user's raw words, as stored (`null` when none).
+    pub source: Option<String>,
 }
 
 /// One node in detail: the node and notes, its breadcrumb and its last events.
@@ -420,6 +423,11 @@ pub fn detail(
             |r| r.get(0),
         )
         .optional()?;
+    let source: Option<String> = conn.query_row(
+        "SELECT source FROM nodes WHERE id = ?1",
+        params![id.0],
+        |r| r.get(0),
+    )?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, at, agent, type, detail FROM events WHERE node_id = ?1
          ORDER BY id DESC LIMIT ?2",
@@ -437,7 +445,11 @@ pub fn detail(
         .collect::<rusqlite::Result<_>>()?;
     Ok(Detail {
         path,
-        node: DetailNode { node, notes },
+        node: DetailNode {
+            node,
+            notes,
+            source,
+        },
         events,
     })
 }
@@ -743,6 +755,7 @@ fn view_node(n: Node, c: ViewCounts, today: NaiveDate, now: &str) -> ViewNode {
             .and_then(crate::recur::Rule::from_json)
             .map(|r| r.describe()),
         has_notes: n.has_notes,
+        has_source: n.has_source,
         unplanned,
         is_step: n.is_step,
         is_next: c.is_next,

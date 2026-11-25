@@ -30,6 +30,8 @@ pub struct NodeSpec {
     pub recur: Option<RecurArg>,
     /// Longer body: plan, research, links. Never shown in listings.
     pub notes: Option<String>,
+    /// The user's own words that led to this node, pasted exactly as typed (no summary, no edits). Kept apart from notes so the original idea can always be recovered. Set once; it can only be appended to later.
+    pub source: Option<String>,
     /// Nodes to create beneath this one, in order. Each takes the same fields (title, kind, ordered, notes, children...).
     pub children: Option<Vec<NodeSpec>>,
 }
@@ -110,6 +112,10 @@ pub struct UpdateArgs {
     pub notes: Option<String>,
     /// Text appended to the end of the notes (e.g. what you did, findings).
     pub notes_append: Option<String>,
+    /// Text added to the end of the source: a later message from the user, pasted exactly as typed.
+    pub source_append: Option<String>,
+    /// Not accepted: the source can never be replaced or cleared. Use source_append.
+    pub source: Option<String>,
     /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
 }
