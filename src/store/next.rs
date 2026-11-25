@@ -22,10 +22,10 @@ use chrono::{Duration, NaiveDate, Utc};
 use rusqlite::{Connection, params};
 
 use super::focus::{focus_numbers, too_long_note};
-use super::{NODE_COLS, ToolResult, ancestors, db_err, node_from_row, require};
+use super::{NODE_COLS, ToolResult, ancestors, db_err, node_from_row, refuse_stage, require};
 use crate::db::now;
 use crate::format::{Row, ago, due_flag, is_unplanned, parse_date, progress, render_rows};
-use crate::model::{DEFAULT_USER, Kind, Node, NodeId, ROOT_ID, Stage, Status, WorkType};
+use crate::model::{DEFAULT_USER, Kind, Node, NodeId, ROOT_ID, Refinement, Status, WorkType};
 use crate::tools::args::NextArgs;
 
 const DEFAULT_LIMIT: i64 = 5;
@@ -45,13 +45,18 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
         Some(l) => l.parse("limit")?.clamp(1, MAX_LIMIT),
         None => DEFAULT_LIMIT,
     } as usize;
+    refuse_stage(args.stage.as_ref())?;
     let filter = Filter {
         work_type: args
             .work_type
             .as_deref()
             .map(WorkType::parse_loose)
             .transpose()?,
-        stage: args.stage.as_deref().map(Stage::parse_loose).transpose()?,
+        refinement: args
+            .refinement
+            .as_deref()
+            .map(Refinement::parse_loose)
+            .transpose()?,
     };
     let scope = require(conn, scope_id)?;
     if scope.status.is_closed() {
@@ -262,30 +267,30 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
     Ok(out.join("\n"))
 }
 
-/// The `type` and `stage` filters of `next`. A node matches on its own values only.
+/// The `type` and `refinement` filters of `next`. A node matches on its own values only.
 struct Filter {
     work_type: Option<WorkType>,
-    stage: Option<Stage>,
+    refinement: Option<Refinement>,
 }
 
 impl Filter {
     fn is_set(&self) -> bool {
-        self.work_type.is_some() || self.stage.is_some()
+        self.work_type.is_some() || self.refinement.is_some()
     }
 
     fn matches(&self, n: &Node) -> bool {
         self.work_type.is_none_or(|t| n.work_type == Some(t))
-            && self.stage.is_none_or(|s| n.stage == Some(s))
+            && self.refinement.is_none_or(|s| n.refinement == Some(s))
     }
 
-    /// `type bug, stage in_review`, naming only the filters given.
+    /// `type bug, refinement planned`, naming only the filters given.
     fn describe(&self) -> String {
         let mut parts = Vec::new();
         if let Some(t) = self.work_type {
             parts.push(format!("type {t}"));
         }
-        if let Some(s) = self.stage {
-            parts.push(format!("stage {s}"));
+        if let Some(s) = self.refinement {
+            parts.push(format!("refinement {s}"));
         }
         parts.join(", ")
     }
@@ -320,7 +325,7 @@ fn work_row(item: &Item, tree: &Tree, today: NaiveDate) -> Row {
     if let Some(t) = node.work_type {
         flags.push(t.to_string());
     }
-    if let Some(s) = node.stage {
+    if let Some(s) = node.refinement {
         flags.push(s.to_string());
     }
     let mut rest = node.title.clone();
@@ -569,10 +574,11 @@ mod tests {
 
     fn next_args(scope: Option<i64>, limit: Option<i64>) -> NextArgs {
         NextArgs {
+            stage: None,
             scope: scope.map(IdArg::Number),
             limit: limit.map(crate::model::NumArg::Number),
             work_type: None,
-            stage: None,
+            refinement: None,
         }
     }
 
@@ -647,10 +653,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn set_fields(conn: &Connection, id: i64, work_type: Option<&str>, stage: Option<&str>) {
+    fn set_fields(conn: &Connection, id: i64, work_type: Option<&str>, refinement: Option<&str>) {
         conn.execute(
-            "UPDATE nodes SET work_type = ?1, stage = ?2 WHERE id = ?3",
-            params![work_type, stage, id],
+            "UPDATE nodes SET work_type = ?1, refinement = ?2 WHERE id = ?3",
+            params![work_type, refinement, id],
         )
         .unwrap();
     }
@@ -661,20 +667,20 @@ mod tests {
         for title in ["Crash", "Polish", "Ship"] {
             add(&mut conn, args(Some(2), title, Kind::Task)).unwrap(); // 3, 4, 5
         }
-        set_fields(&conn, 3, Some("bug"), Some("in_review"));
+        set_fields(&conn, 3, Some("bug"), Some("ready"));
         set_fields(&conn, 4, Some("bug"), Some("planned"));
-        set_fields(&conn, 5, Some("feature"), Some("in_review"));
+        set_fields(&conn, 5, Some("feature"), Some("ready"));
         (conn, dir)
     }
 
     fn run(
         conn: &Connection,
         work_type: Option<&str>,
-        stage: Option<&str>,
+        refinement: Option<&str>,
     ) -> Result<String, String> {
         let mut a = next_args(None, None);
         a.work_type = work_type.map(str::to_string);
-        a.stage = stage.map(str::to_string);
+        a.refinement = refinement.map(str::to_string);
         next(conn, a, crate::format::today_in(chrono_tz::UTC))
     }
 
@@ -688,9 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn stage_filter_keeps_only_matching_items() {
-        let (conn, dir) = typed_tree("next-stage");
-        let out = run(&conn, None, Some("in review")).unwrap();
+    fn refinement_filter_keeps_only_matching_items() {
+        let (conn, dir) = typed_tree("next-refinement");
+        let out = run(&conn, None, Some("ready")).unwrap();
         assert!(out.contains("Crash") && out.contains("Ship"), "{out}");
         assert!(!out.contains("Polish"), "{out}");
         let _ = std::fs::remove_dir_all(dir);
@@ -699,7 +705,7 @@ mod tests {
     #[test]
     fn filters_combine_with_and() {
         let (conn, dir) = typed_tree("next-both");
-        let out = run(&conn, Some("bug"), Some("in_review")).unwrap();
+        let out = run(&conn, Some("bug"), Some("ready")).unwrap();
         assert!(out.contains("Crash"), "{out}");
         assert!(!out.contains("Polish") && !out.contains("Ship"), "{out}");
         let _ = std::fs::remove_dir_all(dir);
@@ -709,8 +715,8 @@ mod tests {
     fn empty_filter_result_names_the_filters() {
         let (conn, dir) = typed_tree("next-none");
         assert_eq!(
-            run(&conn, Some("chore"), Some("done")).unwrap(),
-            "Nothing under SPOKE-1 To do matches type chore, stage done."
+            run(&conn, Some("chore"), Some("ready")).unwrap(),
+            "Nothing under SPOKE-1 To do matches type chore, refinement ready."
         );
         assert_eq!(
             run(&conn, Some("chore"), None).unwrap(),
@@ -729,11 +735,11 @@ mod tests {
     }
 
     #[test]
-    fn lines_show_type_and_stage_flags() {
+    fn lines_show_type_and_refinement_flags() {
         let (conn, dir) = typed_tree("next-flags");
         let out = run(&conn, None, None).unwrap();
-        assert!(out.contains("SPOKE-3  bug in_review      Crash"), "{out}");
-        assert!(out.contains("SPOKE-5  feature in_review  Ship"), "{out}");
+        assert!(out.contains("SPOKE-3  bug ready      Crash"), "{out}");
+        assert!(out.contains("SPOKE-5  feature ready  Ship"), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -5,6 +5,7 @@ pub mod backup;
 pub mod config;
 pub mod db;
 pub mod format;
+pub mod guide;
 pub mod migrate_source;
 pub mod model;
 pub mod recur;

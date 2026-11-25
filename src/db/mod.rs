@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(migrations::latest(), 5);
         let new_cols: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('work_type', 'stage')",
+                "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('work_type', 'refinement')",
                 [],
                 |r| r.get(0),
             )

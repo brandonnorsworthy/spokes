@@ -28,17 +28,20 @@ pub struct NodeSpec {
     pub aliases: Option<Vec<String>>,
     /// Repeat rule for a task, e.g. {"every": 2, "unit": "week", "from": "completion"} or "every 2 weeks". from "schedule" counts from the due date (bills). Marking it done resets it with the next due date.
     pub recur: Option<RecurArg>,
-    /// What sort of work: "bug", "feature", "chore", "idea" or "epic".
+    /// What sort of work: "bug", "feature", "chore", "idea", "epic" or "spike" (research that ends in a written answer in notes).
     #[serde(rename = "type")]
     pub work_type: Option<String>,
-    /// Where it is: "idea", "backlog", "brainstormed", "understood", "planned", "in_progress", "in_review" or "done". Separate from status.
-    pub stage: Option<String>,
+    /// How ready it is for an agent: "idea", "brainstormed", "understood", "planned" or "ready" (an agent can claim it now). Separate from status; execution is tracked by status, not here.
+    pub refinement: Option<String>,
     /// Longer body: plan, research, links. Never shown in listings.
     pub notes: Option<String>,
     /// The user's own words that led to this node, pasted exactly as typed (no summary, no edits). Kept apart from notes so the original idea can always be recovered. Set once; it can only be appended to later.
     pub source: Option<String>,
     /// Nodes to create beneath this one, in order. Each takes the same fields (title, kind, ordered, notes, children...).
     pub children: Option<Vec<NodeSpec>>,
+    /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
+    #[schemars(skip)]
+    pub stage: Option<serde_json::Value>,
 }
 
 // The `agent` label is optional on plain writes (it logs who acted and renews that agent's
@@ -78,11 +81,14 @@ pub struct NextArgs {
     /// Max lines (default 5), not counting up to 3 stale nudges.
     #[schemars(with = "Option<u32>")]
     pub limit: Option<NumArg>,
-    /// Only nodes of this type (bug, feature, chore, idea, epic).
+    /// Only nodes of this type (bug, feature, chore, idea, epic, spike).
     #[serde(rename = "type")]
     pub work_type: Option<String>,
-    /// Only nodes at this stage (e.g. in_review).
-    pub stage: Option<String>,
+    /// Only nodes at this refinement (e.g. ready).
+    pub refinement: Option<String>,
+    /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
+    #[schemars(skip)]
+    pub stage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -118,11 +124,11 @@ pub struct UpdateArgs {
     pub aliases: Option<Vec<String>>,
     /// Repeat rule, e.g. {"every": 1, "unit": "month", "from": "schedule"} or "every 2 weeks"; "" stops it repeating.
     pub recur: Option<RecurArg>,
-    /// What sort of work: "bug", "feature", "chore", "idea" or "epic". "" clears it.
+    /// What sort of work: "bug", "feature", "chore", "idea", "epic" or "spike" (research that ends in a written answer in notes). "" clears it.
     #[serde(rename = "type")]
     pub work_type: Option<String>,
-    /// Where it is: "idea", "backlog", "brainstormed", "understood", "planned", "in_progress", "in_review" or "done". Separate from status. "" clears it.
-    pub stage: Option<String>,
+    /// How ready it is for an agent: "idea", "brainstormed", "understood", "planned" or "ready" (an agent can claim it now). Separate from status; execution is tracked by status, not here. "" clears it.
+    pub refinement: Option<String>,
     /// Replaces the whole notes body; "" clears it. To add to it, use notes_append instead.
     pub notes: Option<String>,
     /// Text appended to the end of the notes (e.g. what you did, findings).
@@ -133,6 +139,9 @@ pub struct UpdateArgs {
     pub source: Option<String>,
     /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
+    /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
+    #[schemars(skip)]
+    pub stage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -165,11 +174,14 @@ pub struct SearchArgs {
     /// Max results (default 10).
     #[schemars(with = "Option<u32>")]
     pub limit: Option<NumArg>,
-    /// Only nodes of this type (bug, feature, chore, idea, epic).
+    /// Only nodes of this type (bug, feature, chore, idea, epic, spike).
     #[serde(rename = "type")]
     pub work_type: Option<String>,
-    /// Only nodes at this stage (e.g. in_review).
-    pub stage: Option<String>,
+    /// Only nodes at this refinement (e.g. ready).
+    pub refinement: Option<String>,
+    /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
+    #[schemars(skip)]
+    pub stage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -248,3 +260,7 @@ pub struct AnswerArgs {
     /// The user's reply, in their words. Appended to the task's notes with the question.
     pub text: String,
 }
+
+/// The guide takes no arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GuideArgs {}

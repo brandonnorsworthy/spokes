@@ -2,10 +2,12 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::{ToolResult, clean_agent, db_err, log_event, renew_leases, require, touch};
+use super::{
+    ToolResult, clean_agent, db_err, log_event, refuse_stage, renew_leases, require, touch,
+};
 use crate::db::{now, position};
 use crate::format::parse_date;
-use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Stage, WorkType};
+use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, WorkType};
 use crate::recur::{RecurArg, RecurChange};
 use crate::tools::args::{AddArgs, NodeSpec};
 
@@ -22,7 +24,7 @@ struct Clean {
     title: String,
     kind: Kind,
     work_type: Option<WorkType>,
-    stage: Option<Stage>,
+    refinement: Option<Refinement>,
     ordered: bool,
     priority: Option<i64>,
     due: Option<String>,
@@ -113,7 +115,7 @@ fn insert(
     };
     tx.execute(
         "INSERT INTO nodes (user_id, parent_id, position, kind, ordered, title, priority,
-                            due_at, defer_until, aliases, recur, source, work_type, stage,
+                            due_at, defer_until, aliases, recur, source, work_type, refinement,
                             created_at, updated_at, touched_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?11, ?11, ?11)",
         params![
@@ -131,7 +133,7 @@ fn insert(
             spec.recur,
             spec.source,
             spec.work_type.map(WorkType::as_str),
-            spec.stage.map(Stage::as_str)
+            spec.refinement.map(Refinement::as_str)
         ],
     )
     .map_err(db_err)?;
@@ -191,9 +193,15 @@ fn clean_spec(
     let notes = clean_notes(spec.notes.as_deref()).map_err(at)?;
     let source = clean_source(spec.source.as_deref()).map_err(at)?;
     let recur = clean_recur(spec.recur.as_ref(), kind).map_err(at)?;
+    refuse_stage(spec.stage.as_ref()).map_err(at)?;
     let work_type =
         clean_added("type", spec.work_type.as_deref(), WorkType::parse_loose).map_err(at)?;
-    let stage = clean_added("stage", spec.stage.as_deref(), Stage::parse_loose).map_err(at)?;
+    let refinement = clean_added(
+        "refinement",
+        spec.refinement.as_deref(),
+        Refinement::parse_loose,
+    )
+    .map_err(at)?;
     let ordered = spec.ordered.unwrap_or(false);
 
     let kids = spec.children.as_deref().unwrap_or_default();
@@ -229,7 +237,7 @@ fn clean_spec(
         title,
         kind,
         work_type,
-        stage,
+        refinement,
         ordered,
         priority,
         due,
@@ -242,7 +250,7 @@ fn clean_spec(
     })
 }
 
-/// A type or stage given on add: parsed loosely; an empty string is an error (omit the field).
+/// A type or refinement given on add: parsed loosely; an empty string is an error (omit the field).
 fn clean_added<T>(
     field: &str,
     raw: Option<&str>,
@@ -257,7 +265,7 @@ fn clean_added<T>(
     }
 }
 
-/// A type or stage given on update: parsed loosely; an empty string clears it.
+/// A type or refinement given on update: parsed loosely; an empty string clears it.
 pub(crate) fn clean_updated<T>(
     raw: Option<&str>,
     parse: fn(&str) -> Result<T, String>,
@@ -470,21 +478,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stores_type_and_stage_loosely_parsed() {
+    fn stores_type_and_refinement_loosely_parsed() {
         let (mut conn, dir) = temp_db("add-type");
         let mut a = args(None, "Fix", Kind::Task);
         a.node.work_type = Some("Bug".into());
-        a.node.stage = Some("In review".into());
+        a.node.refinement = Some("Planned".into());
         add(&mut conn, a).unwrap();
         let row: (Option<String>, Option<String>) = conn
-            .query_row("SELECT work_type, stage FROM nodes WHERE id = 2", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT work_type, refinement FROM nodes WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(row, (Some("bug".into()), Some("in_review".into())));
+        assert_eq!(row, (Some("bug".into()), Some("planned".into())));
         let mut a = args(None, "Empty", Kind::Task);
-        a.node.stage = Some(" ".into());
-        assert!(add(&mut conn, a).unwrap_err().contains("Omit stage"));
+        a.node.refinement = Some(" ".into());
+        assert!(add(&mut conn, a).unwrap_err().contains("Omit refinement"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -8,6 +8,8 @@ summary: Add an optional type (bug/feature/chore/idea/epic) and stage field to S
 
 # SPOKE-8: type and stage fields on nodes
 
+> **Update (2026-11-25):** `stage` was renamed **`refinement`** (idea, brainstormed, understood, planned, ready) and `in_progress`, `in_review` and `done` were removed from it, because they duplicated status and could disagree with it (folded into migration 5, which only adds columns; the old argument name `stage` is refused). `spike` was added to the types, and a `guide` tool was added. Steps 1 to 7 below are the original plan and still say `stage`; read them as history. What remains to add is under **Follow-ups**.
+
 ## Context
 
 Spokes is replacing the GitHub Projects board (SPOKE-6). The board had a Kind column (Bug, Feature, Chore, Idea, Epic) and a Stage column. Spokes has neither, so bk-flow records stage as `Stage:` lines in notes. This change adds two optional, own-value-only (not inherited) fields to every node:
@@ -223,3 +225,29 @@ Not authorized (stop and ask): editing `ogl33t/stacks`, redeploying in Arcane, t
 - **Parallel batch 2 subagents** share one working tree and cargo target, so builds can briefly fail on another step's half-edit. Mitigation: each step's files are disjoint, and retry on foreign failures.
 - **Stale tool schemas:** this session's MCP tool schemas won't show the new args until Claude Code reconnects. The production check uses curl.
 - **spokes-view:** reads `/api` with fields added. It is additive, but if it decodes strictly it could break. A check in the production step: load spokes-view after the redeploy.
+
+## Follow-ups (still to add to this feature)
+
+Written 2026-11-25 after the refinement rename. Ordered by value; each is its own change.
+
+### 1. Keep non-actionable work out of `next` (do first)
+**Problem.** Open tasks that are not meant to be done soon (for example hobby ideas) count toward "+N more open" and compete in `next`. Today nothing hides them except `defer_until`, which needs a date. `type` and `refinement` only filter when the caller passes them, and `next {}` ignores both.
+**Add.**
+- A **`someday` status**, set with `set_status`. Someday nodes are left out of `next` and its open count, and still shown by `get` and `search`. It is the "no date" version of a deferral, and it belongs in status because it answers "should anyone act on this soon?".
+- A **`reference` kind** (alongside `area` and `task`) for things that are kept, not done, such as a bookmarked link. It has no done state, like an area; `set_status done` is refused; `next` and the open counts skip it; it can hold notes and links and sit under a task or area.
+- A periodic nudge in `next` so someday does not become a graveyard: one line such as "N someday items, oldest 90 days".
+**Done when:** with someday and reference nodes in the tree, `next` and "+N more open" count none of them, `get` and `search` still find them, and the `guide` explains both.
+**Interaction.** Drop `type: idea` when this lands (it overlaps `refinement: idea` and someday); keep `refinement: idea` for early work that is still active.
+
+### 2. Viewer: someday and reference
+spokes-view already shows `refinement` and the `spike` type. When item 1 lands, add the someday status and reference kind to the legend.
+
+### 3. Next-action hints on write replies
+Live Spokes node SPOKE-738 (p1). A one-line "Next:" hint after writes, such as "add some aliases", "the last step is done, close the parent". The `guide` tool is the page those hints point at.
+
+### 4. Cross-project links and gate nodes
+Links are planned for v1.1 in `docs/spec.md` (a table `from_id, to_id, type`; "blocks" and "related to"; SPOKE-236). A feature that needs several parts from different projects gets a **gate node** under its own project, linked with `needs` to each part, closing only when all are done, shown as "2 of 3 done". This is the answer to epic-of-epics without giving a node two parents.
+
+### 5. Clean up the type list
+`epic` duplicates the tree: a node with children already is one. Decide whether to drop `epic` (and `idea`, see item 1) from the types once links exist.
+
