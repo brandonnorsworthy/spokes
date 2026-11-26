@@ -2626,3 +2626,61 @@ async fn old_stage_argument_is_refused_and_writes_nothing() {
     assert!(!found.contains("Zebra"), "{found}");
     server.shutdown().await;
 }
+
+/// A closed node shows no refinement anywhere and matches no refinement filter; the stored
+/// value is kept and shows again when the node is reopened. Its type is unaffected.
+#[tokio::test]
+async fn closed_nodes_hide_refinement_until_reopened() {
+    let dir = temp_dir("closed-refinement");
+    let server = start(&dir.join("spokes.db")).await;
+    let m = Mcp::new(server.addr);
+
+    let done = first_id(
+        &m.ok(
+            "add",
+            json!({"title": "Zebra one", "type": "bug", "refinement": "ready"}),
+        )
+        .await,
+    );
+    let dropped = first_id(
+        &m.ok(
+            "add",
+            json!({"title": "Zebra two", "type": "bug", "refinement": "ready"}),
+        )
+        .await,
+    );
+    m.ok("set_status", json!({"ids": [done], "status": "done"}))
+        .await;
+    m.ok("set_status", json!({"ids": [dropped], "status": "dropped"}))
+        .await;
+
+    for id in [&done, &dropped] {
+        let got = m.ok("get", json!({"id": id})).await;
+        assert!(got.contains(" bug"), "{got}");
+        assert!(!got.contains("ready"), "{got}");
+    }
+    let all = m
+        .ok(
+            "search",
+            json!({"query": "", "type": "bug", "include_done": true}),
+        )
+        .await;
+    assert!(
+        all.contains("Zebra one") && all.contains("Zebra two"),
+        "{all}"
+    );
+    assert!(!all.contains("ready"), "{all}");
+    let filtered = m
+        .ok(
+            "search",
+            json!({"query": "", "refinement": "ready", "include_done": true}),
+        )
+        .await;
+    assert!(!filtered.contains("Zebra"), "{filtered}");
+
+    m.ok("set_status", json!({"ids": [done], "status": "open"}))
+        .await;
+    let back = m.ok("get", json!({"id": done})).await;
+    assert!(back.contains("bug ready"), "{back}");
+    server.shutdown().await;
+}

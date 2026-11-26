@@ -588,19 +588,22 @@ fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
         .map_err(db_err)?;
     stmt.query_map(params![DEFAULT_USER], |r| {
         let status: String = r.get(3)?;
+        let status: Status = status.parse().unwrap_or(Status::Open);
         Ok((
             NodeId(r.get(0)?),
             Meta {
                 parent: r.get::<_, Option<i64>>(1)?.map(NodeId),
                 title: r.get(2)?,
-                status: status.parse().unwrap_or(Status::Open),
+                status,
                 priority: r.get(4)?,
                 work_type: r
                     .get::<_, Option<String>>(5)?
                     .and_then(|t| WorkType::parse_loose(&t).ok()),
                 refinement: r
                     .get::<_, Option<String>>(6)?
-                    .and_then(|t| Refinement::parse_loose(&t).ok()),
+                    .and_then(|t| Refinement::parse_loose(&t).ok())
+                    // Closed nodes have no refinement to match (see `node_from_row`).
+                    .filter(|_| !status.is_closed()),
             },
         ))
     })
