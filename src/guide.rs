@@ -25,6 +25,7 @@ REFINEMENT (how ready the work is to pick up; it stops at ready)
   planned       a plan exists: ordered steps with a done-when for each.
   ready         an agent can claim it now and start.
   Once work starts, status carries it (claim -> in_progress -> done). Do not put started work back in refinement.
+  Done and dropped nodes show none and match no refinement filter; the stored value returns on reopen.
 
 TYPE (what kind of work)
   bug       something is broken.   feature  something new.   chore  upkeep, no behaviour change.

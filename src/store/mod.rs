@@ -29,7 +29,7 @@ pub use update::update;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID};
+use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
 
 /// What a tool call yields: text for the model, or an actionable error message.
 pub type ToolResult = Result<String, String>;
@@ -65,13 +65,16 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
     };
     let kind: String = r.get(3)?;
     let status: String = r.get(6)?;
+    let status: Status = status.parse().map_err(|_| text_enum(6, status))?;
     let work_type = match r.get::<_, Option<String>>(24)? {
         Some(v) => Some(v.parse().map_err(|_| text_enum(24, v))?),
         None => None,
     };
+    // Refinement says how ready work is to start, so a closed node shows none. The stored
+    // value is kept and comes back if the node is reopened.
     let refinement = match r.get::<_, Option<String>>(25)? {
-        Some(v) => Some(v.parse().map_err(|_| text_enum(25, v))?),
-        None => None,
+        Some(v) if !status.is_closed() => Some(v.parse().map_err(|_| text_enum(25, v))?),
+        _ => None,
     };
     Ok(Node {
         id: NodeId(r.get(0)?),
@@ -80,7 +83,7 @@ pub(crate) fn node_from_row(r: &Row<'_>) -> rusqlite::Result<Node> {
         kind: kind.parse().map_err(|_| text_enum(3, kind))?,
         ordered: r.get(4)?,
         title: r.get(5)?,
-        status: status.parse().map_err(|_| text_enum(6, status))?,
+        status,
         priority: r.get(7)?,
         due_at: r.get(8)?,
         defer_until: r.get(9)?,
