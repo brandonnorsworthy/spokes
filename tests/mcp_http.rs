@@ -3126,3 +3126,23 @@ async fn ask_hints_to_record_the_reply_over_http() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `answer` says to claim the task before continuing (SPOKE-1079).
+#[tokio::test]
+async fn answer_hints_to_claim_before_continuing_over_http() {
+    let dir = temp_dir("hint-answer");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+    let task = add_node(&mcp, json!({"title": "Install"})).await;
+    mcp.ok(
+        "ask",
+        json!({"id": task, "agent": "w1", "question": "D: or E:?"}),
+    )
+    .await;
+    let out = mcp.ok("answer", json!({"id": task, "text": "E:"})).await;
+    assert!(
+        out.ends_with(&format!("\nNext: Claim {task} before continuing the work.")),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
