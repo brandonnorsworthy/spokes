@@ -3,8 +3,9 @@
 //!
 //! Every hint is made here, by [`hint`], a pure function of the state and the action, and
 //! every hint line starts with [`PREFIX`] so a model, a test or a UI can find it. Rules:
-//! a hint fires only when the state calls for it, one line each, never on areas or closed
-//! nodes, and it says the consequence or the next step, never what the caller just did.
+//! a hint fires only when the state calls for it, one line each, and it says the
+//! consequence or the next step, never what the caller just did. Hints do not suggest
+//! working on or finishing an area or a closed node.
 //! `SPOKES_HINTS=0` turns them all off ([`strip`], applied by the MCP layer).
 
 use crate::model::{Kind, Node, Status};
@@ -38,6 +39,9 @@ pub enum Action<'a> {
         open: &'a [Node],
         held_below: bool,
     },
+    /// `set_status` dropped nodes that still have unfinished work somewhere beneath them.
+    /// Each entry is a dropped node with that work, in tree order.
+    DroppedWithOpen { leftovers: &'a [(Node, Vec<Node>)] },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -46,8 +50,8 @@ pub const CLAIM_ON_READ: &str = "Working on this? Claim it first (that marks it 
 pub const CLAIM_FROM_QUEUE: &str = "Claim the one you pick before starting.";
 /// After appending notes to a task nobody holds.
 pub const CLAIM_ON_NOTES: &str = "Recording progress? Claim it so other agents skip it.";
-/// How many open children the claim-on-parent hint names before "+N more".
-const LISTED_CHILDREN: usize = 3;
+/// How many nodes a hint names before "+N more".
+const LISTED: usize = 3;
 
 /// The hint for an action, as one line starting with [`PREFIX`], or `None` when the state
 /// does not call for one.
@@ -68,6 +72,7 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             open,
             held_below,
         } => parent_claimed(parent, open, *held_below)?,
+        Action::DroppedWithOpen { leftovers } => dropped_with_open(leftovers)?,
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -108,20 +113,40 @@ fn parent_claimed(parent: &Node, open: &[Node], held_below: bool) -> Option<Stri
         let first = &open[0];
         format!("the next step is {} {}", first.id, first.title)
     } else {
-        let mut names: Vec<String> = open
-            .iter()
-            .take(LISTED_CHILDREN)
-            .map(|c| format!("{} {}", c.id, c.title))
-            .collect();
-        if n > LISTED_CHILDREN {
-            names.push(format!("+{} more", n - LISTED_CHILDREN));
-        }
-        names.join(", ")
+        names(open)
     };
     Some(format!(
         "{} has {n} open {subtasks} ({which}). Working on one? Claim that one too. Orchestrating? Keep this claim; workers can claim their own subtasks inside it.",
         parent.id
     ))
+}
+
+/// Dropping a node leaves what is under it open but out of sight, so name it.
+fn dropped_with_open(leftovers: &[(Node, Vec<Node>)]) -> Option<String> {
+    let parts: Vec<String> = leftovers
+        .iter()
+        .filter(|(_, open)| !open.is_empty())
+        .map(|(node, open)| format!("{} {} ({})", node.id, node.title, names(open)))
+        .collect();
+    (!parts.is_empty()).then(|| {
+        format!(
+            "Unfinished work is still under dropped {}. Drop what nobody wants with set_status, or move what you keep.",
+            parts.join(" and ")
+        )
+    })
+}
+
+/// `SPOKE-4 Two, SPOKE-5 Three, SPOKE-6 Four, +2 more`.
+fn names(nodes: &[Node]) -> String {
+    let mut names: Vec<String> = nodes
+        .iter()
+        .take(LISTED)
+        .map(|c| format!("{} {}", c.id, c.title))
+        .collect();
+    if nodes.len() > LISTED {
+        names.push(format!("+{} more", nodes.len() - LISTED));
+    }
+    names.join(", ")
 }
 
 /// An open task that nobody holds: not claimed, not waiting on the user, not closed.
@@ -436,6 +461,30 @@ mod tests {
             };
             assert_eq!(hint(&action), None);
         }
+    }
+
+    #[test]
+    fn dropped_names_the_open_work_left_under_each_node() {
+        let open: Vec<Node> = (4..9).map(|i| node(i, &format!("C{i}"))).collect();
+        let one = [(node(2, "Plan"), open.clone())];
+        assert_eq!(
+            hint(&Action::DroppedWithOpen { leftovers: &one }).as_deref(),
+            Some(
+                "Next: Unfinished work is still under dropped SPOKE-2 Plan (SPOKE-4 C4, SPOKE-5 C5, SPOKE-6 C6, +2 more). Drop what nobody wants with set_status, or move what you keep."
+            )
+        );
+        let two = [
+            (node(2, "Plan"), open[..1].to_vec()),
+            (node(3, "Other"), open[1..2].to_vec()),
+        ];
+        let h = hint(&Action::DroppedWithOpen { leftovers: &two }).unwrap();
+        assert!(
+            h.contains("dropped SPOKE-2 Plan (SPOKE-4 C4) and SPOKE-3 Other (SPOKE-5 C5)."),
+            "{h}"
+        );
+        let none = [(node(2, "Plan"), Vec::new())];
+        assert_eq!(hint(&Action::DroppedWithOpen { leftovers: &none }), None);
+        assert_eq!(hint(&Action::DroppedWithOpen { leftovers: &[] }), None);
     }
 
     #[test]

@@ -2203,9 +2203,12 @@ async fn recurrence_over_http() {
     let out = mcp
         .ok("set_status", json!({"ids": [review], "status": "dropped"}))
         .await;
-    assert_eq!(
-        out,
-        format!("{review} dropped  Weekly review  (it stops repeating)")
+    // Its steps are still open, so the reply names them too.
+    assert!(
+        out.starts_with(&format!(
+            "{review} dropped  Weekly review  (it stops repeating)\nNext: Unfinished work is still under dropped {review} "
+        )),
+        "{out}"
     );
 
     // Rules: areas never repeat; steps of an ordered parent do not repeat on their own.
@@ -2916,4 +2919,51 @@ async fn tracked_mark_is_set_shown_found_and_cleared() {
         .collect();
     assert_eq!(ev, vec!["tracked", "tracked", "untracked"]);
     server.shutdown().await;
+}
+
+/// Dropping a node with unfinished work beneath it names that work (SPOKE-1079).
+#[tokio::test]
+async fn dropping_a_parent_names_the_open_work_under_it_over_http() {
+    let dir = temp_dir("hint-dropped");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let plan = add_node(
+        &mcp,
+        json!({"title": "Plan", "children": [
+            {"title": "Map", "children": [{"title": "Draw"}]}, {"title": "Write"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": plan, "depth": 2})).await;
+    let map = first_id(line_with(&g, "Map"));
+    let draw = first_id(line_with(&g, "Draw"));
+    let write = first_id(line_with(&g, "Write"));
+
+    // A finished leaf leaves nothing behind.
+    let out = mcp
+        .ok("set_status", json!({"ids": [write], "status": "dropped"}))
+        .await;
+    assert!(!out.contains("Unfinished work"), "{out}");
+
+    let out = mcp
+        .ok("set_status", json!({"ids": [plan], "status": "dropped"}))
+        .await;
+    assert!(
+        out.ends_with(&format!(
+            "\nNext: Unfinished work is still under dropped {plan} Plan ({map} Map, {draw} Draw). Drop what nobody wants with set_status, or move what you keep."
+        )),
+        "{out}"
+    );
+
+    // Dropping the rest in one call leaves nothing to name.
+    mcp.ok("set_status", json!({"ids": [plan], "status": "open"}))
+        .await;
+    let out = mcp
+        .ok(
+            "set_status",
+            json!({"ids": [plan, map, draw], "status": "dropped"}),
+        )
+        .await;
+    assert!(!out.contains("Unfinished work"), "{out}");
+    let _ = std::fs::remove_dir_all(dir);
 }
