@@ -54,6 +54,9 @@ pub enum Action<'a> {
     /// `claim` lost because another agent holds the node or something under it.
     /// `scope` is its parent task or area, when that has other work nobody holds.
     ClaimRefused { scope: Option<&'a Node> },
+    /// `release` gave `node` back. `handoff` is true when a note came with it, or notes
+    /// were written on it since it was claimed.
+    Released { node: &'a Node, handoff: bool },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -104,6 +107,12 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             ),
             None => "Call next to find other open work.".to_string(),
         },
+        Action::Released { node, handoff } => (!*handoff).then(|| {
+            format!(
+                "No note says where {} got to. Add one with update notes_append so the next agent can pick it up.",
+                node.id
+            )
+        })?,
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -613,6 +622,26 @@ mod tests {
             hint(&Action::ClaimRefused { scope: None }).as_deref(),
             Some("Next: Call next to find other open work.")
         );
+    }
+
+    #[test]
+    fn release_asks_for_a_handoff_only_without_one() {
+        let t = node(4, "Task");
+        let h = hint(&Action::Released {
+            node: &t,
+            handoff: false,
+        });
+        assert_eq!(
+            h.as_deref(),
+            Some(
+                "Next: No note says where SPOKE-4 got to. Add one with update notes_append so the next agent can pick it up."
+            )
+        );
+        let action = Action::Released {
+            node: &t,
+            handoff: true,
+        };
+        assert_eq!(hint(&action), None);
     }
 
     #[test]

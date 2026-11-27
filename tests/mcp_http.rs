@@ -3063,3 +3063,43 @@ async fn claim_hints_at_source_and_at_other_work_over_http() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Releasing with nothing written down asks for a hand-off note (SPOKE-1079).
+#[tokio::test]
+async fn release_without_a_note_asks_for_one_over_http() {
+    let dir = temp_dir("hint-release");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+    let task = add_node(&mcp, json!({"title": "Task", "notes": "The plan."})).await;
+    let hint = format!(
+        "\nNext: No note says where {task} got to. Add one with update notes_append so the next agent can pick it up."
+    );
+
+    // Notes from before the claim are not a hand-off, even after a renewal.
+    mcp.ok("claim", json!({"id": task, "agent": "w1"})).await;
+    mcp.ok("claim", json!({"id": task, "agent": "w1"})).await;
+    let out = mcp.ok("release", json!({"id": task, "agent": "w1"})).await;
+    assert!(out.ends_with(&hint), "{out}");
+
+    // Notes written during the claim are, even if the claim was renewed afterwards.
+    mcp.ok("claim", json!({"id": task, "agent": "w1"})).await;
+    mcp.ok(
+        "update",
+        json!({"id": task, "notes_append": "Half way.", "agent": "w1"}),
+    )
+    .await;
+    mcp.ok("claim", json!({"id": task, "agent": "w1"})).await;
+    let out = mcp.ok("release", json!({"id": task, "agent": "w1"})).await;
+    assert!(!out.contains("Next: "), "{out}");
+
+    // So is a note passed to release.
+    mcp.ok("claim", json!({"id": task, "agent": "w1"})).await;
+    let out = mcp
+        .ok(
+            "release",
+            json!({"id": task, "agent": "w1", "note": "Blocked on the VPS."}),
+        )
+        .await;
+    assert!(!out.contains("Next: "), "{out}");
+    let _ = std::fs::remove_dir_all(dir);
+}
