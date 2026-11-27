@@ -41,6 +41,7 @@ async fn start_cfg(
         allowed_origins,
         tz: chrono_tz::UTC,
         backup: None,
+        hints: true,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {

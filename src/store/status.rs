@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 
 use crate::db::now;
 use crate::format::{parse_date, short_date};
+use crate::hints;
 use crate::model::{Kind, Node, NodeId, Status};
 use crate::recur::Rule;
 use crate::tools::args::SetStatusArgs;
@@ -66,20 +67,19 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs, today: NaiveDate) 
             if parent.kind != Kind::Task || parent.status.is_closed() {
                 continue;
             }
-            if parent.child_total > 0 && parent.child_done == parent.child_total {
-                lines.push(format!(
-                    "All steps of {} {} are done. If it is finished too, mark it done with set_status.",
-                    parent.id, parent.title
-                ));
-            } else if parent.ordered
-                && let Some(step) = children(&tx, pid)?
+            let next_step = if parent.ordered {
+                children(&tx, pid)?
                     .into_iter()
                     .find(|c| !c.status.is_closed())
-            {
-                lines.push(format!(
-                    "Next step of {} {}: {} {}",
-                    parent.id, parent.title, step.id, step.title
-                ));
+            } else {
+                None
+            };
+            let action = hints::Action::StepClosed {
+                parent: &parent,
+                next_step: next_step.as_ref(),
+            };
+            if let Some(line) = hints::hint(&action) {
+                lines.push(line);
             }
         }
     }
@@ -252,7 +252,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "SPOKE-3 done  Step\nAll steps of SPOKE-2 Project are done. If it is finished too, mark it done with set_status."
+            "SPOKE-3 done  Step\nNext: All steps of SPOKE-2 Project are done. If it is finished too, mark it done with set_status."
         );
         let out = set_status(
             &mut conn,
@@ -324,7 +324,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "SPOKE-3 done  One\nNext step of SPOKE-2 Plan: SPOKE-4 Two"
+            "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan."
         );
         let out = set_status(
             &mut conn,
@@ -332,7 +332,7 @@ mod tests {
             crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
-        assert!(out.ends_with("All steps of SPOKE-2 Plan are done. If it is finished too, mark it done with set_status."), "{out}");
+        assert!(out.ends_with("Next: All steps of SPOKE-2 Plan are done. If it is finished too, mark it done with set_status."), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

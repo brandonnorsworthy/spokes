@@ -47,6 +47,8 @@ pub struct Spokes {
     tool_router: ToolRouter<Self>,
     /// `SPOKES_TZ`: decides what "today" is for due dates and deferrals.
     tz: chrono_tz::Tz,
+    /// `SPOKES_HINTS`: when false, "Next: " hint lines are removed from every reply.
+    hints: bool,
 }
 
 #[tool_router]
@@ -56,11 +58,12 @@ impl Spokes {
         Self::tool_router()
     }
 
-    pub fn new(db: Db, tool_router: ToolRouter<Self>, tz: chrono_tz::Tz) -> Self {
+    pub fn new(db: Db, tool_router: ToolRouter<Self>, tz: chrono_tz::Tz, hints: bool) -> Self {
         Self {
             db,
             tool_router,
             tz,
+            hints,
         }
     }
 
@@ -70,7 +73,8 @@ impl Spokes {
         F: FnOnce(&mut Connection) -> ToolResult + Send + 'static,
     {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
+        let hints = self.hints;
+        let result = tokio::task::spawn_blocking(move || {
             // A panic mid-call rolls its transaction back, so a poisoned lock is safe to reuse.
             let mut conn = db.lock().unwrap_or_else(|p| p.into_inner());
             op(&mut conn)
@@ -79,7 +83,14 @@ impl Spokes {
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "tool task failed");
             Err("Internal error. Try again; if it persists, check the server log.".to_string())
-        })
+        });
+        if hints {
+            result
+        } else {
+            result
+                .map(|t| crate::hints::strip(&t))
+                .map_err(|t| crate::hints::strip(&t))
+        }
     }
 
     #[tool(

@@ -35,8 +35,9 @@ pub fn app(config: &Config) -> anyhow::Result<Router> {
     let router = Spokes::router();
     let mcp_db = db.clone();
     let tz = config.tz;
+    let hints = config.hints;
     let mcp = StreamableHttpService::new(
-        move || Ok(Spokes::new(mcp_db.clone(), router.clone(), tz)),
+        move || Ok(Spokes::new(mcp_db.clone(), router.clone(), tz, hints)),
         Arc::new(NeverSessionManager::default()),
         mcp_config,
     );

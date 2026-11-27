@@ -30,6 +30,7 @@ async fn start(db_path: &Path, backup: Option<BackupConfig>) -> Server {
         allowed_origins: Vec::new(),
         tz: chrono_tz::UTC,
         backup,
+        hints: true,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {

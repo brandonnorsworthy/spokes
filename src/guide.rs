@@ -48,6 +48,11 @@ HOW AN AGENT WORKS A TASK
   Stuck or need a decision: ask (it waits for the user), do not guess. Giving up: release with a note.
   Adding: search first, then add with 2 to 5 aliases; pass the user's own words in source.
 
+HINTS
+  A reply may end with a line starting \"Next: \". It is a hint from the node's current state: the next
+  step of an ordered parent, or that all steps are done so the parent can be closed. It appears only
+  when the state calls for it. Follow it unless you know better; it never repeats what you just did.
+
 SEARCHING
   Several keywords at once, as alternatives. A typed id (958, #958, SPOKE-958) puts that node first,
   even if it is done or dropped. Nodes matching more of the rarer words rank first; by default
@@ -67,6 +72,12 @@ mod tests {
 
     /// The guide must name every refinement, type and status the server accepts, so a new
     /// value cannot ship without being explained.
+    #[test]
+    fn explains_hints() {
+        assert!(GUIDE.contains("HINTS"));
+        assert!(GUIDE.contains(crate::hints::PREFIX.trim_end()));
+    }
+
     #[test]
     fn names_every_value_the_server_accepts() {
         for r in Refinement::ALL {

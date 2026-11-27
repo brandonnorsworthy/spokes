@@ -23,6 +23,9 @@ pub struct Config {
     pub tz: chrono_tz::Tz,
     /// Nightly backups of the database file; `None` when `SPOKES_BACKUP_DIR` is unset.
     pub backup: Option<BackupConfig>,
+    /// `SPOKES_HINTS`: `0` (or `false`, `off`, `no`) removes the "Next: " hint lines from
+    /// every tool reply, for benchmarks and scripts that parse replies. Default on.
+    pub hints: bool,
 }
 
 /// The in-process backup timer (the one scheduled job in spokes).
@@ -97,6 +100,14 @@ impl Config {
                 })
             }
         };
+        let hints = match get("SPOKES_HINTS") {
+            None => true,
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => anyhow::bail!("SPOKES_HINTS '{v}' must be 1 or 0 (on or off)"),
+            },
+        };
         Ok(Config {
             bind,
             db_path,
@@ -104,6 +115,7 @@ impl Config {
             allowed_origins,
             tz,
             backup,
+            hints,
         })
     }
 }
