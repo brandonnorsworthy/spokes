@@ -17,7 +17,7 @@ use super::view::Crumb;
 use super::{ToolResult, db_err, refuse_stage, require};
 use crate::format::{due_flag, is_unplanned, parse_date, progress, short_date};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Refinement, Status, WorkType};
-use crate::text::{keywords, match_strength, normalize, trigrams};
+use crate::text::{keywords, match_strength, normalize, squash, trigrams};
 use crate::tools::args::SearchArgs;
 
 const DEFAULT_LIMIT: i64 = 10;
@@ -59,13 +59,60 @@ struct Hit {
     score: f64,
     /// Set when nothing matched the title: why this node is in the results.
     via: Option<String>,
+    /// The node's own id was typed in the query (`958`, `SPOKE-958`).
+    id_match: bool,
+    /// The keywords this node matched, in query order.
+    matched: Vec<String>,
 }
 
-/// Keywords of a query as `search` uses them (empty when it has no words).
+/// Keywords of a query as `search` uses them (empty when it has no words). A bare
+/// `spoke` that only marks the number after it (`spoke 958`) is not a keyword.
 pub(crate) fn query_keywords(query: &str) -> Vec<String> {
     let mut kws = keywords(query);
+    if query_ids_parts(query).1 {
+        kws.retain(|k| k != "spoke");
+    }
     kws.truncate(MAX_KEYWORDS);
     kws
+}
+
+/// The node ids typed in a query, in the order typed: `958`, `#958`, `SPOKE-958`,
+/// `spoke958`, or `spoke` followed by `958`.
+pub(crate) fn query_ids(query: &str) -> Vec<NodeId> {
+    query_ids_parts(query).0
+}
+
+/// [`query_ids`], plus whether a bare `spoke` word served only as an id marker.
+fn query_ids_parts(query: &str) -> (Vec<NodeId>, bool) {
+    let words: Vec<String> = query
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(|w| squash(&normalize(w)))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let number = |w: &str| -> Option<i64> {
+        (!w.is_empty() && w.len() <= 15 && w.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| w.parse().ok())
+            .flatten()
+    };
+    let mut ids: Vec<NodeId> = Vec::new();
+    let mut marker = false;
+    let mut push = |n: i64| {
+        if !ids.contains(&NodeId(n)) {
+            ids.push(NodeId(n));
+        }
+    };
+    for (i, w) in words.iter().enumerate() {
+        if w == "spoke" {
+            if words.get(i + 1).and_then(|next| number(next)).is_some() {
+                marker = true;
+            }
+            continue;
+        }
+        if let Some(n) = number(w.strip_prefix("spoke").unwrap_or(w)) {
+            push(n);
+        }
+    }
+    (ids, marker)
 }
 
 /// Ranked matches before they are formatted: shared by the MCP tool and `/api/search`.
@@ -108,11 +155,40 @@ fn find(
                 id: *id,
                 score: 0.0,
                 via: None,
+                id_match: false,
+                matched: Vec::new(),
             })
             .collect()
     } else {
         keyword_hits(conn, query, kws)?
     };
+    // A typed id is unambiguous: that node comes first, in the order typed, even when
+    // it is done or dropped (every node stays reachable by id). Scope and the type and
+    // refinement filters still apply.
+    let ids: Vec<NodeId> = query_ids(query)
+        .into_iter()
+        .filter(|id| {
+            *id != ROOT_ID
+                && meta.contains_key(id)
+                && within(&meta, *id, scope)
+                && matches_filters(&meta, *id, filters)
+        })
+        .collect();
+    hits.retain(|h| !ids.contains(&h.id));
+    let id_hits: Vec<Hit> = ids
+        .iter()
+        .map(|id| Hit {
+            id: *id,
+            score: f64::INFINITY,
+            via: Some("id".to_string()),
+            id_match: true,
+            matched: kws
+                .iter()
+                .filter(|k| k.strip_prefix("spoke").unwrap_or(k) == id.0.to_string())
+                .cloned()
+                .collect(),
+        })
+        .collect();
     let mut hidden_closed = 0;
     hits.retain(|h| {
         if h.id == ROOT_ID || !within(&meta, h.id, scope) || !matches_filters(&meta, h.id, filters)
@@ -134,6 +210,7 @@ fn find(
             })
             .then(a.id.cmp(&b.id))
     });
+    hits.splice(0..0, id_hits);
     Ok(Found {
         hits,
         hidden_closed,
@@ -300,8 +377,15 @@ pub struct ApiHit {
     pub focus: Option<usize>,
     /// Ancestors from the root down (the root included, the node itself not).
     pub path: Vec<Crumb>,
-    /// Why it matched when the title did not: `alias "nas"` or `in notes`.
+    /// Why it matched when the title did not: `alias "nas"`, `in notes` or `id`.
     pub via: Option<String>,
+    /// The node's own id was typed in the query.
+    pub id_match: bool,
+    /// The keywords (as in `keywords`) this node matched.
+    pub matched: Vec<String>,
+    /// The "show" switches (`done`, `dropped`) this request left off that hide the node
+    /// or an ancestor. Only an id match can be hidden like this.
+    pub hidden_by: Vec<&'static str>,
 }
 
 /// The `/api/search` body, apart from the common fields.
@@ -359,6 +443,9 @@ pub fn api_search(
             focus: focus.get(&hit.id).copied(),
             path,
             via: hit.via.clone(),
+            id_match: hit.id_match,
+            matched: hit.matched.clone(),
+            hidden_by: hidden_by(&meta, hit.id, include_closed, include_dropped),
         });
     }
     Ok(ApiSearch {
@@ -534,6 +621,7 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
     let mut total = 0.0;
     let mut title_hit = false;
     let mut via: Option<String> = None;
+    let mut matched: Vec<String> = Vec::new();
     let contains_phrase = |column: &str| {
         column
             .lines()
@@ -563,6 +651,7 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
             continue;
         }
         total += s;
+        matched.push(kw.clone());
         match field {
             Field::Title => title_hit = true,
             Field::Alias if via.is_none() => {
@@ -576,6 +665,8 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
         id,
         score: total,
         via: if title_hit { None } else { via },
+        id_match: false,
+        matched,
     })
 }
 
@@ -641,6 +732,24 @@ fn hidden_here_or_above(
         Status::Dropped => !include_dropped,
         _ => false,
     })
+}
+
+/// Which of `done` and `dropped` hide `id` (itself or an ancestor) for these switches.
+fn hidden_by(
+    meta: &HashMap<NodeId, Meta>,
+    id: NodeId,
+    include_done: bool,
+    include_dropped: bool,
+) -> Vec<&'static str> {
+    let statuses: Vec<Status> = lineage(meta, id).map(|(_, m)| m.status).collect();
+    let mut out = Vec::new();
+    if !include_done && statuses.contains(&Status::Done) {
+        out.push("done");
+    }
+    if !include_dropped && statuses.contains(&Status::Dropped) {
+        out.push("dropped");
+    }
+    out
 }
 
 /// The node's own level, or the nearest ancestor's.
@@ -761,6 +870,92 @@ mod tests {
         let out = search(&conn, search_args("crash bug", None, None), today()).unwrap();
         let line = out.lines().find(|l| l.contains("Crash bug")).unwrap();
         assert!(line.contains(" task bug ready "), "{line}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn first_result(out: &str) -> &str {
+        out.lines().nth(1).unwrap_or("")
+    }
+
+    #[test]
+    fn every_id_form_puts_that_node_first() {
+        let (conn, dir) = seeded("search-id-forms");
+        // Root is SPOKE-1, then Crash bug 2, Crash feature 3, Plain crash 4.
+        for q in [
+            "4", "#4", "SPOKE-4", "spoke-4", "spoke4", "SPOKE 4", "spoke #4",
+        ] {
+            let out = search(&conn, search_args(q, None, None), today()).unwrap();
+            let line = first_result(&out);
+            assert!(line.starts_with("  SPOKE-4 task"), "{q}: {out}");
+            assert!(line.ends_with("(id)"), "{q}: {line}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn id_comes_before_text_matches_and_text_still_follows() {
+        let (conn, dir) = seeded("search-id-text");
+        let out = search(&conn, search_args("crash 3", None, None), today()).unwrap();
+        assert!(out.starts_with("3 matches for crash, 3:"), "{out}");
+        assert!(first_result(&out).starts_with("  SPOKE-3 "), "{out}");
+        // Two ids keep the order typed.
+        let out = search(&conn, search_args("4 2", None, None), today()).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines[1].starts_with("  SPOKE-4 ") && lines[2].starts_with("  SPOKE-2 "),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spoke_marker_is_not_searched_as_a_word() {
+        assert_eq!(query_keywords("spoke 958"), vec!["958"]);
+        assert_eq!(query_keywords("SPOKE-958"), vec!["spoke958"]);
+        assert_eq!(query_keywords("spoke wheel"), vec!["spoke", "wheel"]);
+        assert_eq!(
+            query_ids("spoke 958, #12 SPOKE-7 x9 958"),
+            vec![NodeId(958), NodeId(12), NodeId(7)]
+        );
+        assert!(query_ids("spokes 958x 1234567890123456").is_empty());
+    }
+
+    #[test]
+    fn unknown_id_and_root_fall_back_to_text() {
+        let (conn, dir) = seeded("search-id-missing");
+        let out = search(&conn, search_args("999", None, None), today()).unwrap();
+        assert!(out.starts_with("No matches for 999."), "{out}");
+        let out = search(&conn, search_args("1", None, None), today()).unwrap();
+        assert!(!out.contains("SPOKE-1 "), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn closed_node_is_found_by_id_but_not_by_text() {
+        let (conn, dir) = seeded("search-id-closed");
+        conn.execute("UPDATE nodes SET status = 'done' WHERE id = 3", [])
+            .unwrap();
+        let out = search(&conn, search_args("3", None, None), today()).unwrap();
+        assert!(
+            first_result(&out).starts_with("  SPOKE-3 task done "),
+            "{out}"
+        );
+        let out = search(&conn, search_args("crash", None, None), today()).unwrap();
+        assert!(!out.contains("SPOKE-3 "), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn id_respects_scope_and_filters() {
+        let (conn, dir) = seeded("search-id-scope");
+        let mut a = search_args("3", None, None);
+        a.scope = Some(crate::model::IdArg::Number(2));
+        let out = search(&conn, a, today()).unwrap();
+        assert!(!out.contains("SPOKE-3 "), "{out}");
+        let out = search(&conn, search_args("3", Some("bug"), None), today()).unwrap();
+        assert!(!out.contains("SPOKE-3 "), "{out}");
+        let out = search(&conn, search_args("3", Some("feature"), None), today()).unwrap();
+        assert!(first_result(&out).starts_with("  SPOKE-3 "), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

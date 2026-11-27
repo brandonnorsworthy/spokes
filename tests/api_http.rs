@@ -1688,6 +1688,58 @@ async fn search_finds_by_typo_alias_and_notes_with_paths() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn search_finds_a_node_by_its_id() {
+    let dir = temp_dir("search-id");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    m.add(None, json!({"title": "Projects", "kind": "area"}))
+        .await;
+    let projects = id_of(&path, "Projects");
+    m.add(Some(projects), json!({"title": "Finished thing"}))
+        .await;
+    let done = id_of(&path, "Finished thing");
+    m.add(
+        Some(projects),
+        json!({"title": "Mentions it", "notes": format!("see SPOKE-{done}")}),
+    )
+    .await;
+    m.ok("set_status", json!({"ids": [sid(done)], "status": "done"}))
+        .await;
+
+    for q in [
+        format!("{done}"),
+        format!("SPOKE-{done}"),
+        format!("spoke%20{done}"),
+        format!("%23{done}"),
+    ] {
+        let v = m.get(&format!("/api/search?q={q}"), &[]).await.json();
+        let first = &v["results"][0];
+        assert_eq!(first["id"].as_i64(), Some(done), "{q}: {v}");
+        assert_eq!(first["id_match"], true);
+        assert_eq!(first["via"], "id");
+        assert_eq!(first["status"], "done");
+        assert_eq!(first["hidden_by"], json!(["done"]));
+        assert_eq!(v["hidden_closed"], 0, "an id hit is not counted as hidden");
+    }
+    let v = m
+        .get(&format!("/api/search?q={done}&include_closed=true"), &[])
+        .await
+        .json();
+    assert_eq!(v["results"][0]["hidden_by"], json!([]));
+    // Text matches follow the id hit and carry their matched keywords.
+    let v = m
+        .get(&format!("/api/search?q=SPOKE-{done}"), &[])
+        .await
+        .json();
+    assert_eq!(v["results"][1]["id_match"], false);
+    assert_eq!(v["results"][1]["matched"], json!([format!("spoke{done}")]));
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn ids_of_results(v: &Value) -> Vec<i64> {
     v["results"]
         .as_array()
