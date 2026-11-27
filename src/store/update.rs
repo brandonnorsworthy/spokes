@@ -8,8 +8,8 @@ use super::add::{
     clean_recur_change, clean_source, clean_title, clean_updated, recur_step_error,
 };
 use super::{
-    ToolResult, children, clean_agent, db_err, log_event, refuse_stage, renew_leases, require,
-    touch,
+    ToolResult, ancestors, children, clean_agent, db_err, log_event, refuse_stage, renew_leases,
+    require, touch,
 };
 use crate::db::now;
 use crate::model::{Kind, Refinement, Status, WorkType};
@@ -255,9 +255,29 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     log_event(&tx, id, &now, agent.as_deref(), "updated", &detail).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
     renew_leases(&tx, id, agent.as_deref(), &now).map_err(db_err)?;
-    let title = require(&tx, id)?.title;
+    let after = require(&tx, id)?;
+    let mut reply = format!("Updated {id}  {}  ({detail})", after.title);
+    if args.notes_append.is_some() {
+        let held_above = agent.as_deref().is_some_and(|a| {
+            ancestors(&tx, id).is_ok_and(|up| {
+                up.iter().any(|n| {
+                    n.status == Status::InProgress
+                        && n.claimed_by.as_deref() == Some(a)
+                        && n.claim_expires.as_deref() > Some(now.as_str())
+                })
+            })
+        });
+        let action = crate::hints::Action::NotesAppended {
+            node: &after,
+            held_above,
+        };
+        if let Some(line) = crate::hints::hint(&action) {
+            reply.push('\n');
+            reply.push_str(&line);
+        }
+    }
     tx.commit().map_err(db_err)?;
-    Ok(format!("Updated {id}  {title}  ({detail})"))
+    Ok(reply)
 }
 
 /// Only tasks repeat, and never as a step of an ordered parent (see `recur_step_error`).
@@ -584,7 +604,10 @@ mod tests {
 
         // Append with no existing notes.
         let out = up(&mut conn, json!({"id": 2, "notes_append": "  first  "})).unwrap();
-        assert_eq!(out, "Updated SPOKE-2  Task  (notes appended)");
+        assert_eq!(
+            out,
+            "Updated SPOKE-2  Task  (notes appended)\nNext: Recording progress? Claim it so other agents skip it."
+        );
         assert_eq!(notes_row(&conn, 2).as_deref(), Some("first"));
 
         // Append onto existing notes.

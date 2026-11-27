@@ -324,7 +324,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan."
+            "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan. Claim it before starting."
         );
         let out = set_status(
             &mut conn,
