@@ -1770,6 +1770,33 @@ async fn search_match_modes() {
     assert_eq!(v["match"], "any");
     assert_eq!(v["total"], 2);
 
+    // Paging: offset slices the same ranking; total stays the whole count.
+    let p0 = m
+        .get("/api/search?q=tile&match=any&limit=1", &[])
+        .await
+        .json();
+    let p1 = m
+        .get("/api/search?q=tile&match=any&limit=1&offset=1", &[])
+        .await
+        .json();
+    assert_eq!(p0["offset"], 0);
+    assert_eq!(p1["offset"], 1);
+    assert_eq!(p0["total"], 2);
+    assert_eq!(p1["total"], 2);
+    assert_ne!(ids_of_results(&p0), ids_of_results(&p1));
+    let past = m.get("/api/search?q=tile&offset=99", &[]).await.json();
+    assert_eq!(past["results"], json!([]));
+    let all = m
+        .get("/api/search?q=duplicate%20tile&match=all&offset=1", &[])
+        .await
+        .json();
+    assert_eq!(all["results"], json!([]));
+    assert_eq!(all["total"], 1);
+    for bad in ["offset=-1", "offset=10001", "offset=x", "offset=1&offset=2"] {
+        let r = m.get(&format!("/api/search?q=tile&{bad}"), &[]).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
     for bad in ["match=most", "match=", "match=all&match=any"] {
         let r = m.get(&format!("/api/search?q=tile&{bad}"), &[]).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
