@@ -136,6 +136,12 @@ pub fn claim(conn: &mut Connection, args: ClaimArgs, tz: Tz) -> ToolResult {
         reply.push('\n');
         reply.push_str(&line);
     }
+    if !renewed
+        && let Some(line) = crate::hints::hint(&crate::hints::Action::Claimed { node: &before })
+    {
+        reply.push('\n');
+        reply.push_str(&line);
+    }
     log_event(&tx, id, &now, Some(&agent), "claimed", &detail).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
@@ -220,7 +226,7 @@ fn refusal(
         ));
     }
     if let Some(line) = held_by_other(node, agent, now, tz) {
-        return Ok(line);
+        return with_other_work(conn, node, line);
     }
     let below: Option<(i64, String, String, String)> = conn
         .query_row(
@@ -237,15 +243,39 @@ fn refusal(
         .optional()
         .map_err(db_err)?;
     if let Some((did, title, who, until)) = below {
-        return Ok(format!(
+        let line = format!(
             "{} {title} under {id} is claimed by {who} until {}. Claim a different step, or ask the user.",
             NodeId(did),
             clock(&until, tz)
-        ));
+        );
+        return with_other_work(conn, node, line);
     }
     Ok(format!(
         "{id} could not be claimed just now. Run next and pick again."
     ))
+}
+
+/// A refusal over someone else's claim, ending with where to find other work (SPOKE-1079).
+/// The parent is named only when it has another open task that `next` could offer; the
+/// steps of an ordered parent wait for the held one, so they don't count.
+fn with_other_work(conn: &Connection, node: &Node, line: String) -> Result<String, String> {
+    let scope = match node.parent_id {
+        Some(pid) => {
+            let parent = require(conn, pid)?;
+            let other = children(conn, pid)?
+                .iter()
+                .any(|c| c.id != node.id && c.kind == Kind::Task && c.status == Status::Open);
+            (parent.parent_id.is_some() && !parent.ordered && other).then_some(parent)
+        }
+        None => None,
+    };
+    let action = crate::hints::Action::ClaimRefused {
+        scope: scope.as_ref(),
+    };
+    Ok(match crate::hints::hint(&action) {
+        Some(hint) => format!("{line}\n{hint}"),
+        None => line,
+    })
 }
 
 fn live_other(n: &Node, agent: &str, now: &str) -> bool {

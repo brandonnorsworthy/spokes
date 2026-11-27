@@ -49,6 +49,11 @@ pub enum Action<'a> {
         unaliased: &'a [NodeId],
         first_step: Option<&'a Node>,
     },
+    /// `claim` took `node`.
+    Claimed { node: &'a Node },
+    /// `claim` lost because another agent holds the node or something under it.
+    /// `scope` is its parent task or area, when that has other work nobody holds.
+    ClaimRefused { scope: Option<&'a Node> },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -85,6 +90,20 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             unaliased,
             first_step,
         } => added(top, unaliased, *first_step)?,
+        // With notes, the claim reply already says to read them, which shows the source too.
+        Action::Claimed { node } => (node.has_source && !node.has_notes).then(|| {
+            format!(
+                "{} has the user's own words: read them (get notes: true) before starting.",
+                node.id
+            )
+        })?,
+        Action::ClaimRefused { scope } => match scope {
+            Some(p) => format!(
+                "Call next with scope {} for other work under {}.",
+                p.id, p.title
+            ),
+            None => "Call next to find other open work.".to_string(),
+        },
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -560,6 +579,40 @@ mod tests {
             first_step: None,
         };
         assert_eq!(hint(&action), None);
+    }
+
+    #[test]
+    fn claim_points_at_source_only_when_the_reply_does_not() {
+        let spoken = Node {
+            has_source: true,
+            ..node(4, "Idea")
+        };
+        assert_eq!(
+            hint(&Action::Claimed { node: &spoken }).as_deref(),
+            Some(
+                "Next: SPOKE-4 has the user's own words: read them (get notes: true) before starting."
+            )
+        );
+        let noted = Node {
+            has_notes: true,
+            ..spoken
+        };
+        for n in [&noted, &node(5, "Plain")] {
+            assert_eq!(hint(&Action::Claimed { node: n }), None);
+        }
+    }
+
+    #[test]
+    fn claim_refusal_says_where_other_work_is() {
+        let p = parent(false, 0, 2);
+        assert_eq!(
+            hint(&Action::ClaimRefused { scope: Some(&p) }).as_deref(),
+            Some("Next: Call next with scope SPOKE-2 for other work under Plan.")
+        );
+        assert_eq!(
+            hint(&Action::ClaimRefused { scope: None }).as_deref(),
+            Some("Next: Call next to find other open work.")
+        );
     }
 
     #[test]
