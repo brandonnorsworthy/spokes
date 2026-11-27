@@ -226,7 +226,7 @@ fn refusal(
         ));
     }
     if let Some(line) = held_by_other(node, agent, now, tz) {
-        return with_other_work(conn, node, line);
+        return with_other_work(conn, node, line, tz);
     }
     let below: Option<(i64, String, String, String)> = conn
         .query_row(
@@ -248,7 +248,7 @@ fn refusal(
             NodeId(did),
             clock(&until, tz)
         );
-        return with_other_work(conn, node, line);
+        return with_other_work(conn, node, line, tz);
     }
     Ok(format!(
         "{id} could not be claimed just now. Run next and pick again."
@@ -257,14 +257,19 @@ fn refusal(
 
 /// A refusal over someone else's claim, ending with where to find other work (SPOKE-1079).
 /// The parent is named only when it has another open task that `next` could offer; the
-/// steps of an ordered parent wait for the held one, so they don't count.
-fn with_other_work(conn: &Connection, node: &Node, line: String) -> Result<String, String> {
+/// steps of an ordered parent wait for the held one, and a deferred task is hidden, so
+/// neither counts.
+fn with_other_work(conn: &Connection, node: &Node, line: String, tz: Tz) -> Result<String, String> {
+    let today = today_in(tz).to_string();
     let scope = match node.parent_id {
         Some(pid) => {
             let parent = require(conn, pid)?;
-            let other = children(conn, pid)?
-                .iter()
-                .any(|c| c.id != node.id && c.kind == Kind::Task && c.status == Status::Open);
+            let other = children(conn, pid)?.iter().any(|c| {
+                c.id != node.id
+                    && c.kind == Kind::Task
+                    && c.status == Status::Open
+                    && c.defer_until.as_deref().is_none_or(|d| d <= today.as_str())
+            });
             (parent.parent_id.is_some() && !parent.ordered && other).then_some(parent)
         }
         None => None,

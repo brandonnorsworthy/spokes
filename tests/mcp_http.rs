@@ -3046,6 +3046,25 @@ async fn claim_hints_at_source_and_at_other_work_over_http() {
         "{out}"
     );
 
+    // A parent whose only other task is deferred is not worth pointing at.
+    let bag = add_node(
+        &mcp,
+        json!({"title": "Chores", "children": [
+            {"title": "Dishes"}, {"title": "Gutters", "defer_until": "2999-01-01"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": bag})).await;
+    let dishes = first_id(line_with(&g, "Dishes"));
+    mcp.ok("claim", json!({"id": dishes, "agent": "w1"})).await;
+    let (out, failed) = mcp
+        .call("claim", json!({"id": dishes, "agent": "w2"}))
+        .await;
+    assert!(failed, "{out}");
+    assert!(
+        out.ends_with("\nNext: Call next to find other open work."),
+        "{out}"
+    );
+
     // An ordered parent has nothing else to offer while its step is held.
     let plan = add_node(
         &mcp,
