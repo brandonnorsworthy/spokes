@@ -3,7 +3,8 @@
 use rusqlite::{Connection, params};
 
 use super::{
-    ToolResult, children, clean_agent, db_err, load, log_event, renew_leases, require, touch,
+    ToolResult, ancestors, children, clean_agent, db_err, load, log_event, renew_leases, require,
+    touch,
 };
 use chrono::NaiveDate;
 
@@ -83,6 +84,11 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs, today: NaiveDate) 
             }
         }
     }
+    if target == Status::Dropped
+        && let Some(line) = dropped_hint(&tx, &changed)?
+    {
+        lines.push(line);
+    }
     tx.commit().map_err(db_err)?;
 
     let text = lines.join("\n");
@@ -91,6 +97,42 @@ pub fn set_status(conn: &mut Connection, args: SetStatusArgs, today: NaiveDate) 
     } else {
         Ok(text)
     }
+}
+
+/// Unfinished work left under the nodes this call dropped (SPOKE-1079). Read after every
+/// id has changed, so a child dropped in the same call is not named; a node dropped
+/// beneath another one in the call is covered by that one's entry.
+fn dropped_hint(conn: &Connection, dropped: &[Box<Node>]) -> Result<Option<String>, String> {
+    let mut leftovers = Vec::new();
+    for node in dropped {
+        if ancestors(conn, node.id)?
+            .iter()
+            .any(|a| dropped.iter().any(|d| d.id == a.id))
+        {
+            continue;
+        }
+        let mut open = Vec::new();
+        open_below(conn, node.id, &mut open)?;
+        if !open.is_empty() {
+            leftovers.push(((**node).clone(), open));
+        }
+    }
+    let action = hints::Action::DroppedWithOpen {
+        leftovers: &leftovers,
+    };
+    Ok(hints::hint(&action))
+}
+
+/// Every unfinished node beneath `id`, in tree order, looking through closed ones too.
+fn open_below(conn: &Connection, id: NodeId, out: &mut Vec<Node>) -> Result<(), String> {
+    for child in children(conn, id)? {
+        let child_id = child.id;
+        if !child.status.is_closed() {
+            out.push(child);
+        }
+        open_below(conn, child_id, out)?;
+    }
+    Ok(())
 }
 
 enum Outcome {
