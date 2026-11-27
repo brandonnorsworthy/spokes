@@ -1493,10 +1493,11 @@ async fn two_agents_get_different_tasks_over_http() {
         json!({"id": "SPOKE-3", "agent": "sonnet-blue"}),
     )
     .await;
+    // The second line says where other work is (SPOKE-1079).
     assert_eq!(
         e,
         format!(
-            "SPOKE-3 is claimed by opus-red until {until}. Pick another task, or ask the user."
+            "SPOKE-3 is claimed by opus-red until {until}. Pick another task, or ask the user.\nNext: Call next with scope SPOKE-2 for other work under Work."
         )
     );
     // Red claiming again renews its own lease.
@@ -3013,5 +3014,52 @@ async fn add_hints_at_loose_ends_over_http() {
         ),
         "{out}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `claim` points at the user's own words when nothing else in the reply does, and a
+/// refusal says where other work is (SPOKE-1079).
+#[tokio::test]
+async fn claim_hints_at_source_and_at_other_work_over_http() {
+    let dir = temp_dir("hint-claim");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let idea = add_node(&mcp, json!({"title": "Idea", "source": "make it so"})).await;
+    let out = mcp.ok("claim", json!({"id": idea, "agent": "w1"})).await;
+    assert!(
+        out.ends_with(&format!(
+            "\nNext: {idea} has the user's own words: read them (get notes: true) before starting."
+        )),
+        "{out}"
+    );
+    // A renewal says nothing; under the root a refusal points at plain next.
+    let out = mcp.ok("claim", json!({"id": idea, "agent": "w1"})).await;
+    assert!(!out.contains("Next: "), "{out}");
+    let (out, failed) = mcp.call("claim", json!({"id": idea, "agent": "w2"})).await;
+    assert!(failed, "{out}");
+    assert!(
+        out.ends_with("\nNext: Call next to find other open work."),
+        "{out}"
+    );
+
+    // An ordered parent has nothing else to offer while its step is held.
+    let plan = add_node(
+        &mcp,
+        json!({"title": "Deploy", "ordered": true,
+               "children": [{"title": "Map"}, {"title": "Write"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": plan})).await;
+    let map = first_id(line_with(&g, "Map"));
+    mcp.ok("claim", json!({"id": map, "agent": "w1"})).await;
+    for id in [&map, &plan] {
+        let (out, failed) = mcp.call("claim", json!({"id": id, "agent": "w2"})).await;
+        assert!(failed, "{out}");
+        assert!(
+            out.ends_with("\nNext: Call next to find other open work."),
+            "{out}"
+        );
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
