@@ -1804,9 +1804,10 @@ async fn ask_answer_and_stalled_leases_over_http() {
             json!({"id": 3, "agent": "sonnet-2", "question": "Install to D: or E:?"}),
         )
         .await;
+    // The second line is the ask hint (SPOKE-1079).
     assert_eq!(
         out,
-        "SPOKE-3 Set up emulator is waiting on the user: \"Install to D: or E:?\". It is at the top of next under NEEDS YOU. Stop work on it until it is answered."
+        "SPOKE-3 Set up emulator is waiting on the user: \"Install to D: or E:?\". It is at the top of next under NEEDS YOU. Stop work on it until it is answered.\nNext: When the user replies, record it with answer on SPOKE-3."
     );
     let conn = db(&path);
     conn.execute(
@@ -3101,5 +3102,27 @@ async fn release_without_a_note_asks_for_one_over_http() {
         )
         .await;
     assert!(!out.contains("Next: "), "{out}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `ask` says how to record the user's reply (SPOKE-1079).
+#[tokio::test]
+async fn ask_hints_to_record_the_reply_over_http() {
+    let dir = temp_dir("hint-ask");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+    let task = add_node(&mcp, json!({"title": "Install"})).await;
+    let out = mcp
+        .ok(
+            "ask",
+            json!({"id": task, "agent": "w1", "question": "D: or E:?"}),
+        )
+        .await;
+    assert!(
+        out.ends_with(&format!(
+            "\nNext: When the user replies, record it with answer on {task}."
+        )),
+        "{out}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
