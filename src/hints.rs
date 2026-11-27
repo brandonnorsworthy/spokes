@@ -29,6 +29,15 @@ pub enum Action<'a> {
     /// `update` appended to the notes of `node`. `held_above` is true when the calling
     /// agent holds a live claim on an ancestor (an orchestrator writing a plan).
     NotesAppended { node: &'a Node, held_above: bool },
+    /// `claim` took `parent`, a task with children (SPOKE-692). `open` are its open
+    /// children in tree order (for an ordered parent, empty unless its first unfinished
+    /// step is open); `held_below` is true when the claiming agent already holds
+    /// a live claim on a descendant.
+    ParentClaimed {
+        parent: &'a Node,
+        open: &'a [Node],
+        held_below: bool,
+    },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -37,6 +46,8 @@ pub const CLAIM_ON_READ: &str = "Working on this? Claim it first (that marks it 
 pub const CLAIM_FROM_QUEUE: &str = "Claim the one you pick before starting.";
 /// After appending notes to a task nobody holds.
 pub const CLAIM_ON_NOTES: &str = "Recording progress? Claim it so other agents skip it.";
+/// How many open children the claim-on-parent hint names before "+N more".
+const LISTED_CHILDREN: usize = 3;
 
 /// The hint for an action, as one line starting with [`PREFIX`], or `None` when the state
 /// does not call for one.
@@ -52,6 +63,11 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             (unheld_task(node) && !*held_above && !has_open_children(node))
                 .then(|| CLAIM_ON_NOTES.to_string())?
         }
+        Action::ParentClaimed {
+            parent,
+            open,
+            held_below,
+        } => parent_claimed(parent, open, *held_below)?,
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -75,6 +91,36 @@ fn step_closed(parent: &Node, next_step: Option<&Node>) -> Option<String> {
     Some(format!(
         "{} {}, the next step of {} {}.{claim}",
         step.id, step.title, parent.id, parent.title
+    ))
+}
+
+/// Claiming a parent: the work is usually in one subtask, which should be claimed too. A
+/// claim inside the caller's own claim is allowed, so this never leads to a refusal.
+fn parent_claimed(parent: &Node, open: &[Node], held_below: bool) -> Option<String> {
+    if held_below || open.is_empty() || parent.kind != Kind::Task {
+        return None;
+    }
+    let n = open.len();
+    let subtasks = if n == 1 { "subtask" } else { "subtasks" };
+    let which = if parent.ordered {
+        // The caller passes nothing when the first unfinished step is not open, so the
+        // first open child is the next step.
+        let first = &open[0];
+        format!("the next step is {} {}", first.id, first.title)
+    } else {
+        let mut names: Vec<String> = open
+            .iter()
+            .take(LISTED_CHILDREN)
+            .map(|c| format!("{} {}", c.id, c.title))
+            .collect();
+        if n > LISTED_CHILDREN {
+            names.push(format!("+{} more", n - LISTED_CHILDREN));
+        }
+        names.join(", ")
+    };
+    Some(format!(
+        "{} has {n} open {subtasks} ({which}). Working on one? Claim that one too. Orchestrating? Keep this claim; workers can claim their own subtasks inside it.",
+        parent.id
     ))
 }
 
@@ -286,6 +332,65 @@ mod tests {
             held_above: false,
         };
         assert_eq!(hint(&action), None);
+    }
+
+    #[test]
+    fn parent_claim_names_the_next_step_of_an_ordered_parent() {
+        let p = parent(true, 1, 3);
+        let open = [node(4, "Two"), node(5, "Three")];
+        let h = hint(&Action::ParentClaimed {
+            parent: &p,
+            open: &open,
+            held_below: false,
+        });
+        assert_eq!(
+            h.as_deref(),
+            Some(
+                "Next: SPOKE-2 has 2 open subtasks (the next step is SPOKE-4 Two). Working on one? Claim that one too. Orchestrating? Keep this claim; workers can claim their own subtasks inside it."
+            )
+        );
+    }
+
+    #[test]
+    fn parent_claim_lists_up_to_three_open_children() {
+        let p = parent(false, 0, 5);
+        let open: Vec<Node> = (4..9).map(|i| node(i, &format!("C{i}"))).collect();
+        let h = hint(&Action::ParentClaimed {
+            parent: &p,
+            open: &open,
+            held_below: false,
+        })
+        .unwrap();
+        assert!(
+            h.starts_with(
+                "Next: SPOKE-2 has 5 open subtasks (SPOKE-4 C4, SPOKE-5 C5, SPOKE-6 C6, +2 more). "
+            ),
+            "{h}"
+        );
+        let one = hint(&Action::ParentClaimed {
+            parent: &p,
+            open: &open[..1],
+            held_below: false,
+        })
+        .unwrap();
+        assert!(
+            one.starts_with("Next: SPOKE-2 has 1 open subtask (SPOKE-4 C4). "),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn parent_claim_silent_without_open_children_or_when_already_holding_one() {
+        let p = parent(false, 0, 2);
+        let open = [node(4, "Two")];
+        for (open, held_below) in [(&open[..], true), (&[][..], false)] {
+            let action = Action::ParentClaimed {
+                parent: &p,
+                open,
+                held_below,
+            };
+            assert_eq!(hint(&action), None);
+        }
     }
 
     #[test]
