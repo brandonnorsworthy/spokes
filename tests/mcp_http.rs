@@ -27,6 +27,10 @@ async fn start(db_path: &Path) -> Server {
 }
 
 async fn start_tz(db_path: &Path, tz: chrono_tz::Tz) -> Server {
+    start_with(db_path, tz, true).await
+}
+
+async fn start_with(db_path: &Path, tz: chrono_tz::Tz, hints: bool) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = Config {
@@ -36,6 +40,7 @@ async fn start_tz(db_path: &Path, tz: chrono_tz::Tz) -> Server {
         allowed_origins: Vec::new(),
         tz,
         backup: None,
+        hints,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -285,6 +290,46 @@ async fn walking_skeleton_over_http() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `SPOKES_HINTS=0`: the same state change gives no "Next: " line, and the rest of the
+/// reply is unchanged (SPOKE-1078).
+#[tokio::test]
+async fn hints_off_over_http() {
+    let dir = temp_dir("hints-off");
+    let db = dir.join("spokes.db");
+    for hints in [true, false] {
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = start_with(&db, chrono_tz::UTC, hints).await;
+        let mcp = Mcp::new(server.addr);
+        mcp.ok(
+            "add",
+            json!({"title": "Plan", "ordered": true,
+                   "children": [{"title": "One"}, {"title": "Two"}]}),
+        )
+        .await; // SPOKE-2..4
+        let first = mcp
+            .ok("set_status", json!({"ids": ["SPOKE-3"], "status": "done"}))
+            .await;
+        let last = mcp
+            .ok("set_status", json!({"ids": ["SPOKE-4"], "status": "done"}))
+            .await;
+        if hints {
+            assert_eq!(
+                first,
+                "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan."
+            );
+            assert!(
+                last.starts_with("SPOKE-4 done  Two\nNext: All steps of SPOKE-2 Plan are done."),
+                "{last}"
+            );
+        } else {
+            assert_eq!(first, "SPOKE-3 done  One");
+            assert_eq!(last, "SPOKE-4 done  Two");
+        }
+        server.shutdown().await;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The M1 "done when": a six-step plan is written and walked in three calls, then
 /// move, update and notes round-trip and the tree's error paths answer usefully.
 #[tokio::test]
@@ -339,7 +384,7 @@ async fn tree_over_http() {
     assert_eq!(
         mcp.ok("set_status", json!({"ids": ["SPOKE-6"], "status": "done"}))
             .await,
-        "SPOKE-6 done  Map the pipeline\nNext step of SPOKE-5 Deploy game to production: SPOKE-7 Write the pipeline"
+        "SPOKE-6 done  Map the pipeline\nNext: SPOKE-7 Write the pipeline, the next step of SPOKE-5 Deploy game to production."
     );
     let walked = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
     assert!(walked.contains("(1/6)"), "{walked}");
@@ -547,7 +592,7 @@ async fn tree_over_http() {
         )
         .await;
     assert!(
-        done.ends_with("All steps of SPOKE-5 Deploy game to production are done. If it is finished too, mark it done with set_status."),
+        done.ends_with("Next: All steps of SPOKE-5 Deploy game to production are done. If it is finished too, mark it done with set_status."),
         "{done}"
     );
     let parent = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
@@ -2410,7 +2455,7 @@ async fn orchestrator_workers_and_local_history_over_http() {
 }
 
 /// M4 retro: a worker finishing a step inside an ordered project that the orchestrator
-/// holds claimed gets the same "Next step of ..." hint as in an unclaimed project.
+/// holds claimed gets the same "Next: ..., the next step of ..." hint as in an unclaimed project.
 #[tokio::test]
 async fn next_step_hint_inside_a_claimed_project_over_http() {
     let dir = temp_dir("hint-claimed");
@@ -2446,7 +2491,7 @@ async fn next_step_hint_inside_a_claimed_project_over_http() {
             .await;
         assert!(
             out.ends_with(&format!(
-                "\nNext step of {proj} Deploy: {next} {}",
+                "\nNext: {next} {}, the next step of {proj} Deploy.",
                 if next == &write { "Write" } else { "Secrets" }
             )),
             "{out}"
@@ -2460,7 +2505,7 @@ async fn next_step_hint_inside_a_claimed_project_over_http() {
         )
         .await;
     assert!(
-        out.ends_with(&format!("All steps of {proj} Deploy are done. If it is finished too, mark it done with set_status.")),
+        out.ends_with(&format!("Next: All steps of {proj} Deploy are done. If it is finished too, mark it done with set_status.")),
         "{out}"
     );
 
