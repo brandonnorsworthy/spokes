@@ -61,6 +61,19 @@ pub enum Action<'a> {
     Asked { node: &'a Node },
     /// `answer` recorded the reply and reopened `node`.
     Answered { node: &'a Node },
+    /// `move` changed the children of these parents (the old one and/or the new one).
+    Moved { parents: &'a [Reordered<'a>] },
+}
+
+/// A parent whose children a move changed, read after the move.
+pub struct Reordered<'a> {
+    pub parent: &'a Node,
+    /// Its first unfinished child before the move.
+    pub step_before: Option<NodeId>,
+    /// Its first unfinished child now.
+    pub step_now: Option<&'a Node>,
+    /// The moved node was unfinished and left this parent.
+    pub lost_open: bool,
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -124,19 +137,53 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
         Action::Answered { node } => {
             format!("Claim {} before continuing the work.", node.id)
         }
+        Action::Moved { parents } => moved(parents)?,
     };
     Some(format!("{PREFIX}{text}"))
+}
+
+/// A move matters when it changes which step of an ordered task comes next, or takes the
+/// last unfinished child away from a task.
+fn moved(parents: &[Reordered<'_>]) -> Option<String> {
+    let parts: Vec<String> = parents
+        .iter()
+        .filter_map(|r| {
+            let p = r.parent;
+            if p.kind != Kind::Task || p.status.is_closed() {
+                return None;
+            }
+            if r.lost_open && all_done(p) {
+                return Some(all_steps_done(p));
+            }
+            let step = r.step_now.filter(|_| p.ordered)?;
+            (r.step_before != Some(step.id)).then(|| {
+                format!(
+                    "The next step of {} {} is now {} {}.",
+                    p.id, p.title, step.id, step.title
+                )
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn all_done(parent: &Node) -> bool {
+    parent.child_total > 0 && parent.child_done == parent.child_total
+}
+
+fn all_steps_done(parent: &Node) -> String {
+    format!(
+        "All steps of {} {} are done. If it is finished too, mark it done with set_status.",
+        parent.id, parent.title
+    )
 }
 
 fn step_closed(parent: &Node, next_step: Option<&Node>) -> Option<String> {
     if parent.kind != Kind::Task || parent.status.is_closed() {
         return None;
     }
-    if parent.child_total > 0 && parent.child_done == parent.child_total {
-        return Some(format!(
-            "All steps of {} {} are done. If it is finished too, mark it done with set_status.",
-            parent.id, parent.title
-        ));
+    if all_done(parent) {
+        return Some(all_steps_done(parent));
     }
     let step = next_step.filter(|_| parent.ordered)?;
     let claim = if unheld_task(step) && !has_open_children(step) {
@@ -671,6 +718,66 @@ mod tests {
             hint(&Action::Answered { node: &t }).as_deref(),
             Some("Next: Claim SPOKE-4 before continuing the work.")
         );
+    }
+
+    #[test]
+    fn move_names_a_new_next_step_and_a_parent_left_finished() {
+        let ordered = parent(true, 0, 2);
+        let step = node(5, "Five");
+        let emptied = Node {
+            id: NodeId(3),
+            ..parent(false, 1, 1)
+        };
+        let both = [
+            Reordered {
+                parent: &emptied,
+                step_before: None,
+                step_now: None,
+                lost_open: true,
+            },
+            Reordered {
+                parent: &ordered,
+                step_before: Some(NodeId(4)),
+                step_now: Some(&step),
+                lost_open: false,
+            },
+        ];
+        assert_eq!(
+            hint(&Action::Moved { parents: &both }).as_deref(),
+            Some(
+                "Next: All steps of SPOKE-3 Plan are done. If it is finished too, mark it done with set_status. The next step of SPOKE-2 Plan is now SPOKE-5 Five."
+            )
+        );
+    }
+
+    #[test]
+    fn move_is_silent_when_nothing_to_act_on_changed() {
+        let ordered = parent(true, 0, 2);
+        let unordered = parent(false, 0, 2);
+        let finished = parent(false, 1, 1);
+        let area = Node {
+            kind: Kind::Area,
+            ..parent(true, 0, 2)
+        };
+        let step = node(5, "Five");
+        let cases = [
+            // Same next step as before.
+            (&ordered, Some(NodeId(5)), false),
+            // Order means nothing here.
+            (&unordered, Some(NodeId(4)), false),
+            (&area, Some(NodeId(4)), false),
+            // It was already finished: the move took nothing unfinished away.
+            (&finished, None, false),
+        ];
+        for (parent, step_before, lost_open) in cases {
+            let one = [Reordered {
+                parent,
+                step_before,
+                step_now: Some(&step),
+                lost_open,
+            }];
+            assert_eq!(hint(&Action::Moved { parents: &one }), None);
+        }
     }
 
     #[test]

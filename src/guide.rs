@@ -53,8 +53,12 @@ HINTS
   step of an ordered parent, or that all steps are done so the parent can be closed; on get, next and
   notes_append, a reminder to claim an open task nobody holds before working on it (claim sets
   in_progress; there is no set_status in_progress); on claim of a task with open children, their ids,
-  so you claim the subtask you are working on too. It appears only when the state calls for it.
-  Follow it unless you know better; it never repeats what you just did.
+  so you claim the subtask you are working on too, or the user's own words to read; on a refused claim,
+  where to find other work. After other writes: on add, the first step of a plan, a task left under the
+  root and tasks without aliases; on release with nothing written down, a hand-off note to add; on ask
+  and answer, the call that comes next; on move, a changed next step or a parent left finished; on
+  set_status dropped, unfinished work still under the node. It appears only when the state calls for
+  it. Follow it unless you know better; it never repeats what you just did.
 
 SEARCHING
   Several keywords at once, as alternatives. A typed id (958, #958, SPOKE-958) puts that node first,

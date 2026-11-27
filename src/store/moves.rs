@@ -6,7 +6,8 @@ use super::{
     ToolResult, ancestors, children, clean_agent, db_err, log_event, renew_leases, require, touch,
 };
 use crate::db::{now, position};
-use crate::model::{Kind, Node, Status};
+use crate::hints::{self, Reordered};
+use crate::model::{Kind, Node, NodeId, Status};
 use crate::tools::args::MoveArgs;
 
 pub fn move_node(conn: &mut Connection, args: MoveArgs) -> ToolResult {
@@ -88,6 +89,12 @@ pub fn move_node(conn: &mut Connection, args: MoveArgs) -> ToolResult {
         ));
     }
 
+    // The parents the move touches, and the step each was waiting on, for the hint.
+    let mut touched = vec![(old_parent, next_step(&tx, old_parent)?)];
+    if target.id != old_parent {
+        touched.push((target.id, next_step(&tx, target.id)?));
+    }
+
     let siblings: Vec<Node> = children(&tx, target.id)?
         .into_iter()
         .filter(|s| s.id != id)
@@ -131,20 +138,61 @@ pub fn move_node(conn: &mut Connection, args: MoveArgs) -> ToolResult {
         .filter(|s| s.status != Status::Dropped || s.id == id)
         .collect();
     let place = live.iter().position(|s| s.id == id).map_or(0, |i| i + 1);
+    let left = (target.id != old_parent && !node.status.is_closed()).then_some(old_parent);
+    let hint = move_hint(&tx, &touched, left)?;
     tx.commit().map_err(db_err)?;
-    Ok(format!(
+    let mut reply = format!(
         "Moved {id}  {}  (under {} {}, {place} of {})",
         node.title,
         target.id,
         target.title,
         live.len()
-    ))
+    );
+    if let Some(hint) = hint {
+        reply.push('\n');
+        reply.push_str(&hint);
+    }
+    Ok(reply)
+}
+
+/// The first unfinished child of `parent`, in order.
+fn next_step(conn: &Connection, parent: NodeId) -> Result<Option<NodeId>, String> {
+    Ok(children(conn, parent)?
+        .into_iter()
+        .find(|c| !c.status.is_closed())
+        .map(|c| c.id))
+}
+
+/// What the move changed for the parents involved (SPOKE-1079). `touched` pairs each one
+/// with its next step before the move; `left` is the parent an unfinished node moved out of.
+fn move_hint(
+    conn: &Connection,
+    touched: &[(NodeId, Option<NodeId>)],
+    left: Option<NodeId>,
+) -> Result<Option<String>, String> {
+    let mut states = Vec::new();
+    for &(id, before) in touched {
+        let step = children(conn, id)?
+            .into_iter()
+            .find(|c| !c.status.is_closed());
+        states.push((require(conn, id)?, before, step));
+    }
+    let parents: Vec<Reordered<'_>> = states
+        .iter()
+        .map(|(parent, step_before, step_now)| Reordered {
+            parent,
+            step_before: *step_before,
+            step_now: step_now.as_ref(),
+            lost_open: left == Some(parent.id),
+        })
+        .collect();
+    Ok(hints::hint(&hints::Action::Moved { parents: &parents }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{IdArg, NodeId, SettableStatus};
+    use crate::model::{IdArg, SettableStatus};
     use crate::store::add::tests::args;
     use crate::store::test_support::temp_db;
     use crate::store::{add, set_status};
