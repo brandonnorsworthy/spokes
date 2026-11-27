@@ -514,7 +514,8 @@ async fn tree_over_http() {
     assert_eq!(
         mcp.ok("move", json!({"id": "SPOKE-8", "before": "SPOKE-7"}))
             .await,
-        "Moved SPOKE-8  Add secrets  (under SPOKE-5 Deploy game to production, 2 of 6)"
+        // The new next step gets the move hint (SPOKE-1079).
+        "Moved SPOKE-8  Add secrets  (under SPOKE-5 Deploy game to production, 2 of 6)\nNext: The next step of SPOKE-5 Deploy game to production is now SPOKE-8 Add secrets."
     );
     let listing = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
     assert!(
@@ -526,7 +527,8 @@ async fn tree_over_http() {
     assert_eq!(
         mcp.ok("move", json!({"id": "SPOKE-11", "parent": "SPOKE-4"}))
             .await,
-        "Moved SPOKE-11  Retro and write-up  (under SPOKE-4 Skyforge, 2 of 2)"
+        // SPOKE-11 sat after the done step, so it was next; leaving hands that back.
+        "Moved SPOKE-11  Retro and write-up  (under SPOKE-4 Skyforge, 2 of 2)\nNext: The next step of SPOKE-5 Deploy game to production is now SPOKE-8 Add secrets."
     );
     let sky = mcp.ok("get", json!({"id": "SPOKE-4"})).await;
     assert!(
@@ -3142,6 +3144,57 @@ async fn answer_hints_to_claim_before_continuing_over_http() {
     let out = mcp.ok("answer", json!({"id": task, "text": "E:"})).await;
     assert!(
         out.ends_with(&format!("\nNext: Claim {task} before continuing the work.")),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `move` speaks up when an ordered parent's next step changes or a task is left with no
+/// unfinished steps (SPOKE-1079).
+#[tokio::test]
+async fn move_hints_at_a_changed_next_step_over_http() {
+    let dir = temp_dir("hint-move");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let plan = add_node(
+        &mcp,
+        json!({"title": "Plan", "ordered": true,
+               "children": [{"title": "One"}, {"title": "Two"}, {"title": "Three"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": plan})).await;
+    let one = first_id(line_with(&g, "One"));
+    let two = first_id(line_with(&g, "Two"));
+    let three = first_id(line_with(&g, "Three"));
+
+    // Reordering behind the next step changes nothing to act on.
+    let out = mcp.ok("move", json!({"id": three, "before": two})).await;
+    assert!(!out.contains("Next: "), "{out}");
+    let out = mcp.ok("move", json!({"id": two, "before": one})).await;
+    assert!(
+        out.ends_with(&format!(
+            "\nNext: The next step of {plan} Plan is now {two} Two."
+        )),
+        "{out}"
+    );
+
+    // Moving the last unfinished child out leaves the old parent finished.
+    let bag = add_node(
+        &mcp,
+        json!({"title": "Bag", "children": [{"title": "Done bit"}, {"title": "Open bit"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": bag})).await;
+    let done = first_id(line_with(&g, "Done bit"));
+    let open = first_id(line_with(&g, "Open bit"));
+    mcp.ok("set_status", json!({"ids": [done], "status": "done"}))
+        .await;
+    let out = mcp.ok("move", json!({"id": open, "parent": plan})).await;
+    assert!(
+        out.ends_with(&format!(
+            "\nNext: All steps of {bag} Bag are done. If it is finished too, mark it done with set_status."
+        )),
         "{out}"
     );
     let _ = std::fs::remove_dir_all(dir);
