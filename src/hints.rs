@@ -59,6 +59,8 @@ pub enum Action<'a> {
     Released { node: &'a Node, handoff: bool },
     /// `ask` left `node` waiting on the user.
     Asked { node: &'a Node },
+    /// `answer` recorded the reply and reopened `node`.
+    Answered { node: &'a Node },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -119,6 +121,9 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             "When the user replies, record it with answer on {}.",
             node.id
         ),
+        Action::Answered { node } => {
+            format!("Claim {} before continuing the work.", node.id)
+        }
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -656,6 +661,15 @@ mod tests {
         assert_eq!(
             hint(&Action::Asked { node: &t }).as_deref(),
             Some("Next: When the user replies, record it with answer on SPOKE-4.")
+        );
+    }
+
+    #[test]
+    fn answer_says_to_claim_before_continuing() {
+        let t = node(4, "Task");
+        assert_eq!(
+            hint(&Action::Answered { node: &t }).as_deref(),
+            Some("Next: Claim SPOKE-4 before continuing the work.")
         );
     }
 

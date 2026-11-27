@@ -487,10 +487,15 @@ pub fn answer(conn: &mut Connection, args: AnswerArgs, tz: Tz) -> ToolResult {
     log_event(&tx, id, &now, None, "answered", text).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
-    Ok(format!(
+    let mut reply = format!(
         "Answered {id} {}; it is open again, with the question and answer in its notes. next lists it under NEEDS YOU as answered until an agent claims it.",
         node.title
-    ))
+    );
+    if let Some(line) = crate::hints::hint(&crate::hints::Action::Answered { node: &node }) {
+        reply.push('\n');
+        reply.push_str(&line);
+    }
+    Ok(reply)
 }
 
 /// Adds a paragraph to the notes body and keeps the search index in step.
