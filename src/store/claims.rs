@@ -14,7 +14,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::add::MAX_NOTES;
 use super::{
-    DEFAULT_LEASE_MINUTES, ToolResult, ancestors, db_err, lease_end, log_event, require, touch,
+    DEFAULT_LEASE_MINUTES, ToolResult, ancestors, children, db_err, lease_end, log_event, require,
+    touch,
 };
 use crate::db::now;
 use crate::format::{clock, today_in};
@@ -126,10 +127,62 @@ pub fn claim(conn: &mut Connection, args: ClaimArgs, tz: Tz) -> ToolResult {
     } else if before.has_notes && before.status != Status::InProgress {
         reply.push_str(" It has notes: read them with get notes: true.");
     }
+    let renewed =
+        before.status == Status::InProgress && before.claimed_by.as_deref() == Some(&agent);
+    if !renewed
+        && before.child_total > before.child_done
+        && let Some(line) = parent_hint(&tx, &before, &agent, &now)?
+    {
+        reply.push('\n');
+        reply.push_str(&line);
+    }
     log_event(&tx, id, &now, Some(&agent), "claimed", &detail).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
     Ok(reply)
+}
+
+/// The claim-on-parent hint (SPOKE-692): name the open subtasks so a worker claims the one
+/// it is working on.
+fn parent_hint(
+    conn: &Connection,
+    parent: &Node,
+    agent: &str,
+    now: &str,
+) -> Result<Option<String>, String> {
+    let kids = children(conn, parent.id)?;
+    let open: Vec<Node> = if parent.ordered {
+        match kids.iter().position(|c| !c.status.is_closed()) {
+            Some(i) if kids[i].status == Status::Open => kids[i..]
+                .iter()
+                .filter(|c| c.status == Status::Open)
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    } else {
+        kids.into_iter()
+            .filter(|c| c.status == Status::Open)
+            .collect()
+    };
+    let held_below: bool = conn
+        .query_row(
+            "WITH RECURSIVE down(id) AS (
+               SELECT id FROM nodes WHERE parent_id = ?1
+               UNION ALL
+               SELECT c.id FROM nodes c JOIN down ON c.parent_id = down.id)
+             SELECT EXISTS (SELECT 1 FROM nodes d JOIN down ON d.id = down.id
+              WHERE d.status = 'in_progress' AND d.claimed_by = ?2 AND d.claim_expires > ?3)",
+            params![parent.id.0, agent, now],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let action = crate::hints::Action::ParentClaimed {
+        parent,
+        open: &open,
+        held_below,
+    };
+    Ok(crate::hints::hint(&action))
 }
 
 /// Why a claim lost, and what to do instead.

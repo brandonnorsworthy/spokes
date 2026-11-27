@@ -2494,6 +2494,63 @@ async fn orchestrator_workers_and_local_history_over_http() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Claiming a task with open children names them and says to claim the subtask too
+/// (SPOKE-692); silent on a renewal, on a leaf, and once the agent holds a subtask.
+#[tokio::test]
+async fn claim_on_a_parent_hints_to_claim_the_subtask_over_http() {
+    let dir = temp_dir("hint-parent-claim");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let proj = add_node(
+        &mcp,
+        json!({"title": "Deploy", "ordered": true,
+               "children": [{"title": "Map"}, {"title": "Write"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": proj})).await;
+    let map = first_id(line_with(&g, "Map"));
+    let out = mcp
+        .ok("claim", json!({"id": proj, "agent": "opus-orch"}))
+        .await;
+    assert!(
+        out.ends_with(&format!(
+            "\nNext: {proj} has 2 open subtasks (the next step is {map} Map). Working on one? Claim that one too. Orchestrating? Keep this claim; workers can claim their own subtasks inside it."
+        )),
+        "{out}"
+    );
+    let renewed = mcp
+        .ok("claim", json!({"id": proj, "agent": "opus-orch"}))
+        .await;
+    assert!(!renewed.contains("Next: "), "{renewed}");
+    let leaf = mcp
+        .ok("claim", json!({"id": map, "agent": "opus-orch"}))
+        .await;
+    assert!(!leaf.contains("Next: "), "{leaf}");
+
+    // An unordered parent lists its open children; holding one of them silences it.
+    let bag = add_node(
+        &mcp,
+        json!({"title": "Chores", "children": [{"title": "Dishes"}, {"title": "Laundry"}]}),
+    )
+    .await;
+    let g = mcp.ok("get", json!({"id": bag})).await;
+    let dishes = first_id(line_with(&g, "Dishes"));
+    let laundry = first_id(line_with(&g, "Laundry"));
+    let out = mcp.ok("claim", json!({"id": bag, "agent": "w1"})).await;
+    assert!(
+        out.contains(&format!(
+            "\nNext: {bag} has 2 open subtasks ({dishes} Dishes, {laundry} Laundry). "
+        )),
+        "{out}"
+    );
+    mcp.ok("release", json!({"id": bag, "agent": "w1"})).await;
+    mcp.ok("claim", json!({"id": dishes, "agent": "w1"})).await;
+    let out = mcp.ok("claim", json!({"id": bag, "agent": "w1"})).await;
+    assert!(!out.contains("Next: "), "{out}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// M4 retro: a worker finishing a step inside an ordered project that the orchestrator
 /// holds claimed gets the same "Next: ..., the next step of ..." hint as in an unclaimed project.
 #[tokio::test]
