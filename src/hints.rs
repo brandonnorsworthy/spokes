@@ -57,6 +57,8 @@ pub enum Action<'a> {
     /// `release` gave `node` back. `handoff` is true when a note came with it, or notes
     /// were written on it since it was claimed.
     Released { node: &'a Node, handoff: bool },
+    /// `ask` left `node` waiting on the user.
+    Asked { node: &'a Node },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -113,6 +115,10 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
                 node.id
             )
         })?,
+        Action::Asked { node } => format!(
+            "When the user replies, record it with answer on {}.",
+            node.id
+        ),
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -642,6 +648,15 @@ mod tests {
             handoff: true,
         };
         assert_eq!(hint(&action), None);
+    }
+
+    #[test]
+    fn ask_says_how_to_record_the_reply() {
+        let t = node(4, "Task");
+        assert_eq!(
+            hint(&Action::Asked { node: &t }).as_deref(),
+            Some("Next: When the user replies, record it with answer on SPOKE-4.")
+        );
     }
 
     #[test]

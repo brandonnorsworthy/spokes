@@ -437,10 +437,15 @@ pub fn ask(conn: &mut Connection, args: AskArgs, tz: Tz) -> ToolResult {
     log_event(&tx, id, &now, Some(&agent), "asked", &question).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
-    Ok(format!(
+    let mut reply = format!(
         "{id} {} is waiting on the user: \"{question}\". It is at the top of next under NEEDS YOU. Stop work on it until it is answered.",
         node.title
-    ))
+    );
+    if let Some(line) = crate::hints::hint(&crate::hints::Action::Asked { node: &node }) {
+        reply.push('\n');
+        reply.push_str(&line);
+    }
+    Ok(reply)
 }
 
 pub fn answer(conn: &mut Connection, args: AnswerArgs, tz: Tz) -> ToolResult {
