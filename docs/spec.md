@@ -256,7 +256,9 @@ You open any chat and ask what needs you. The model shows the question, you repl
 
 ## Search
 
-Search has to work when the model only half knows what you mean ("my server") and when a project has an odd spelling. Three cheap layers handle that without an embedding model.
+Search has to work when the model only half knows what you mean ("my server") and when a project has an odd spelling. Three cheap layers handle that without an embedding model, after an exact check for ids.
+
+0. **Exact ids first.** A keyword that is a node id (`958`, `#958`, `SPOKE-958`, `spoke958`, or `spoke` followed by `958`) puts that node first, marked `(id)`, even when it is done or dropped, because every node stays reachable by id. Text matches follow it, so a number that also appears in titles or notes still finds those. A number that is no node's id is searched as text only.
 
 1. **Aliases written at creation.** The `add` tool description tells the model to supply 2 to 5 aliases: synonyms, the plain spelling, what you would call it out loud. A project titled "Skyforj" gets `skyforge`, `sky forge`, `the game`. The model creating the node is the best synonym generator available, and it runs once.
 2. **Normalization.** Titles and aliases are indexed lowercased, with accents and punctuation stripped, and also in a squashed form with no spaces, so `home-lab`, `home lab` and `homelab` all match each other.
