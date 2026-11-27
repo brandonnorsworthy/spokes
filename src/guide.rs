@@ -50,8 +50,10 @@ HOW AN AGENT WORKS A TASK
 
 HINTS
   A reply may end with a line starting \"Next: \". It is a hint from the node's current state: the next
-  step of an ordered parent, or that all steps are done so the parent can be closed. It appears only
-  when the state calls for it. Follow it unless you know better; it never repeats what you just did.
+  step of an ordered parent, or that all steps are done so the parent can be closed; on get, next and
+  notes_append, a reminder to claim an open task nobody holds before working on it (claim sets
+  in_progress; there is no set_status in_progress). It appears only when the state calls for it.
+  Follow it unless you know better; it never repeats what you just did.
 
 SEARCHING
   Several keywords at once, as alternatives. A typed id (958, #958, SPOKE-958) puts that node first,

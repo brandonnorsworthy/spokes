@@ -264,6 +264,14 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
             total - shown.len()
         ));
     }
+    let work_items: usize = sections
+        .iter()
+        .filter(|(title, _)| matches!(*title, "FOCUS" | "DUE SOON" | "UP NEXT"))
+        .map(|(_, rows)| rows.len())
+        .sum();
+    if let Some(line) = crate::hints::hint(&crate::hints::Action::Queue { work_items }) {
+        out.push(line);
+    }
     Ok(out.join("\n"))
 }
 
@@ -623,7 +631,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "UP NEXT\n  SPOKE-6  p1  Pay bill  unplanned\n  SPOKE-3  p2  Fix garage (0/2)  next: SPOKE-4 Buy parts\n  SPOKE-7      Someday  unplanned"
+            "UP NEXT\n  SPOKE-6  p1  Pay bill  unplanned\n  SPOKE-3  p2  Fix garage (0/2)  next: SPOKE-4 Buy parts\n  SPOKE-7      Someday  unplanned\nNext: Claim the one you pick before starting."
         );
         let out = next(
             &conn,
@@ -632,7 +640,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.ends_with("(+2 more open. Pass scope or limit.)"),
+            out.ends_with("(+2 more open. Pass scope or limit.)\nNext: Claim the one you pick before starting."),
             "{out}"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -652,7 +660,10 @@ mod tests {
             crate::format::today_in(chrono_tz::UTC),
         )
         .unwrap();
-        assert_eq!(out, "UP NEXT\n  SPOKE-3  First  unplanned");
+        assert_eq!(
+            out,
+            "UP NEXT\n  SPOKE-3  First  unplanned\nNext: Claim the one you pick before starting."
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

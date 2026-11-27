@@ -117,6 +117,20 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
         out.push("HISTORY (newest first)".to_string());
         out.extend(history(conn, id, tz)?);
     }
+    let later_step = match above.last() {
+        Some(parent) if parent.ordered => super::children(conn, parent.id)?
+            .into_iter()
+            .find(|c| !c.status.is_closed())
+            .is_some_and(|first| first.id != node.id),
+        _ => false,
+    };
+    let action = crate::hints::Action::Read {
+        node: &node,
+        later_step,
+    };
+    if let Some(line) = crate::hints::hint(&action) {
+        out.push(line);
+    }
     Ok(out.join("\n"))
 }
 

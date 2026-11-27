@@ -212,6 +212,7 @@ async fn walking_skeleton_over_http() {
         mcp.ok("get", json!({"id": "SPOKE-1"})).await,
         "SPOKE-1 area  To do\n  - SPOKE-2 area  Home\n  - SPOKE-3 area  Work\n  - SPOKE-4 area  Hobbies"
     );
+    // No work listed, so no claim footer.
     assert_eq!(
         mcp.ok("next", json!({})).await,
         "Nothing actionable under SPOKE-1 To do. Add a task with add."
@@ -223,9 +224,10 @@ async fn walking_skeleton_over_http() {
         json!({"parent": 4, "title": "Rewire garage outlet", "priority": 2}),
     )
     .await;
+    // SPOKE-1006: a queue with work ends with the claim footer.
     assert_eq!(
         mcp.ok("next", json!({})).await,
-        "UP NEXT\n  SPOKE-5  p2  Rewire garage outlet  unplanned"
+        "UP NEXT\n  SPOKE-5  p2  Rewire garage outlet  unplanned\nNext: Claim the one you pick before starting."
     );
     assert_eq!(
         mcp.ok(
@@ -312,10 +314,33 @@ async fn hints_off_over_http() {
         let last = mcp
             .ok("set_status", json!({"ids": ["SPOKE-4"], "status": "done"}))
             .await;
+        // The read and notes hints (SPOKE-1006), on a fresh open task nobody holds.
+        mcp.ok("add", json!({"title": "Loose"})).await; // SPOKE-5
+        let read = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
+        let noted = mcp
+            .ok("update", json!({"id": "SPOKE-5", "notes_append": "x"}))
+            .await;
+        let queued = mcp.ok("next", json!({})).await;
+        let claim_hint = "Next: Working on this? Claim it first (that marks it in_progress). Finish with set_status done, or release it.";
+        if hints {
+            assert!(read.ends_with(&format!("\n{claim_hint}")), "{read}");
+            assert!(
+                noted.ends_with("\nNext: Recording progress? Claim it so other agents skip it."),
+                "{noted}"
+            );
+            assert!(
+                queued.ends_with("\nNext: Claim the one you pick before starting."),
+                "{queued}"
+            );
+        } else {
+            for out in [&read, &noted, &queued] {
+                assert!(!out.contains("Next: "), "{out}");
+            }
+        }
         if hints {
             assert_eq!(
                 first,
-                "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan."
+                "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan. Claim it before starting."
             );
             assert!(
                 last.starts_with("SPOKE-4 done  Two\nNext: All steps of SPOKE-2 Plan are done."),
@@ -384,7 +409,7 @@ async fn tree_over_http() {
     assert_eq!(
         mcp.ok("set_status", json!({"ids": ["SPOKE-6"], "status": "done"}))
             .await,
-        "SPOKE-6 done  Map the pipeline\nNext: SPOKE-7 Write the pipeline, the next step of SPOKE-5 Deploy game to production."
+        "SPOKE-6 done  Map the pipeline\nNext: SPOKE-7 Write the pipeline, the next step of SPOKE-5 Deploy game to production. Claim it before starting."
     );
     let walked = mcp.ok("get", json!({"id": "SPOKE-5"})).await;
     assert!(walked.contains("(1/6)"), "{walked}");
@@ -398,7 +423,7 @@ async fn tree_over_http() {
     );
     assert_eq!(walked.matches("<- next").count(), 1, "{walked}");
     assert_eq!(
-        mcp.ok("next", json!({})).await,
+        queue(mcp.ok("next", json!({})).await),
         "UP NEXT\n  SPOKE-5  p1 due Nov 20 2030  Deploy game to production (1/6)  next: SPOKE-7 Write the pipeline"
     );
 
@@ -431,8 +456,13 @@ async fn tree_over_http() {
             json!({"id": "SPOKE-7", "notes_append": "Used deploy.yml.", "agent": "it"})
         )
         .await,
-        "Updated SPOKE-7  Write the pipeline  (notes appended)"
+        "Updated SPOKE-7  Write the pipeline  (notes appended)\nNext: Recording progress? Claim it so other agents skip it."
     );
+    // SPOKE-1006: get hints at claiming only the step to start, not a later one.
+    let start = mcp.ok("get", json!({"id": "SPOKE-7"})).await;
+    assert!(start.ends_with("\nNext: Working on this? Claim it first (that marks it in_progress). Finish with set_status done, or release it."), "{start}");
+    let later = mcp.ok("get", json!({"id": "SPOKE-8"})).await;
+    assert!(!later.contains("Next: "), "{later}");
     mcp.ok(
         "update",
         json!({"id": "SPOKE-7", "notes_append": "Added a cache step."}),
@@ -447,18 +477,18 @@ async fn tree_over_http() {
     assert!(!listing.contains("Target: the VPS"), "{listing}");
     let body = mcp.ok("get", json!({"id": "SPOKE-7", "notes": true})).await;
     assert!(
-        body.ends_with("NOTES\nUsed deploy.yml.\n\nAdded a cache step."),
+        body.ends_with("NOTES\nUsed deploy.yml.\n\nAdded a cache step.\nNext: Working on this? Claim it first (that marks it in_progress). Finish with set_status done, or release it."),
         "{body}"
     );
     mcp.ok("update", json!({"id": "SPOKE-7", "notes": "Replaced."}))
         .await;
     let body = mcp.ok("get", json!({"id": "SPOKE-7", "notes": true})).await;
-    assert!(body.ends_with("NOTES\nReplaced."), "{body}");
+    assert!(body.ends_with("NOTES\nReplaced.\nNext: Working on this? Claim it first (that marks it in_progress). Finish with set_status done, or release it."), "{body}");
     mcp.ok("update", json!({"id": "SPOKE-7", "notes": ""}))
         .await;
     let body = mcp.ok("get", json!({"id": "SPOKE-7", "notes": true})).await;
     assert!(
-        body.ends_with("(no notes)") && !body.contains("+notes"),
+        body.ends_with("(no notes)\nNext: Working on this? Claim it first (that marks it in_progress). Finish with set_status done, or release it.") && !body.contains("+notes"),
         "{body}"
     );
 
@@ -896,7 +926,7 @@ async fn priority_inheritance_over_http() {
     // Level 1 (inherited from the area), then 2, 3, 4, then unset; oldest first within a
     // level. "Deep own level" shows its own p3 under the p1 area. "Deep plain" and
     // "Step one" carry no level or date, and blocked "Step two" stays hidden despite its p2.
-    let out = mcp.ok("next", json!({"limit": 50})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 50})).await);
     assert_eq!(
         out,
         "UP NEXT\n\
@@ -922,7 +952,7 @@ async fn priority_inheritance_over_http() {
         .await;
     mcp.ok("update", json!({"id": "SPOKE-10", "due": "2099-01-02"}))
         .await;
-    let out = mcp.ok("next", json!({"limit": 50})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 50})).await);
     assert_eq!(out.matches("Step one").count(), 1, "{out}");
     assert!(
         out.contains("Pipeline (0/2)  next: SPOKE-9 Step one"),
@@ -1045,7 +1075,7 @@ async fn focus_over_http() {
     focus_err(&mcp, json!({"id": 8}), "is done").await;
 
     // `next`: FOCUS first, numbered in rank order, and no repeats further down.
-    let out = mcp.ok("next", json!({"limit": 20})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 20})).await);
     assert_eq!(
         out,
         "FOCUS\n\
@@ -1072,7 +1102,7 @@ async fn focus_over_http() {
         .ok("set_status", json!({"ids": [3], "status": "done"}))
         .await;
     assert!(out.contains("(taken off the focus list)"), "{out}");
-    let out = mcp.ok("next", json!({"limit": 20})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 20})).await);
     assert!(out.starts_with("FOCUS\n  1. SPOKE-4  Beta"), "{out}");
     assert!(!out.contains("Alpha"), "{out}");
 
@@ -1089,7 +1119,7 @@ async fn focus_over_http() {
         out.ends_with("The focus list has 11 entries; keep it to about 10. Take some off with focus remove: true."),
         "{out}"
     );
-    let out = mcp.ok("next", json!({"limit": 50})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 50})).await);
     assert!(
         out.ends_with("(The focus list has 11 entries; keep it to about 10. Take some off with focus remove: true.)"),
         "{out}"
@@ -1100,6 +1130,14 @@ async fn focus_over_http() {
 }
 
 /// The leading `SPOKE-n` of every item line (not headers or the footer).
+/// A `next` reply without its claim footer (checked in `walking_skeleton_over_http`).
+fn queue(out: String) -> String {
+    match out.strip_suffix("\nNext: Claim the one you pick before starting.") {
+        Some(body) => body.to_string(),
+        None => out,
+    }
+}
+
 fn listed_ids(out: &str) -> Vec<String> {
     out.lines()
         .filter(|l| l.starts_with("  "))
@@ -1150,7 +1188,7 @@ async fn due_and_sections_over_http() {
     mcp.ok("focus", json!({"id": 15})).await;
 
     // Without NEEDS YOU or STALE yet: DUE SOON order, and the +20 day task is UP NEXT.
-    let out = mcp.ok("next", json!({"limit": 50})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 50})).await);
     let (d_over, d_soon, d_far) = (
         short(today - Duration::days(3), today),
         short(today + Duration::days(5), today),
@@ -1197,7 +1235,7 @@ async fn due_and_sections_over_http() {
     .unwrap();
     drop(conn);
 
-    let out = mcp.ok("next", json!({"limit": 8})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 8})).await);
     let days = (chrono::Utc::now()
         - "2020-01-01T00:00:00Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -1264,7 +1302,7 @@ async fn due_and_sections_over_http() {
     );
 
     // With room for everything, nothing repeats and STALE stays at three lines.
-    let out = mcp.ok("next", json!({"limit": 50})).await;
+    let out = queue(mcp.ok("next", json!({"limit": 50})).await);
     let ids = listed_ids(&out);
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(ids.len(), unique.len(), "an id repeats: {out}");
@@ -1276,18 +1314,14 @@ async fn due_and_sections_over_http() {
     let work = add_node(&mcp, json!({"title": "Work", "kind": "area"})).await;
     mcp.ok("add", json!({"parent": work, "title": "Elsewhere job"}))
         .await;
-    assert!(
-        mcp.ok("next", json!({"limit": 50}))
-            .await
-            .contains("Elsewhere job")
-    );
-    let scoped = mcp.ok("next", json!({"scope": 2, "limit": 50})).await;
+    assert!(queue(mcp.ok("next", json!({"limit": 50})).await).contains("Elsewhere job"));
+    let scoped = queue(mcp.ok("next", json!({"scope": 2, "limit": 50})).await);
     assert!(
         !scoped.contains("Elsewhere job") && scoped.contains("Soon job"),
         "{scoped}"
     );
     assert_eq!(
-        mcp.ok("next", json!({"scope": work})).await,
+        queue(mcp.ok("next", json!({"scope": work})).await),
         "UP NEXT\n  SPOKE-17  Elsewhere job  unplanned"
     );
 
@@ -1328,7 +1362,7 @@ async fn timezone_over_http() {
 
     // Kiritimati: its own today is "due today"; Pago Pago's today is already past.
     assert_eq!(
-        k.ok("next", json!({})).await,
+        queue(k.ok("next", json!({})).await),
         due_soon([
             (
                 "SPOKE-4",
@@ -1340,7 +1374,7 @@ async fn timezone_over_http() {
     );
     // Pago Pago: its own today is "due today"; Kiritimati's today is still ahead.
     assert_eq!(
-        p.ok("next", json!({})).await,
+        queue(p.ok("next", json!({})).await),
         due_soon([
             ("SPOKE-4", "due today".to_string(), "Pago Pago day"),
             (
@@ -1421,8 +1455,8 @@ async fn two_agents_get_different_tasks_over_http() {
     .await; // 2: 3, 4, 5
 
     // Both terminals see the same top task.
-    let first = red.ok("next", json!({})).await;
-    assert_eq!(first, blue.ok("next", json!({})).await);
+    let first = queue(red.ok("next", json!({})).await);
+    assert_eq!(first, queue(blue.ok("next", json!({})).await));
     let top = listed_ids(&first)[0].clone();
     assert_eq!(top, "SPOKE-3");
 
@@ -1442,13 +1476,13 @@ async fn two_agents_get_different_tasks_over_http() {
         chrono::DateTime::parse_from_rfc3339(&expires).unwrap() - chrono::Utc::now().fixed_offset();
     assert!((58..=60).contains(&lease.num_minutes()), "{lease}");
 
-    let seen = blue.ok("next", json!({})).await;
+    let seen = queue(blue.ok("next", json!({})).await);
     assert!(!seen.contains("SPOKE-3 "), "{seen}");
     let blue_top = listed_ids(&seen)[0].clone();
     assert_eq!(blue_top, "SPOKE-4");
     blue.ok("claim", json!({"id": blue_top, "agent": "sonnet-blue"}))
         .await;
-    let seen = red.ok("next", json!({})).await;
+    let seen = queue(red.ok("next", json!({})).await);
     assert_eq!(listed_ids(&seen), ["SPOKE-5"], "{seen}");
 
     // Blue cannot take red's task; the error says who, until when, and what to do.
@@ -1510,7 +1544,7 @@ async fn two_agents_get_different_tasks_over_http() {
         "{notes}"
     );
     assert_eq!(
-        listed_ids(&blue.ok("next", json!({})).await),
+        listed_ids(&queue(blue.ok("next", json!({})).await)),
         ["SPOKE-3", "SPOKE-5"]
     );
     let e = err(
@@ -1594,7 +1628,7 @@ async fn claim_rules_and_lease_renewal_over_http() {
     // project, a worker (blue) claims a step inside it under its own label. The step
     // stays hidden from next (its ancestor is claimed); get shows the worker's claim.
     mcp.ok("claim", json!({"id": 3, "agent": "red"})).await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(!q.contains("Garage") && !q.contains("Clear"), "{q}");
     let c = mcp.ok("claim", json!({"id": 4, "agent": "blue"})).await;
     assert!(
@@ -1602,7 +1636,7 @@ async fn claim_rules_and_lease_renewal_over_http() {
             && c.contains("It is a step of SPOKE-3 Garage, which red holds as the orchestrator."),
         "{c}"
     );
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(!q.contains("Clear"), "{q}");
     let g = mcp.ok("get", json!({"id": 4})).await;
     assert!(g.contains("\nclaimed by blue until "), "{g}");
@@ -1778,7 +1812,7 @@ async fn ask_answer_and_stalled_leases_over_http() {
         [ts_ago(185)],
     )
     .unwrap();
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert_eq!(
         q,
         "NEEDS YOU\n\
@@ -1816,7 +1850,7 @@ async fn ask_answer_and_stalled_leases_over_http() {
     );
     assert!(notes.contains("): E:, it has more space."), "{notes}");
     assert!(notes.contains("\nanswered "), "{notes}");
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert_eq!(
         q,
         "NEEDS YOU\n\
@@ -1834,7 +1868,7 @@ async fn ask_answer_and_stalled_leases_over_http() {
         "{out}"
     );
     assert_eq!(
-        listed_ids(&mcp.ok("next", json!({})).await),
+        listed_ids(&queue(mcp.ok("next", json!({})).await)),
         ["SPOKE-4", "SPOKE-5"]
     );
 
@@ -1850,7 +1884,7 @@ async fn ask_answer_and_stalled_leases_over_http() {
         json!({"id": 5, "agent": "sonnet-2", "question": "Which colour?"}),
     )
     .await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert_eq!(
         q,
         "NEEDS YOU\n\
@@ -1872,7 +1906,7 @@ async fn ask_answer_and_stalled_leases_over_http() {
             && out.contains("Read its notes (get notes: true) for where opus-red got to."),
         "{out}"
     );
-    assert!(!mcp.ok("next", json!({})).await.contains("SPOKE-3"));
+    assert!(!queue(mcp.ok("next", json!({})).await).contains("SPOKE-3"));
 
     // The history on get: newest first, with who did what.
     let shown = mcp.ok("get", json!({"id": 3, "history": true})).await;
@@ -1916,7 +1950,7 @@ async fn ask_answer_and_stalled_leases_over_http() {
         json!({"id": 5, "agent": "sonnet-2", "note": "Will pick a colour later."}),
     )
     .await;
-    assert!(!mcp.ok("next", json!({})).await.contains("waiting"));
+    assert!(!queue(mcp.ok("next", json!({})).await).contains("waiting"));
 
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
@@ -1954,7 +1988,7 @@ async fn next_lists_each_actionable_step_once_over_http() {
     )
     .await; // 11 > 12 > 13; 14
 
-    let q = mcp.ok("next", json!({"limit": 20})).await;
+    let q = queue(mcp.ok("next", json!({"limit": 20})).await);
     assert_eq!(
         listed_ids(&q),
         ["SPOKE-4", "SPOKE-13", "SPOKE-14"],
@@ -1973,11 +2007,11 @@ async fn next_lists_each_actionable_step_once_over_http() {
     // Once the deploy step moves on to another sub-step, still one line per step.
     mcp.ok("set_status", json!({"ids": [6], "status": "done"}))
         .await;
-    let q = mcp.ok("next", json!({"limit": 20})).await;
+    let q = queue(mcp.ok("next", json!({"limit": 20})).await);
     assert_eq!(listed_ids(&q), ["SPOKE-4", "SPOKE-13", "SPOKE-14"], "{q}");
     // Without the due sub-project the parent project carries the line again.
     mcp.ok("update", json!({"id": 4, "due": ""})).await;
-    let q = mcp.ok("next", json!({"limit": 20})).await;
+    let q = queue(mcp.ok("next", json!({"limit": 20})).await);
     assert_eq!(listed_ids(&q), ["SPOKE-13", "SPOKE-3", "SPOKE-14"], "{q}");
     assert!(
         line_with(&q, "SPOKE-3 ").contains("next: SPOKE-7 Add secrets"),
@@ -2002,15 +2036,21 @@ async fn project_with_all_steps_claimed_is_not_offered_over_http() {
     )
     .await; // 2 > 3 > 4 > 5; 6
     assert_eq!(
-        listed_ids(&mcp.ok("next", json!({})).await),
+        listed_ids(&queue(mcp.ok("next", json!({})).await)),
         ["SPOKE-3", "SPOKE-6"]
     );
     mcp.ok("claim", json!({"id": 4, "agent": "opus-red"})).await;
-    assert_eq!(listed_ids(&mcp.ok("next", json!({})).await), ["SPOKE-6"]);
+    assert_eq!(
+        listed_ids(&queue(mcp.ok("next", json!({})).await)),
+        ["SPOKE-6"]
+    );
     mcp.ok("release", json!({"id": 4, "agent": "opus-red"}))
         .await;
     mcp.ok("claim", json!({"id": 5, "agent": "opus-red"})).await;
-    assert_eq!(listed_ids(&mcp.ok("next", json!({})).await), ["SPOKE-6"]);
+    assert_eq!(
+        listed_ids(&queue(mcp.ok("next", json!({})).await)),
+        ["SPOKE-6"]
+    );
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -2049,7 +2089,7 @@ async fn recurrence_over_http() {
                "recur": {"every": 2, "unit": "week", "from": "completion"}}),
     )
     .await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(line_with(&q, "Check oil").contains("repeats"), "{q}");
     mcp.ok("claim", json!({"id": oil, "agent": "red"})).await;
     let out = mcp
@@ -2078,7 +2118,7 @@ async fn recurrence_over_http() {
         )
         .unwrap();
     assert_eq!(claimed, None, "claim cleared");
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(!q.contains("Check oil"), "deferred until relevant: {q}");
     let g = mcp.ok("get", json!({"id": oil, "history": true})).await;
     assert!(
@@ -2257,7 +2297,7 @@ async fn defer_until_over_http() {
     )
     .await;
     add_node(&mcp, json!({"parent": home, "title": "Now thing"})).await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(
         !q.contains("Paint") && !q.contains("Later thing") && q.contains("Now thing"),
         "{q}"
@@ -2277,7 +2317,7 @@ async fn defer_until_over_http() {
         json!({"id": solo, "agent": "red", "question": "Which color?"}),
     )
     .await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(line_with(&q, "Later thing").contains("waiting"), "{q}");
     // Clearing the deferral brings it back.
     mcp.ok("update", json!({"id": proj, "defer_until": ""}))
@@ -2286,7 +2326,7 @@ async fn defer_until_over_http() {
     let buy = first_id(line_with(&g, "Buy paint"));
     mcp.ok("update", json!({"id": buy, "defer_until": ""}))
         .await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(
         line_with(&q, "Paint").contains(&format!("next: {buy} Buy paint")),
         "{q}"
@@ -2337,7 +2377,7 @@ async fn staleness_over_http() {
         age(id, d);
     }
     age(&deferred, 90);
-    let q = mcp.ok("next", json!({"limit": 1})).await;
+    let q = queue(mcp.ok("next", json!({"limit": 1})).await);
     // UP NEXT shows Fresh (oldest created first); STALE the three oldest of the rest.
     assert!(q.contains("UP NEXT\n"), "{q}");
     let stale = &q[pos(&q, "STALE\n")..];
@@ -2370,7 +2410,7 @@ async fn staleness_over_http() {
     .await;
     mcp.ok("set_status", json!({"ids": [ids[2]], "status": "dropped"}))
         .await;
-    let q = mcp.ok("next", json!({"limit": 1})).await;
+    let q = queue(mcp.ok("next", json!({"limit": 1})).await);
     let stale = &q[pos(&q, "STALE\n")..];
     let lines: Vec<&str> = stale
         .lines()
@@ -2429,7 +2469,7 @@ async fn orchestrator_workers_and_local_history_over_http() {
         json!({"id": secrets, "agent": "sonnet-1", "question": "Which vault?"}),
     )
     .await;
-    let q = mcp.ok("next", json!({})).await;
+    let q = queue(mcp.ok("next", json!({})).await);
     assert!(line_with(&q, "Secrets").contains("waiting"), "{q}");
     assert!(!q.contains("Docs"), "{q}");
     mcp.ok(
@@ -2491,12 +2531,20 @@ async fn next_step_hint_inside_a_claimed_project_over_http() {
             .await;
         assert!(
             out.ends_with(&format!(
-                "\nNext: {next} {}, the next step of {proj} Deploy.",
+                "\nNext: {next} {}, the next step of {proj} Deploy. Claim it before starting.",
                 if next == &write { "Write" } else { "Secrets" }
             )),
             "{out}"
         );
     }
+    // The orchestrator noting on a step under its own claim gets no claim nudge (SPOKE-1006).
+    let noted = mcp
+        .ok(
+            "update",
+            json!({"id": secrets, "notes_append": "Plan: rotate keys.", "agent": "opus-orch"}),
+        )
+        .await;
+    assert!(!noted.contains("Next: "), "{noted}");
     // The orchestrator finishing a step itself gets the closing hint too.
     let out = mcp
         .ok(
