@@ -43,6 +43,14 @@ HOW AN AGENT WORKS A TASK
   Stuck or need a decision: ask (it waits for the user), do not guess. Giving up: release with a note.
   Adding: search first, then add with 2 to 5 aliases; pass the user's own words in source.
 
+SEARCHING
+  Several keywords at once, as alternatives. A typed id (958, #958, SPOKE-958) puts that node first,
+  even if it is done or dropped. Nodes matching more of the rarer words rank first; by default
+  (match: \"best\") much weaker matches are left out and counted. match: \"any\" lists every node with
+  any keyword, match: \"all\" only nodes with every keyword. \"(matched 2 of 3: a, b)\" says which words a
+  partial match had. \"+N more ... Pass offset: 10\" gives the next page. Paths show the last 3
+  ancestors with ids (\"… / Spokes (SPOKE-5) / agent-feedback (SPOKE-182)\"); full_paths: true shows all.
+
 READING A LINE
   +notes has a body (get notes: true). +source has the user's original words. (2/5) means two of five
   children are done. p1..p4 is priority; children inherit it.";
