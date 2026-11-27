@@ -782,7 +782,9 @@ async fn search_over_http() {
         .await;
     assert_eq!(out.lines().filter(|l| l.starts_with("  SPOKE-")).count(), 1);
     assert!(
-        out.contains("\n(+1 more matches. Pass offset: 1 for the next page, or add keywords or scope.)"),
+        out.contains(
+            "\n(+1 more matches. Pass offset: 1 for the next page, or add keywords or scope.)"
+        ),
         "{out}"
     );
 
