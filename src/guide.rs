@@ -34,6 +34,11 @@ TYPE (what kind of work)
             so they can run in parallel. Finish one by notes_append of the findings, then set_status done;
             if it implies work, add that work as new nodes.
 
+TRACKED (what the user follows)
+  The user follows some nodes, usually an epic, and spokes-view lists the tracked ones with their progress.
+  update tracked: true when the user asks to track a node; tracked: false stops it. search tracked: true
+  lists them. It changes nothing about status, priority, focus or next.
+
 STRUCTURE
   Everything is one tree; each node has one parent. A parent with ordered: true holds steps and only the
   first unfinished step is actionable (marked <- next). A project is simply a task with children.
@@ -53,7 +58,7 @@ SEARCHING
 
 READING A LINE
   +notes has a body (get notes: true). +source has the user's original words. (2/5) means two of five
-  children are done. p1..p4 is priority; children inherit it.";
+  children are done. p1..p4 is priority; children inherit it. \"tracked\" means the user follows it.";
 
 #[cfg(test)]
 mod tests {

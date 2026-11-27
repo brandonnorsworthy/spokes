@@ -123,6 +123,7 @@ CREATE TABLE nodes (
   waiting_on    TEXT,                              -- the question for the human
   claimed_by    TEXT,
   claim_expires TEXT,
+  tracked_at    TEXT,                              -- UTC instant the user's tracking began; NULL = not tracked (schema 6)
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
   touched_at    TEXT NOT NULL,                     -- bubbles up to ancestors
@@ -165,9 +166,9 @@ Twelve tools with flat arguments. The count is deliberately small: every tool's 
 | --- | --- | --- |
 | `next` | The queue: what needs you, what is top priority, what is due, what is stale | `scope`, `limit` (default 5) |
 | `get` | One node and an outline of its children | `id`, `depth` (default 1), `notes` (default false) |
-| `search` | Find nodes by keywords | `query`, `scope`, `include_done` |
-| `add` | Create a node, or a whole nested plan in one call | `parent`, `title`, optional fields, `children[]` |
-| `update` | Change fields, replace or append notes | `id`, fields, `notes_append` |
+| `search` | Find nodes by keywords | `query`, `scope`, `include_done`, `tracked` |
+| `add` | Create a node, or a whole nested plan in one call | `parent`, `title`, optional fields (`tracked`), `children[]` |
+| `update` | Change fields, replace or append notes | `id`, fields (`tracked`), `notes_append` |
 | `set_status` | Mark done, dropped or reopened | `ids[]`, `status` |
 | `move` | Reparent or reorder | `id`, `parent`, `before` or `after` |
 | `focus` | Place a node on, or remove it from, the global ranked list | `id`, `rank` or `before`/`after` |
@@ -253,6 +254,10 @@ Agent labels are free text supplied by the caller. Nothing verifies them in v1, 
 ### Answering a question
 
 You open any chat and ask what needs you. The model shows the question, you reply in plain language, and it calls `answer`. The text is appended to the task's notes and the task returns to `open` near the top, so the next agent to pick it up finds the answer in the body.
+
+### Tracked nodes
+
+A node can be marked tracked (`tracked_at`, schema 6): the user follows it, usually an epic, and the read-only viewer lists tracked nodes with their progress (`GET /api/tracked`). It is set only through MCP (`update` or `add` with `tracked: true`; `tracked: false` clears it), tracking twice keeps the first time, and it changes nothing about status, priority, focus or `next`. Lines show a `tracked` flag, `get` shows `Tracked since <date>`, and `search` takes `tracked: true` as a filter.
 
 ## Search
 

@@ -2689,3 +2689,81 @@ async fn closed_nodes_hide_refinement_until_reopened() {
     assert!(back.contains("bug ready"), "{back}");
     server.shutdown().await;
 }
+
+/// The tracked mark: set on add (top level and nested) and by update, shown as a flag and as
+/// "Tracked since" in the user's time zone, found by search, cleared by update, and logged.
+/// It changes nothing about status or priority.
+#[tokio::test]
+async fn tracked_mark_is_set_shown_found_and_cleared() {
+    let dir = temp_dir("tracked");
+    let path = dir.join("spokes.db");
+    let server = start_tz(&path, chrono_tz::Pacific::Auckland).await;
+    let m = Mcp::new(server.addr);
+
+    let text = m
+        .ok(
+            "add",
+            json!({"title": "Zebra epic", "tracked": true, "children": [
+                {"title": "Zebra kid", "tracked": true}, {"title": "Zebra plain"}]}),
+        )
+        .await;
+    let epic = first_id(&text);
+    let find = |q: &str| json!({"query": q, "tracked": true});
+    let found = m.ok("search", find("")).await;
+    assert!(
+        found.contains("Zebra epic") && found.contains("Zebra kid"),
+        "{found}"
+    );
+    assert!(!found.contains("Zebra plain"), "{found}");
+    assert!(found.contains(" tracked "), "{found}");
+    let found = m.ok("search", find("zebra")).await;
+    assert!(
+        found.contains("Zebra epic") && !found.contains("Zebra plain"),
+        "{found}"
+    );
+
+    // Another node, tracked by update; tracking twice keeps the first time.
+    let other = first_id(&m.ok("add", json!({"title": "Zebra other"})).await);
+    let reply = m.ok("update", json!({"id": other, "tracked": true})).await;
+    assert!(reply.ends_with("(tracked)"), "{reply}");
+    let n: i64 = other.trim_start_matches("SPOKE-").parse().unwrap();
+    // 2026-11-27 23:30 UTC is 2026-11-28 12:30 in Auckland (UTC+13).
+    db(&path)
+        .execute(
+            "UPDATE nodes SET tracked_at = '2026-11-27T23:30:00Z' WHERE id = ?1",
+            [n],
+        )
+        .unwrap();
+    m.ok("update", json!({"id": other, "tracked": true})).await;
+    let got = m.ok("get", json!({"id": other})).await;
+    assert!(got.contains("Tracked since 2026-11-28"), "{got}");
+    assert!(got.lines().next().unwrap().contains(" tracked "), "{got}");
+    let outline = m.ok("get", json!({"id": epic})).await;
+    assert!(
+        outline.contains("Zebra kid") && outline.contains("tracked"),
+        "{outline}"
+    );
+    assert!(
+        !m.ok("get", json!({"id": "SPOKE-1"}))
+            .await
+            .contains("Tracked since"),
+    );
+
+    // Cleared, and logged in the node's events.
+    let reply = m.ok("update", json!({"id": other, "tracked": false})).await;
+    assert!(reply.ends_with("(untracked)"), "{reply}");
+    let found = m.ok("search", find("")).await;
+    assert!(!found.contains("Zebra other"), "{found}");
+    let got = m.ok("get", json!({"id": other})).await;
+    assert!(
+        !got.contains("Tracked since") && !got.contains(" tracked "),
+        "{got}"
+    );
+    let ev: Vec<String> = events(&db(&path), &other)
+        .into_iter()
+        .filter(|e| e.0 == "updated")
+        .map(|e| e.2)
+        .collect();
+    assert_eq!(ev, vec!["tracked", "tracked", "untracked"]);
+    server.shutdown().await;
+}

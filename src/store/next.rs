@@ -328,6 +328,9 @@ fn work_row(item: &Item, tree: &Tree, today: NaiveDate) -> Row {
     if let Some(s) = node.refinement {
         flags.push(s.to_string());
     }
+    if node.tracked_at.is_some() {
+        flags.push("tracked".to_string());
+    }
     let mut rest = node.title.clone();
     if let Some(p) = progress(node) {
         rest.push(' ');

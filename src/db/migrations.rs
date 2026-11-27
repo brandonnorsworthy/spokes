@@ -74,6 +74,10 @@ const STEPS: &[Step] = &[
      ALTER TABLE nodes ADD COLUMN refinement TEXT
        CHECK (refinement IN ('idea','brainstormed','understood','planned','ready'));",
     ),
+    // 6: the tracked mark (SPOKE-1042): the UTC instant a node was tracked, NULL = not tracked.
+    // Set through MCP only; spokes-view lists tracked nodes with their progress. A 0.14.x server
+    // refuses a database at this version, so a rollback restores a backup.
+    Step::Sql("ALTER TABLE nodes ADD COLUMN tracked_at TEXT"),
 ];
 
 fn search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -198,5 +202,51 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// A schema-5 database (0.14.x) gains a nullable `tracked_at` and keeps every row.
+    #[test]
+    fn step_six_adds_tracked_at_and_keeps_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_to(&mut conn, 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nodes (id, parent_id, position, kind, title, work_type, refinement, created_at, updated_at, touched_at)
+             VALUES (1, NULL, 'a', 'area', 'To do', NULL, NULL, 't', 't', 't'),
+                    (2, 1, 'a', 'task', 'Old', 'epic', 'ready', 't', 't', 't');
+             INSERT INTO notes (node_id, body) VALUES (2, 'keep me');",
+        )
+        .unwrap();
+        apply(&mut conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, latest());
+        assert!(version >= 6);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        let row: (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT title, work_type, refinement, tracked_at FROM nodes WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "Old".to_string(),
+                Some("epic".to_string()),
+                Some("ready".to_string()),
+                None
+            )
+        );
+        let notes: String = conn
+            .query_row("SELECT body FROM notes WHERE node_id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(notes, "keep me");
+        conn.execute("UPDATE nodes SET tracked_at = 'x' WHERE id = 2", [])
+            .unwrap();
     }
 }

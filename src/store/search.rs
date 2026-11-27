@@ -99,6 +99,7 @@ struct Meta {
     priority: Option<i64>,
     work_type: Option<WorkType>,
     refinement: Option<Refinement>,
+    tracked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -193,16 +194,17 @@ pub struct Show {
     pub dropped: bool,
 }
 
-/// Type and refinement filters: a node's own values must equal every filter given.
+/// Type, refinement and tracked filters: a node's own values must equal every filter given.
 #[derive(Clone, Copy, Default)]
 struct Filters {
     work_type: Option<WorkType>,
     refinement: Option<Refinement>,
+    tracked: bool,
 }
 
 impl Filters {
     fn is_empty(&self) -> bool {
-        self.work_type.is_none() && self.refinement.is_none()
+        self.work_type.is_none() && self.refinement.is_none() && !self.tracked
     }
 }
 
@@ -410,13 +412,14 @@ fn parent_bonus(hits: &mut [Hit], meta: &HashMap<NodeId, Meta>, n_kws: usize) {
     }
 }
 
-/// The node's own type and refinement must equal every filter given.
+/// The node's own type, refinement and tracked mark must equal every filter given.
 fn matches_filters(meta: &HashMap<NodeId, Meta>, id: NodeId, filters: Filters) -> bool {
     let Some(m) = meta.get(&id) else {
         return false;
     };
     filters.work_type.is_none_or(|t| m.work_type == Some(t))
         && filters.refinement.is_none_or(|s| m.refinement == Some(s))
+        && (!filters.tracked || m.tracked)
 }
 
 /// `type bug, refinement planned`.
@@ -427,6 +430,9 @@ fn filter_label(filters: Filters) -> String {
     }
     if let Some(s) = filters.refinement {
         parts.push(format!("refinement {s}"));
+    }
+    if filters.tracked {
+        parts.push("tracked".to_string());
     }
     parts.join(", ")
 }
@@ -444,6 +450,7 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
             .as_deref()
             .map(Refinement::parse_loose)
             .transpose()?,
+        tracked: args.tracked.unwrap_or(false),
     };
     let kws = query_keywords(&args.query);
     if kws.is_empty() && filters.is_empty() {
@@ -724,6 +731,9 @@ fn result_line(
     if node.has_source {
         flags.push("+source".to_string());
     }
+    if node.tracked_at.is_some() {
+        flags.push("tracked".to_string());
+    }
     if is_unplanned(node) {
         flags.push("unplanned".to_string());
     }
@@ -913,7 +923,7 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
 fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, parent_id, title, status, priority, work_type, refinement
+            "SELECT id, parent_id, title, status, priority, work_type, refinement, tracked_at
              FROM nodes WHERE user_id = ?1",
         )
         .map_err(db_err)?;
@@ -935,6 +945,7 @@ fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
                     .and_then(|t| Refinement::parse_loose(&t).ok())
                     // Closed nodes have no refinement to match (see `node_from_row`).
                     .filter(|_| !status.is_closed()),
+                tracked: r.get::<_, Option<String>>(7)?.is_some(),
             },
         ))
     })
@@ -1031,6 +1042,7 @@ mod tests {
             limit: None,
             work_type: work_type.map(String::from),
             refinement: refinement.map(String::from),
+            tracked: None,
             full_paths: None,
             match_mode: None,
             offset: None,
@@ -1066,6 +1078,42 @@ mod tests {
         assert!(out.starts_with("1 match for refinement ready:"), "{out}");
         assert!(out.contains("Crash bug"));
         assert!(!out.contains("Crash feature") && !out.contains("Plain crash"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tracked_filter_lists_tracked_nodes_with_or_without_a_query() {
+        let (conn, dir) = seeded("search-tracked");
+        conn.execute(
+            "UPDATE nodes SET tracked_at = '2026-01-01T00:00:00Z' WHERE title = 'Crash feature'",
+            [],
+        )
+        .unwrap();
+        let mut a = search_args("", None, None);
+        a.tracked = Some(true);
+        let out = search(&conn, a, today()).unwrap();
+        assert!(out.starts_with("1 match for tracked:"), "{out}");
+        assert!(
+            out.contains("Crash feature") && out.contains(" tracked "),
+            "{out}"
+        );
+        assert!(!out.contains("Crash bug") && !out.contains("Plain crash"));
+        let mut a = search_args("crash", None, None);
+        a.tracked = Some(true);
+        let out = search(&conn, a, today()).unwrap();
+        assert!(out.contains("Crash feature"), "{out}");
+        assert!(
+            !out.contains("Crash bug") && !out.contains("Plain crash"),
+            "{out}"
+        );
+        // false is no filter.
+        let mut a = search_args("crash", None, None);
+        a.tracked = Some(false);
+        let out = search(&conn, a, today()).unwrap();
+        assert!(
+            out.contains("Crash bug") && out.contains("Crash feature"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

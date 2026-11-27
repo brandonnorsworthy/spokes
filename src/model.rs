@@ -327,6 +327,8 @@ pub struct Node {
     pub work_type: Option<WorkType>,
     /// Where the work is; own value only, separate from status.
     pub refinement: Option<Refinement>,
+    /// The UTC instant the node was tracked (set through MCP); `None` = not tracked.
+    pub tracked_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Last activity on the node or anything beneath it (bubbles up).
