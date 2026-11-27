@@ -23,6 +23,8 @@ use crate::tools::args::SearchArgs;
 const DEFAULT_LIMIT: i64 = 10;
 const MAX_LIMIT: i64 = 50;
 const MAX_KEYWORDS: usize = 12;
+/// Furthest page start (`offset`) a search accepts.
+pub const MAX_OFFSET: usize = 10_000;
 /// FTS candidates scored per call; ranked by bm25 first, so the best survive the cut.
 const MAX_CANDIDATES: i64 = 500;
 
@@ -455,6 +457,16 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         Some(l) => l.parse("limit")?.clamp(1, MAX_LIMIT),
         None => DEFAULT_LIMIT,
     } as usize;
+    let offset = match &args.offset {
+        Some(o) => {
+            let o = o.parse("offset")?;
+            if !(0..=MAX_OFFSET as i64).contains(&o) {
+                return Err(format!("offset must be 0 to {MAX_OFFSET}."));
+            }
+            o as usize
+        }
+        None => 0,
+    };
     let scope = match &args.scope {
         Some(s) => require(conn, s.parse()?)?.id,
         None => ROOT_ID,
@@ -523,23 +535,34 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         .iter()
         .filter(|k| hits.iter().any(|h| h.matched.contains(k)))
         .count();
+    let shown_end = (offset + limit).min(hits.len());
+    let range = if offset > 0 && offset < hits.len() {
+        format!(" (showing {}-{})", offset + 1, shown_end)
+    } else {
+        String::new()
+    };
     let mut out = vec![format!(
-        "{} {} for {}:",
+        "{} {} for {}{range}:",
         hits.len(),
         if hits.len() == 1 { "match" } else { "matches" },
         subject
     )];
-    for hit in hits.iter().take(limit) {
+    if offset >= hits.len() {
+        out.push(format!(
+            "(offset {offset} is past the last match; pass a smaller offset, or none.)"
+        ));
+    }
+    for hit in hits.iter().skip(offset).take(limit) {
         let node = require(conn, hit.id)?;
         out.push(format!(
             "  {}",
             result_line(&node, &meta, &focus, hit, live, today, full_paths)
         ));
     }
-    if hits.len() > limit {
+    if hits.len() > shown_end && offset < hits.len() {
         out.push(format!(
-            "(+{} more matches. Add or change keywords, or pass scope.)",
-            hits.len() - limit
+            "(+{} more matches. Pass offset: {shown_end} for the next page, or add keywords or scope.)",
+            hits.len() - shown_end
         ));
     }
     if let Some(note) = weaker_note {
@@ -549,6 +572,13 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         out.push(note);
     }
     Ok(out.join("\n"))
+}
+
+/// Which slice of the ranked matches to send.
+#[derive(Clone, Copy, Debug)]
+pub struct Page {
+    pub offset: usize,
+    pub limit: usize,
 }
 
 /// Default and largest `limit` of `/api/search`.
@@ -584,7 +614,9 @@ pub struct ApiSearch {
     /// How keywords combined: `best`, `any` or `all`.
     #[serde(rename = "match")]
     pub match_mode: &'static str,
-    /// Matches found (before `limit`).
+    /// Where this page starts in the ranked matches.
+    pub offset: usize,
+    /// Matches found (before `offset` and `limit`).
     pub total: usize,
     pub hidden_closed: usize,
     /// Weaker matches left out by `match=best`.
@@ -601,7 +633,7 @@ pub fn api_search(
     mode: MatchMode,
     scope: NodeId,
     show: Show,
-    limit: usize,
+    page: Page,
 ) -> Result<ApiSearch, String> {
     let Found {
         hits,
@@ -611,7 +643,7 @@ pub fn api_search(
     } = find(conn, query, &kws, Filters::default(), mode, scope, show)?;
     let focus = focus_numbers(conn)?;
     let mut results = Vec::new();
-    for hit in hits.iter().take(limit) {
+    for hit in hits.iter().skip(page.offset).take(page.limit) {
         let node = require(conn, hit.id)?;
         let mut path: Vec<Crumb> = lineage(&meta, hit.id)
             .skip(1)
@@ -638,6 +670,7 @@ pub fn api_search(
     Ok(ApiSearch {
         keywords: kws,
         match_mode: mode.as_str(),
+        offset: page.offset,
         total: hits.len(),
         hidden_closed,
         weaker_hidden,
@@ -1000,6 +1033,7 @@ mod tests {
             refinement: refinement.map(String::from),
             full_paths: None,
             match_mode: None,
+            offset: None,
         }
     }
 
@@ -1395,6 +1429,56 @@ mod tests {
         assert!(
             !line_of(&out, "Duplicate tile").contains("matched"),
             "{out}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offset_pages_through_matches_without_gaps_or_overlap() {
+        let (mut conn, dir) = temp_db("search-pages");
+        for i in 0..25 {
+            add::add(
+                &mut conn,
+                args(None, &format!("Pager item {i:02}"), Kind::Task),
+            )
+            .unwrap();
+        }
+        let page = |offset: Option<i64>| {
+            let mut a = search_args("pager", None, None);
+            a.offset = offset.map(crate::model::NumArg::Number);
+            search(&conn, a, today()).unwrap()
+        };
+        let p1 = page(None);
+        assert!(p1.starts_with("25 matches for pager:"), "{p1}");
+        assert!(
+            p1.contains("(+15 more matches. Pass offset: 10 for the next page"),
+            "{p1}"
+        );
+        let p2 = page(Some(10));
+        assert!(
+            p2.starts_with("25 matches for pager (showing 11-20):"),
+            "{p2}"
+        );
+        assert!(p2.contains("Pass offset: 20"), "{p2}");
+        let p3 = page(Some(20));
+        assert!(
+            p3.starts_with("25 matches for pager (showing 21-25):"),
+            "{p3}"
+        );
+        assert!(!p3.contains("more matches"), "{p3}");
+        let mut seen: Vec<String> = [&p1, &p2, &p3].iter().flat_map(|p| ids_in(p)).collect();
+        assert_eq!(seen.len(), 25);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 25, "no overlap");
+        let past = page(Some(40));
+        assert!(past.contains("offset 40 is past the last match"), "{past}");
+        let mut a = search_args("pager", None, None);
+        a.offset = Some(crate::model::NumArg::Number(-1));
+        assert!(
+            search(&conn, a, today())
+                .unwrap_err()
+                .contains("offset must be 0 to")
         );
         let _ = std::fs::remove_dir_all(dir);
     }

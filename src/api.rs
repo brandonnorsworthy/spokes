@@ -435,6 +435,7 @@ async fn search(
         &[
             "q",
             "limit",
+            "offset",
             "include_closed",
             "include_dropped",
             "scope",
@@ -467,6 +468,20 @@ async fn search(
                 ))
             })?,
     };
+    let offset = match p.get("offset") {
+        None => 0,
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|o| *o <= find::MAX_OFFSET)
+            .ok_or_else(|| {
+                bad(format!(
+                    "offset must be a whole number from 0 to {}",
+                    find::MAX_OFFSET
+                ))
+            })?,
+    };
     let (include_closed, include_dropped) = visibility(&p)?;
     let scope = match p.get("scope") {
         None => crate::model::ROOT_ID,
@@ -481,7 +496,7 @@ async fn search(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&q, &mut hasher);
     let tag = format!(
-        "s.{:x}.{limit}.{}{}.{}.{}",
+        "s.{:x}.{limit}.{offset}.{}{}.{}.{}",
         std::hash::Hasher::finish(&hasher),
         u8::from(include_closed),
         u8::from(include_dropped),
@@ -502,7 +517,7 @@ async fn search(
                 done: include_closed,
                 dropped: include_dropped,
             },
-            limit,
+            find::Page { offset, limit },
         )?;
         Ok(SearchBody {
             meta,

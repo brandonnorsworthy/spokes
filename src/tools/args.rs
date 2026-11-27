@@ -174,6 +174,9 @@ pub struct SearchArgs {
     /// Max results (default 10).
     #[schemars(with = "Option<u32>")]
     pub limit: Option<NumArg>,
+    /// Skip this many results, for the next page (default 0); the reply says which offset comes next.
+    #[schemars(with = "Option<u32>")]
+    pub offset: Option<NumArg>,
     /// Only nodes of this type (bug, feature, chore, idea, epic, spike).
     #[serde(rename = "type")]
     pub work_type: Option<String>,
