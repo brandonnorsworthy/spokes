@@ -432,7 +432,14 @@ async fn search(
 ) -> Result<Response, ApiError> {
     let p = params(
         query,
-        &["q", "limit", "include_closed", "include_dropped", "scope"],
+        &[
+            "q",
+            "limit",
+            "include_closed",
+            "include_dropped",
+            "scope",
+            "match",
+        ],
     )?;
     let q = p.get("q").map(|v| v.trim().to_string()).unwrap_or_default();
     if q.chars().count() > MAX_QUERY_CHARS {
@@ -465,21 +472,38 @@ async fn search(
         None => crate::model::ROOT_ID,
         Some(v) => parse_id(v, "scope")?,
     };
+    let mode = match p.get("match").map(|v| v.trim()) {
+        None => find::MatchMode::Best,
+        Some("") => return Err(bad("match must be best, any or all")),
+        Some(v) => find::MatchMode::parse(v).map_err(|_| bad("match must be best, any or all"))?,
+    };
     // The query text goes into the ETag as a hash: it is free text, a header is not.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&q, &mut hasher);
     let tag = format!(
-        "s.{:x}.{limit}.{}{}.{}",
+        "s.{:x}.{limit}.{}{}.{}.{}",
         std::hash::Hasher::finish(&hasher),
         u8::from(include_closed),
         u8::from(include_dropped),
-        scope.0
+        scope.0,
+        mode.as_str()
     );
     Ok(respond(api, headers, tag, move |conn, meta, _today, _now| {
         if load(conn, scope)?.is_none() {
             return Err(ViewError::NotFound(format!("{scope} does not exist")));
         }
-        let found = find::api_search(conn, &q, kws, scope, include_closed, include_dropped, limit)?;
+        let found = find::api_search(
+            conn,
+            &q,
+            kws,
+            mode,
+            scope,
+            find::Show {
+                done: include_closed,
+                dropped: include_dropped,
+            },
+            limit,
+        )?;
         Ok(SearchBody {
             meta,
             query: q,

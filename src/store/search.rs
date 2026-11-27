@@ -26,9 +26,61 @@ const MAX_KEYWORDS: usize = 12;
 /// FTS candidates scored per call; ranked by bm25 first, so the best survive the cut.
 const MAX_CANDIDATES: i64 = 500;
 
-const W_TITLE: f64 = 3.0;
-const W_ALIAS: f64 = 2.0;
-const W_NOTES: f64 = 1.0;
+/// How much a keyword hit counts per field: a title hit fully, an alias nearly, a notes
+/// hit much less (long prose mentions many things, and feedback notes often quote whole
+/// queries).
+const W_TITLE: f64 = 1.0;
+const W_ALIAS: f64 = 0.85;
+const W_NOTES: f64 = 0.4;
+/// The rarest keyword of a query weighs 1, the commonest no less than this.
+const MIN_KEYWORD_WEIGHT: f64 = 0.25;
+/// A node with children whose title or aliases hold at least a third of the matched
+/// keywords: the usual "where do I add this" parent.
+const PARENT_BONUS: f64 = 1.15;
+/// Notes-only keyword hits add up to at most this (about one title word): a note that
+/// mentions or quotes many of the words must not outrank a node named by them.
+const NOTES_CAP: f64 = 1.2;
+/// A parent whose own descendants also match is where those results cluster: each such
+/// descendant lifts it by this share, up to `CLUSTER_MAX` of them.
+const CLUSTER_STEP: f64 = 0.06;
+const CLUSTER_MAX: usize = 5;
+/// With two or more keywords, results scoring under this share of the best are left out
+/// by default (`match: "best"`), apart from the first few.
+const QUIET_SHARE: f64 = 0.4;
+const QUIET_KEEP: usize = 3;
+
+/// How keywords combine.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum MatchMode {
+    /// Any keyword, but drop the much weaker matches (the default).
+    #[default]
+    Best,
+    /// Every node matching any keyword.
+    Any,
+    /// Only nodes matching every keyword.
+    All,
+}
+
+impl MatchMode {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "best" | "" => Ok(MatchMode::Best),
+            "any" => Ok(MatchMode::Any),
+            "all" => Ok(MatchMode::All),
+            other => Err(format!(
+                "match {other:?} is not known. Use best (the default), any or all."
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchMode::Best => "best",
+            MatchMode::Any => "any",
+            MatchMode::All => "all",
+        }
+    }
+}
 
 /// Normalized index text of one node.
 struct Doc {
@@ -63,6 +115,12 @@ struct Hit {
     id_match: bool,
     /// The keywords this node matched, in query order.
     matched: Vec<String>,
+    /// Per keyword (aligned with the query's keywords): the field-weighted strength.
+    strengths: Vec<f64>,
+    /// Per keyword: matched in the title or an alias, not only in notes.
+    head: Vec<bool>,
+    /// The whole-phrase bonus.
+    bonus: f64,
 }
 
 /// Keywords of a query as `search` uses them (empty when it has no words). A bare
@@ -120,7 +178,17 @@ struct Found {
     /// Best first.
     hits: Vec<Hit>,
     hidden_closed: usize,
+    /// Weaker matches left out by `match: "best"`.
+    weaker_hidden: usize,
     meta: HashMap<NodeId, Meta>,
+}
+
+/// Which closed nodes a search may return: done ones, dropped ones (each with what lies
+/// under it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Show {
+    pub done: bool,
+    pub dropped: bool,
 }
 
 /// Type and refinement filters: a node's own values must equal every filter given.
@@ -144,9 +212,9 @@ fn find(
     query: &str,
     kws: &[String],
     filters: Filters,
+    mode: MatchMode,
     scope: NodeId,
-    include_done: bool,
-    include_dropped: bool,
+    show: Show,
 ) -> Result<Found, String> {
     let meta = load_meta(conn)?;
     let mut hits = if kws.is_empty() {
@@ -157,10 +225,20 @@ fn find(
                 via: None,
                 id_match: false,
                 matched: Vec::new(),
+                strengths: Vec::new(),
+                head: Vec::new(),
+                bonus: 0.0,
             })
             .collect()
     } else {
-        keyword_hits(conn, query, kws)?
+        let mut hits = keyword_hits(conn, query, kws)?;
+        weigh(&mut hits, kws.len(), meta.len());
+        let live = live_keywords(&hits, kws.len());
+        parent_bonus(&mut hits, &meta, live);
+        if mode == MatchMode::All {
+            hits.retain(|h| h.matched.len() == kws.len());
+        }
+        hits
     };
     // A typed id is unambiguous: that node comes first, in the order typed, even when
     // it is done or dropped (every node stays reachable by id). Scope and the type and
@@ -187,6 +265,9 @@ fn find(
                 .filter(|k| k.strip_prefix("spoke").unwrap_or(k) == id.0.to_string())
                 .cloned()
                 .collect(),
+            strengths: Vec::new(),
+            head: Vec::new(),
+            bonus: 0.0,
         })
         .collect();
     let mut hidden_closed = 0;
@@ -195,7 +276,7 @@ fn find(
         {
             return false;
         }
-        if hidden_here_or_above(&meta, h.id, include_done, include_dropped) {
+        if hidden_here_or_above(&meta, h.id, show.done, show.dropped) {
             hidden_closed += 1;
             return false;
         }
@@ -210,10 +291,25 @@ fn find(
             })
             .then(a.id.cmp(&b.id))
     });
+    let mut weaker_hidden = 0;
+    if mode == MatchMode::Best
+        && kws.len() >= 2
+        && let Some(top) = hits.first().map(|h| h.score)
+    {
+        let cut = top * QUIET_SHARE;
+        let before = hits.len();
+        let mut i = 0;
+        hits.retain(|h| {
+            i += 1;
+            i <= QUIET_KEEP || h.score >= cut
+        });
+        weaker_hidden = before - hits.len();
+    }
     hits.splice(0..0, id_hits);
     Ok(Found {
         hits,
         hidden_closed,
+        weaker_hidden,
         meta,
     })
 }
@@ -244,6 +340,72 @@ fn keyword_hits(conn: &Connection, query: &str, kws: &[String]) -> Result<Vec<Hi
         }
     }
     Ok(hits)
+}
+
+/// Final scores: each keyword counts by its rarity among the matches (a word half the
+/// tree mentions says little), times how strongly and where it matched, plus the
+/// phrase bonus. A node matching more of the rarer keywords therefore ranks first.
+fn weigh(hits: &mut [Hit], n_kws: usize, n_nodes: usize) {
+    let n = n_nodes.max(1) as f64;
+    let raw: Vec<f64> = (0..n_kws)
+        .map(|i| {
+            let df = hits.iter().filter(|h| h.strengths[i] > 0.0).count().max(1) as f64;
+            (1.0 + n / df).ln()
+        })
+        .collect();
+    let top = raw.iter().copied().fold(0.0, f64::max);
+    let weights: Vec<f64> = raw
+        .iter()
+        .map(|w| {
+            let share = if top > 0.0 { w / top } else { 1.0 };
+            MIN_KEYWORD_WEIGHT + (1.0 - MIN_KEYWORD_WEIGHT) * share
+        })
+        .collect();
+    for h in hits.iter_mut() {
+        let (mut named, mut notes) = (0.0, 0.0);
+        for ((s, w), head) in h.strengths.iter().zip(&weights).zip(&h.head) {
+            if *head {
+                named += s * w;
+            } else {
+                notes += s * w;
+            }
+        }
+        h.score = named + notes.min(NOTES_CAP) + h.bonus;
+    }
+}
+
+/// How many keywords matched at least one node (a keyword nothing has does not count
+/// against anyone).
+fn live_keywords(hits: &[Hit], n_kws: usize) -> usize {
+    (0..n_kws)
+        .filter(|i| {
+            hits.iter()
+                .any(|h| h.strengths.get(*i).is_some_and(|s| *s > 0.0))
+        })
+        .count()
+}
+
+/// A parent (any node with children) whose title or aliases carry at least a third of
+/// the matched keywords is the likely place to add under, so it gets a small lift.
+fn parent_bonus(hits: &mut [Hit], meta: &HashMap<NodeId, Meta>, n_kws: usize) {
+    let parents: std::collections::HashSet<NodeId> =
+        meta.values().filter_map(|m| m.parent).collect();
+    let matched: std::collections::HashSet<NodeId> = hits.iter().map(|h| h.id).collect();
+    let mut below: HashMap<NodeId, usize> = HashMap::new();
+    for h in hits.iter() {
+        for (a, _) in lineage(meta, h.id).skip(1) {
+            if matched.contains(&a) {
+                *below.entry(a).or_default() += 1;
+            }
+        }
+    }
+    for h in hits.iter_mut() {
+        let head = h.head.iter().filter(|b| **b).count();
+        if parents.contains(&h.id) && head > 0 && head * 3 >= n_kws {
+            let cluster = below.get(&h.id).copied().unwrap_or(0).min(CLUSTER_MAX);
+            h.score *= PARENT_BONUS + CLUSTER_STEP * cluster as f64;
+        }
+    }
 }
 
 /// The node's own type and refinement must equal every filter given.
@@ -298,19 +460,32 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         None => ROOT_ID,
     };
     let include_done = args.include_done.unwrap_or(false);
+    let mode = match &args.match_mode {
+        Some(m) => MatchMode::parse(m)?,
+        None => MatchMode::Best,
+    };
     let Found {
         hits,
         hidden_closed,
+        weaker_hidden,
         meta,
     } = find(
         conn,
         &args.query,
         &kws,
         filters,
+        mode,
         scope,
-        include_done,
-        include_done,
+        Show {
+            done: include_done,
+            dropped: include_done,
+        },
     )?;
+    let weaker_note = (weaker_hidden > 0).then(|| {
+        format!(
+            "({weaker_hidden} weaker matches, on fewer or commoner keywords, left out; pass match: \"any\" to list them, or match: \"all\" to narrow.)"
+        )
+    });
 
     let hidden_note = (hidden_closed > 0).then(|| {
         format!(
@@ -334,10 +509,20 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
             out.push('\n');
             out.push_str(&note);
         }
+        if mode == MatchMode::All && kws.len() > 1 {
+            out.push_str(
+                "\n(No node has every keyword; drop match: \"all\" to see partial matches.)",
+            );
+        }
         return Ok(out);
     }
 
     let focus = focus_numbers(conn)?;
+    // Keywords some match has: one nothing matched is not "missing" from every result.
+    let live = kws
+        .iter()
+        .filter(|k| hits.iter().any(|h| h.matched.contains(k)))
+        .count();
     let mut out = vec![format!(
         "{} {} for {}:",
         hits.len(),
@@ -348,7 +533,7 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         let node = require(conn, hit.id)?;
         out.push(format!(
             "  {}",
-            result_line(&node, &meta, &focus, hit, today, full_paths)
+            result_line(&node, &meta, &focus, hit, live, today, full_paths)
         ));
     }
     if hits.len() > limit {
@@ -356,6 +541,9 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
             "(+{} more matches. Add or change keywords, or pass scope.)",
             hits.len() - limit
         ));
+    }
+    if let Some(note) = weaker_note {
+        out.push(note);
     }
     if let Some(note) = hidden_note {
         out.push(note);
@@ -393,9 +581,14 @@ pub struct ApiHit {
 #[derive(Debug, Serialize)]
 pub struct ApiSearch {
     pub keywords: Vec<String>,
+    /// How keywords combined: `best`, `any` or `all`.
+    #[serde(rename = "match")]
+    pub match_mode: &'static str,
     /// Matches found (before `limit`).
     pub total: usize,
     pub hidden_closed: usize,
+    /// Weaker matches left out by `match=best`.
+    pub weaker_hidden: usize,
     pub results: Vec<ApiHit>,
 }
 
@@ -405,24 +598,17 @@ pub fn api_search(
     conn: &Connection,
     query: &str,
     kws: Vec<String>,
+    mode: MatchMode,
     scope: NodeId,
-    include_closed: bool,
-    include_dropped: bool,
+    show: Show,
     limit: usize,
 ) -> Result<ApiSearch, String> {
     let Found {
         hits,
         hidden_closed,
+        weaker_hidden,
         meta,
-    } = find(
-        conn,
-        query,
-        &kws,
-        Filters::default(),
-        scope,
-        include_closed,
-        include_dropped,
-    )?;
+    } = find(conn, query, &kws, Filters::default(), mode, scope, show)?;
     let focus = focus_numbers(conn)?;
     let mut results = Vec::new();
     for hit in hits.iter().take(limit) {
@@ -446,13 +632,15 @@ pub fn api_search(
             via: hit.via.clone(),
             id_match: hit.id_match,
             matched: hit.matched.clone(),
-            hidden_by: hidden_by(&meta, hit.id, include_closed, include_dropped),
+            hidden_by: hidden_by(&meta, hit.id, show.done, show.dropped),
         });
     }
     Ok(ApiSearch {
         keywords: kws,
+        match_mode: mode.as_str(),
         total: hits.len(),
         hidden_closed,
+        weaker_hidden,
         results,
     })
 }
@@ -463,6 +651,7 @@ fn result_line(
     meta: &HashMap<NodeId, Meta>,
     focus: &HashMap<NodeId, usize>,
     hit: &Hit,
+    n_kws: usize,
     today: NaiveDate,
     full_paths: bool,
 ) -> String {
@@ -516,8 +705,16 @@ fn result_line(
             path
         }
     );
-    if let Some(via) = &hit.via {
-        line.push_str(&format!("  ({via})"));
+    let mut why: Vec<String> = hit.via.iter().cloned().collect();
+    if !hit.id_match && n_kws > 1 && hit.matched.len() < n_kws {
+        why.push(format!(
+            "matched {} of {n_kws}: {}",
+            hit.matched.len(),
+            hit.matched.join(", ")
+        ));
+    }
+    if !why.is_empty() {
+        line.push_str(&format!("  ({})", why.join("; ")));
     }
     line
 }
@@ -621,9 +818,12 @@ fn best_line<'a>(kw: &str, column: &'a str) -> Option<&'a str> {
 /// server") earns a bonus, so the user's own words beat a bare keyword hit.
 fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
     let mut total = 0.0;
+    let mut bonus = 0.0;
     let mut title_hit = false;
     let mut via: Option<String> = None;
     let mut matched: Vec<String> = Vec::new();
+    let mut strengths: Vec<f64> = Vec::with_capacity(kws.len());
+    let mut head: Vec<bool> = Vec::with_capacity(kws.len());
     let contains_phrase = |column: &str| {
         column
             .lines()
@@ -631,11 +831,11 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
             .map(str::to_string)
     };
     if contains_phrase(&doc.title).is_some() {
-        total += W_TITLE;
+        bonus += W_TITLE;
         title_hit = true;
     }
     if let Some(alias) = contains_phrase(&doc.aliases) {
-        total += W_ALIAS;
+        bonus += W_ALIAS;
         via = Some(format!("alias \"{alias}\""));
     }
     for kw in kws {
@@ -649,6 +849,8 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
             .into_iter()
             .max_by(|a, b| a.0.total_cmp(&b.0))
             .expect("three options");
+        strengths.push(s.max(0.0));
+        head.push(s > 0.0 && field != Field::Notes);
         if s <= 0.0 {
             continue;
         }
@@ -663,12 +865,15 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
             _ => {}
         }
     }
-    (total > 0.0).then_some(Hit {
+    (total + bonus > 0.0).then_some(Hit {
         id,
-        score: total,
+        score: total + bonus,
         via: if title_hit { None } else { via },
         id_match: false,
         matched,
+        strengths,
+        head,
+        bonus,
     })
 }
 
@@ -794,6 +999,7 @@ mod tests {
             work_type: work_type.map(String::from),
             refinement: refinement.map(String::from),
             full_paths: None,
+            match_mode: None,
         }
     }
 
@@ -1027,6 +1233,169 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains('…'), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A small tree with the shapes that made loose queries noisy (SPOKE-774, SPOKE-226):
+    /// a YouTube area with video ideas, a Discord status bot project with a child whose
+    /// aliases match many words, a feedback task whose notes quote the whole query, and
+    /// filler that makes "video", "ideas" and "content" common words.
+    fn loose_tree(name: &str) -> (Connection, std::path::PathBuf) {
+        use crate::tools::args::NodeSpec;
+        let (mut conn, dir) = temp_db(name);
+        let mut put =
+            |parent: Option<i64>, title: &str, kind: Kind, aliases: &[&str], notes: &str| {
+                let mut a = args(parent, title, kind);
+                a.node = NodeSpec {
+                    aliases: (!aliases.is_empty())
+                        .then(|| aliases.iter().map(|s| s.to_string()).collect()),
+                    notes: (!notes.is_empty()).then(|| notes.to_string()),
+                    ..a.node
+                };
+                add::add(&mut conn, a).unwrap();
+            };
+        put(None, "Hobbies", Kind::Area, &[], ""); // 2
+        put(
+            Some(2),
+            "YouTube",
+            Kind::Area,
+            &["youtube channel", "video content"],
+            "",
+        ); // 3
+        put(
+            Some(3),
+            "Video idea: a skit",
+            Kind::Task,
+            &[],
+            "content ideas",
+        ); // 4
+        put(
+            Some(3),
+            "Editing idea: transition by holding a picture",
+            Kind::Task,
+            &["video editing"],
+            "",
+        ); // 5
+        put(None, "Projects", Kind::Area, &[], ""); // 6
+        put(
+            Some(6),
+            "norsworthy-discord-status",
+            Kind::Area,
+            &["discord status bot", "discord bot"],
+            "",
+        ); // 7
+        put(
+            Some(7),
+            "Duplicate tile after a container recreate",
+            Kind::Task,
+            &["duplicate server entries", "status image duplicate tiles"],
+            "",
+        ); // 8
+        put(
+            Some(7),
+            "Re-run CI on the status image PRs",
+            Kind::Task,
+            &[],
+            "",
+        ); // 9
+        put(
+            Some(6),
+            "Search ranks too loosely",
+            Kind::Task,
+            &[],
+            "I searched youtube video editing transition ideas video content channel and \
+             discord status bot server tile chart image offline and got dozens of hits",
+        ); // 10
+        for i in 0..12 {
+            put(
+                Some(6),
+                &format!("Filler {i}"),
+                Kind::Task,
+                &[],
+                "video ideas and content for some server image",
+            ); // 11..22
+        }
+        (conn, dir)
+    }
+
+    fn ids_in(out: &str) -> Vec<String> {
+        out.lines()
+            .skip(1)
+            .filter(|l| l.starts_with("  SPOKE-"))
+            .map(|l| l.split_whitespace().next().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn loose_youtube_query_finds_the_area_first_and_stays_short() {
+        let (conn, dir) = loose_tree("search-loose-yt");
+        let q = "youtube video editing transition ideas video content channel";
+        let out = search(&conn, search_args(q, None, None), today()).unwrap();
+        let ids = ids_in(&out);
+        assert_eq!(ids[0], "SPOKE-3", "{out}");
+        assert!(ids.len() <= 5, "{out}");
+        // Notes that quote the query rank below every node the words name.
+        let pos = |id: &str| ids.iter().position(|i| i == id).unwrap_or(usize::MAX);
+        assert!(
+            pos("SPOKE-10") > pos("SPOKE-5"),
+            "quoted notes must not win: {out}"
+        );
+        assert!(out.contains("weaker matches"), "{out}");
+        // match: any lists everything again.
+        let mut a = search_args(q, None, None);
+        a.match_mode = Some("any".into());
+        let all = search(&conn, a, today()).unwrap();
+        assert!(
+            ids_in(&all).len() > ids.len() || all.contains("more matches"),
+            "{all}"
+        );
+        assert!(!all.contains("weaker matches"), "{all}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loose_discord_query_puts_the_parent_first() {
+        let (conn, dir) = loose_tree("search-loose-discord");
+        let q = "discord status bot server tile chart image offline";
+        let out = search(&conn, search_args(q, None, None), today()).unwrap();
+        assert_eq!(ids_in(&out)[0], "SPOKE-7", "{out}");
+        assert!(ids_in(&out).len() <= 6, "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn match_all_keeps_only_nodes_with_every_keyword() {
+        let (conn, dir) = loose_tree("search-all");
+        let mut a = search_args("duplicate tile", None, None);
+        a.match_mode = Some("ALL".into());
+        let out = search(&conn, a, today()).unwrap();
+        assert_eq!(ids_in(&out), vec!["SPOKE-8"], "{out}");
+        let mut a = search_args("duplicate zzqqxx", None, None);
+        a.match_mode = Some("all".into());
+        let out = search(&conn, a, today()).unwrap();
+        assert!(out.starts_with("No matches"), "{out}");
+        let mut a = search_args("tile", None, None);
+        a.match_mode = Some("most".into());
+        assert!(
+            search(&conn, a, today())
+                .unwrap_err()
+                .contains("best (the default), any or all")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn partial_matches_say_which_keywords_they_had() {
+        let (conn, dir) = loose_tree("search-matched");
+        let out = search(&conn, search_args("duplicate rerun", None, None), today()).unwrap();
+        let line = line_of(&out, "Duplicate tile");
+        assert!(line.ends_with("(matched 1 of 2: duplicate)"), "{line}");
+        // A keyword nothing has does not count: no note when every live keyword matched.
+        let out = search(&conn, search_args("duplicate zzqqxx", None, None), today()).unwrap();
+        assert!(
+            !line_of(&out, "Duplicate tile").contains("matched"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
