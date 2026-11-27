@@ -181,6 +181,9 @@ pub struct SearchArgs {
     pub refinement: Option<String>,
     /// Show every ancestor in each result's path (default: the last 3, with ids).
     pub full_paths: Option<bool>,
+    /// How keywords combine: "best" (default: any keyword, much weaker matches left out), "any" (every node matching any keyword) or "all" (only nodes matching every keyword).
+    #[serde(rename = "match")]
+    pub match_mode: Option<String>,
     /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
     #[schemars(skip)]
     pub stage: Option<serde_json::Value>,

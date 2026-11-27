@@ -1740,6 +1740,45 @@ async fn search_finds_a_node_by_its_id() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn search_match_modes() {
+    let dir = temp_dir("search-match");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+    m.add(None, json!({"title": "Duplicate tile bug"})).await;
+    m.add(None, json!({"title": "Tile colours"})).await;
+    let both = id_of(&path, "Duplicate tile bug");
+
+    let v = m.get("/api/search?q=duplicate%20tile", &[]).await.json();
+    assert_eq!(v["match"], "best");
+    assert_eq!(v["weaker_hidden"], 0);
+    assert_eq!(v["results"][0]["id"].as_i64(), Some(both));
+    assert_eq!(v["results"][0]["matched"], json!(["duplicate", "tile"]));
+    assert_eq!(v["results"][1]["matched"], json!(["tile"]));
+
+    let v = m
+        .get("/api/search?q=duplicate%20tile&match=all", &[])
+        .await
+        .json();
+    assert_eq!(v["match"], "all");
+    assert_eq!(ids_of_results(&v), vec![both]);
+    let v = m
+        .get("/api/search?q=duplicate%20tile&match=ANY", &[])
+        .await
+        .json();
+    assert_eq!(v["match"], "any");
+    assert_eq!(v["total"], 2);
+
+    for bad in ["match=most", "match=", "match=all&match=any"] {
+        let r = m.get(&format!("/api/search?q=tile&{bad}"), &[]).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn ids_of_results(v: &Value) -> Vec<i64> {
     v["results"]
         .as_array()
