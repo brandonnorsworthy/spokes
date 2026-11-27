@@ -97,7 +97,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. A node id (958, SPOKE-958) puts that node first. Each result shows its path. Search before adding. type and refinement filter; with an empty query they list every match."
+        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. A node id (958, SPOKE-958) puts that node first. Each result shows its path (last 3 ancestors with ids; full_paths for all). Search before adding. type and refinement filter; with an empty query they list every match."
     )]
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> ToolResult {
         let today = today_in(self.tz);

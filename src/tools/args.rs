@@ -179,6 +179,8 @@ pub struct SearchArgs {
     pub work_type: Option<String>,
     /// Only nodes at this refinement (e.g. ready).
     pub refinement: Option<String>,
+    /// Show every ancestor in each result's path (default: the last 3, with ids).
+    pub full_paths: Option<bool>,
     /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
     #[schemars(skip)]
     pub stage: Option<serde_json::Value>,

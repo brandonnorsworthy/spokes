@@ -6,7 +6,9 @@ use chrono::NaiveDate;
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{NODE_COLS, ToolResult, ancestors, breadcrumb, db_err, node_from_row, require};
+use super::{
+    NODE_COLS, ToolResult, ancestors, breadcrumb_with_parent_id, db_err, node_from_row, require,
+};
 use crate::format::{child_line, clock, earliest, header_line, today_in};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
 use crate::tools::args::GetArgs;
@@ -35,7 +37,7 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
         .fold(None, |acc, a| earliest(acc, a.due_at.as_deref()));
     let mut out = vec![header_line(&node, today, above_due)];
     if node.parent_id.is_some() {
-        let path = breadcrumb(&above);
+        let path = breadcrumb_with_parent_id(&above);
         out.push(if path.is_empty() {
             "(top level)".to_string()
         } else {
@@ -352,7 +354,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "SPOKE-3 task ordered (0/2) +notes  Deploy\nHobbies\n  1. SPOKE-4 open  Step one  <- next\n  2. SPOKE-5 open  Step two\nNOTES\nplan"
+            "SPOKE-3 task ordered (0/2) +notes  Deploy\nHobbies (SPOKE-2)\n  1. SPOKE-4 open  Step one  <- next\n  2. SPOKE-5 open  Step two\nNOTES\nplan"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
