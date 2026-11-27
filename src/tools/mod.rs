@@ -26,7 +26,7 @@ Spokes is one tree of to-dos. IDs look like SPOKE-12 (a bare 12 also works). The
 Areas (kind area: Home, Work) hold work forever and never finish; tasks get done or dropped. Nothing is deleted.
 An ordered parent's children are steps: only the first unfinished one is actionable (marked <- next).
 - \"What should I do?\" -> next (scope narrows it to one subtree).
-- To find something (\"my server\"), search first, with several keywords at once: names, synonyms, likely spellings. Results show each node's path; ask the user only if it is truly ambiguous.
+- To find something (\"my server\"), search first, with several keywords at once: names, synonyms, likely spellings. A number or SPOKE-958 finds that node first. Nodes matching more of the rarer words rank first; much weaker matches are left out (match: \"any\" lists them, \"all\" needs every word) and the footer gives the offset for the next page. Each result shows its last 3 ancestors with ids, so you can add under one directly; ask the user only if it is truly ambiguous.
 - Search before adding, so you don't create duplicates and the node lands under the right parent.
 - Write a whole plan in one add with nested children. Give every new node 2 to 5 aliases (synonyms, plain spelling, what you'd call it out loud). Long detail goes in notes, not the title.
 - Priority: level 1-4 (inherits downward) for \"this matters\"; focus for the short ranked top list.
