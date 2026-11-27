@@ -25,6 +25,7 @@ struct Clean {
     kind: Kind,
     work_type: Option<WorkType>,
     refinement: Option<Refinement>,
+    tracked: bool,
     ordered: bool,
     priority: Option<i64>,
     due: Option<String>,
@@ -116,8 +117,8 @@ fn insert(
     tx.execute(
         "INSERT INTO nodes (user_id, parent_id, position, kind, ordered, title, priority,
                             due_at, defer_until, aliases, recur, source, work_type, refinement,
-                            created_at, updated_at, touched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?11, ?11, ?11)",
+                            tracked_at, created_at, updated_at, touched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?11, ?11, ?11)",
         params![
             DEFAULT_USER,
             parent.0,
@@ -133,7 +134,8 @@ fn insert(
             spec.recur,
             spec.source,
             spec.work_type.map(WorkType::as_str),
-            spec.refinement.map(Refinement::as_str)
+            spec.refinement.map(Refinement::as_str),
+            spec.tracked.then_some(now)
         ],
     )
     .map_err(db_err)?;
@@ -202,6 +204,7 @@ fn clean_spec(
         Refinement::parse_loose,
     )
     .map_err(at)?;
+    let tracked = spec.tracked.unwrap_or(false);
     let ordered = spec.ordered.unwrap_or(false);
 
     let kids = spec.children.as_deref().unwrap_or_default();
@@ -238,6 +241,7 @@ fn clean_spec(
         kind,
         work_type,
         refinement,
+        tracked,
         ordered,
         priority,
         due,
@@ -473,6 +477,34 @@ pub(crate) mod tests {
             add(&mut conn, args(Some(2), "Area", Kind::Area))
                 .unwrap_err()
                 .contains("areas can only go under areas")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tracked_marks_top_level_and_nested_nodes() {
+        let (mut conn, dir) = temp_db("add-tracked");
+        let mut a = args(None, "Epic", Kind::Task);
+        a.node.tracked = Some(true);
+        let mut kid = args(None, "Kid", Kind::Task).node;
+        kid.tracked = Some(true);
+        let plain = args(None, "Plain", Kind::Task).node;
+        a.node.children = Some(vec![kid, plain]);
+        add(&mut conn, a).unwrap();
+        let tracked: Vec<(String, bool)> = conn
+            .prepare("SELECT title, tracked_at IS NOT NULL FROM nodes WHERE id > 1 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            tracked,
+            vec![
+                ("Epic".to_string(), true),
+                ("Kid".to_string(), true),
+                ("Plain".to_string(), false)
+            ]
         );
         let _ = std::fs::remove_dir_all(dir);
     }

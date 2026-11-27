@@ -1872,3 +1872,122 @@ async fn search_rules_and_etag() {
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn tracked_flag_and_tracked_list_with_progress() {
+    let dir = temp_dir("tracked");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let m = Mcp::new(server.addr);
+
+    // Empty at first.
+    let v = m.j("/api/tracked").await;
+    assert_eq!(v["nodes"].as_array().unwrap().len(), 0);
+    assert!(v["time_zone"].is_string() && v["today"].is_string());
+
+    m.add(
+        None,
+        json!({"title": "Home", "kind": "area", "children": [
+            {"title": "Project", "kind": "area", "children": [
+                {"title": "Sub area", "kind": "area", "children": [{"title": "Deep"}]},
+                {"title": "Done one"}, {"title": "Busy one"}, {"title": "Open one"},
+                {"title": "Dropped one"}]},
+            {"title": "Epic", "children": [{"title": "E1"}, {"title": "E2"}]},
+            {"title": "Untracked"}]}),
+    )
+    .await;
+    let (project, epic, untracked) = (
+        id_of(&path, "Project"),
+        id_of(&path, "Epic"),
+        id_of(&path, "Untracked"),
+    );
+    m.ok(
+        "set_status",
+        json!({"ids": [sid(id_of(&path, "Done one"))], "status": "done"}),
+    )
+    .await;
+    m.ok(
+        "set_status",
+        json!({"ids": [sid(id_of(&path, "Dropped one"))], "status": "dropped"}),
+    )
+    .await;
+    m.ok(
+        "claim",
+        json!({"id": sid(id_of(&path, "Busy one")), "agent": "t"}),
+    )
+    .await;
+    m.ok("update", json!({"id": sid(project), "tracked": true}))
+        .await;
+    m.ok("update", json!({"id": sid(epic), "tracked": true}))
+        .await;
+    // Pin the instants so "newest first" does not depend on the clock.
+    let conn = db(&path);
+    conn.execute(
+        "UPDATE nodes SET tracked_at = '2026-11-01T10:00:00Z' WHERE id = ?1",
+        [project],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE nodes SET tracked_at = '2026-11-02T10:00:00Z' WHERE id = ?1",
+        [epic],
+    )
+    .unwrap();
+
+    let r = m.get("/api/tracked", &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let tag = r.etag();
+    let v = r.json();
+    let list = v["nodes"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{v}");
+    assert_eq!(list[0]["node"]["id"], epic);
+    assert_eq!(list[0]["tracked_at"], "2026-11-02T10:00:00Z");
+    assert_eq!(list[0]["node"]["tracked"], true);
+    assert_eq!(
+        list[0]["progress"],
+        json!({"done": 0, "in_progress": 0, "total": 2})
+    );
+    assert_eq!(
+        list[0]["path"],
+        json!([{"id": 1, "title": "To do"}, {"id": id_of(&path, "Home"), "title": "Home"}])
+    );
+    assert_eq!(list[1]["node"]["id"], project);
+    assert_eq!(list[1]["tracked_at"], "2026-11-01T10:00:00Z");
+    // Deep, Done one, Busy one and Open one count; the area and the dropped task do not.
+    assert_eq!(
+        list[1]["progress"],
+        json!({"done": 1, "in_progress": 1, "total": 4})
+    );
+
+    // The flag is on every node JSON.
+    let v = m.j(&format!("/api/nodes/{}", sid(epic))).await;
+    assert_eq!(v["node"]["tracked"], true);
+    let v = m.j(&format!("/api/nodes/{}", sid(untracked))).await;
+    assert_eq!(v["node"]["tracked"], false);
+    let v = m.j("/api/tree?depth=3").await;
+    assert_eq!(node(&v, epic)["tracked"], true);
+    assert_eq!(node(&v, untracked)["tracked"], false);
+    let v = m.j("/api/history").await;
+    assert_eq!(node(&v, project)["tracked"], true);
+
+    // ETag/304, and a write that changes the list invalidates it.
+    let r = m.get("/api/tracked", &[("if-none-match", &tag)]).await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    m.ok("update", json!({"id": sid(epic), "tracked": false}))
+        .await;
+    let r = m.get("/api/tracked", &[("if-none-match", &tag)]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["nodes"].as_array().unwrap().len(), 1);
+
+    // Origin, method and parameter rules like the other routes.
+    let r = m
+        .get("/api/tracked", &[("origin", "http://evil.example")])
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = m.request("POST", "/api/tracked", &[]).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+    let r = m.get("/api/tracked?foo=1", &[]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}

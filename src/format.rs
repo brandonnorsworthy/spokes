@@ -172,6 +172,9 @@ fn detail_flags(node: &Node, today: NaiveDate, parent_due: Option<&str>, out: &m
     if node.has_source {
         out.push("+source".to_string());
     }
+    if node.tracked_at.is_some() {
+        out.push("tracked".to_string());
+    }
     if is_unplanned(node) {
         out.push("unplanned".to_string());
     }
@@ -229,6 +232,7 @@ mod tests {
             recur: None,
             work_type: None,
             refinement: None,
+            tracked_at: None,
             created_at: "2026-11-01T00:00:00Z".into(),
             updated_at: "2026-11-01T00:00:00Z".into(),
             touched_at: "2026-11-01T00:00:00Z".into(),

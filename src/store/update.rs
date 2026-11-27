@@ -110,6 +110,9 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
             "refinement cleared"
         });
     }
+    if let Some(t) = args.tracked {
+        changed.push(if t { "tracked" } else { "untracked" });
+    }
     let replace_notes = args
         .notes
         .as_deref()
@@ -119,9 +122,14 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     if args.notes_append.is_some() && append.is_none() {
         return Err("notes_append is empty. Pass the text to add.".to_string());
     }
-    if sets.is_empty() && replace_notes.is_none() && append.is_none() && source_append.is_none() {
+    if sets.is_empty()
+        && args.tracked.is_none()
+        && replace_notes.is_none()
+        && append.is_none()
+        && source_append.is_none()
+    {
         return Err(
-            "nothing to update. Pass at least one field (title, kind, type, refinement, ordered, priority, due, defer_until, aliases, recur, notes, notes_append, source_append). To change status use set_status; to reparent use move."
+            "nothing to update. Pass at least one field (title, kind, type, refinement, tracked, ordered, priority, due, defer_until, aliases, recur, notes, notes_append, source_append). To change status use set_status; to reparent use move."
                 .to_string(),
         );
     }
@@ -155,6 +163,20 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
         )
         .map_err(db_err)?;
     }
+
+    match args.tracked {
+        // Tracking twice keeps the first time.
+        Some(true) => tx.execute(
+            "UPDATE nodes SET tracked_at = ?1 WHERE id = ?2 AND tracked_at IS NULL",
+            params![now, id.0],
+        ),
+        Some(false) => tx.execute(
+            "UPDATE nodes SET tracked_at = NULL WHERE id = ?1",
+            params![id.0],
+        ),
+        None => Ok(0),
+    }
+    .map_err(db_err)?;
 
     match (replace_notes, append) {
         (Some(None), _) => {
@@ -492,6 +514,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(detail, "type cleared, refinement cleared");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tracks_and_untracks_keeping_the_first_time() {
+        let (mut conn, dir) = temp_db("up-tracked");
+        add(&mut conn, args(None, "Task", Kind::Task)).unwrap(); // 2
+        let tracked = |conn: &Connection| -> Option<String> {
+            conn.query_row("SELECT tracked_at FROM nodes WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(tracked(&conn), None);
+        let out = up(&mut conn, json!({"id": 2, "tracked": true})).unwrap();
+        assert_eq!(out, "Updated SPOKE-2  Task  (tracked)");
+        let first = tracked(&conn).unwrap();
+        conn.execute(
+            "UPDATE nodes SET tracked_at = '2020-01-01T00:00:00Z' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        up(&mut conn, json!({"id": 2, "tracked": true})).unwrap();
+        assert_eq!(tracked(&conn).as_deref(), Some("2020-01-01T00:00:00Z"));
+        assert!(first.as_str() > "2020");
+        let out = up(&mut conn, json!({"id": 2, "tracked": false})).unwrap();
+        assert_eq!(out, "Updated SPOKE-2  Task  (untracked)");
+        assert_eq!(tracked(&conn), None);
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM events WHERE node_id = 2 AND type = 'updated' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, "untracked");
+        // Nothing else changed.
+        let (status, priority): (String, Option<i64>) = conn
+            .query_row("SELECT status, priority FROM nodes WHERE id = 2", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((status.as_str(), priority), ("open", None));
         let _ = std::fs::remove_dir_all(dir);
     }
 

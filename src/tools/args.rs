@@ -33,6 +33,8 @@ pub struct NodeSpec {
     pub work_type: Option<String>,
     /// How ready it is for an agent: "idea", "brainstormed", "understood", "planned" or "ready" (an agent can claim it now). Separate from status; execution is tracked by status, not here.
     pub refinement: Option<String>,
+    /// true to track it: the user follows this node (usually an epic) and spokes-view lists it with its progress. Changes nothing about status, priority, focus or next.
+    pub tracked: Option<bool>,
     /// Longer body: plan, research, links. Never shown in listings.
     pub notes: Option<String>,
     /// The user's own words that led to this node, pasted exactly as typed (no summary, no edits). Kept apart from notes so the original idea can always be recovered. Set once; it can only be appended to later.
@@ -129,6 +131,8 @@ pub struct UpdateArgs {
     pub work_type: Option<String>,
     /// How ready it is for an agent: "idea", "brainstormed", "understood", "planned" or "ready" (an agent can claim it now). Separate from status; execution is tracked by status, not here. "" clears it.
     pub refinement: Option<String>,
+    /// true tracks it (the user follows it; spokes-view lists it with its progress), false stops tracking. Changes nothing about status, priority, focus or next.
+    pub tracked: Option<bool>,
     /// Replaces the whole notes body; "" clears it. To add to it, use notes_append instead.
     pub notes: Option<String>,
     /// Text appended to the end of the notes (e.g. what you did, findings).
@@ -182,6 +186,8 @@ pub struct SearchArgs {
     pub work_type: Option<String>,
     /// Only nodes at this refinement (e.g. ready).
     pub refinement: Option<String>,
+    /// true = only tracked nodes (with an empty query, every tracked node).
+    pub tracked: Option<bool>,
     /// Show every ancestor in each result's path (default: the last 3, with ids).
     pub full_paths: Option<bool>,
     /// How keywords combine: "best" (default: any keyword, much weaker matches left out), "any" (every node matching any keyword) or "all" (only nodes matching every keyword).

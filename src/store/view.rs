@@ -95,6 +95,8 @@ pub struct ViewNode {
     #[serde(rename = "type")]
     pub work_type: Option<&'static str>,
     pub refinement: Option<&'static str>,
+    /// The user follows this node (set through MCP); `/api/tracked` lists these.
+    pub tracked: bool,
     pub status: &'static str,
     pub priority: Option<i64>,
     pub effective_priority: Option<i64>,
@@ -160,6 +162,74 @@ pub struct Detail {
     pub path: Vec<Crumb>,
     pub node: DetailNode,
     pub events: Vec<Event>,
+}
+
+/// A tracked node's progress over its descendant tasks (areas, the node itself and
+/// dropped tasks are not counted).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct TrackedProgress {
+    pub done: i64,
+    pub in_progress: i64,
+    pub total: i64,
+}
+
+/// One tracked node: the node as `/api/nodes` shows it, its breadcrumb, progress and
+/// the UTC instant it was tracked.
+#[derive(Debug, Serialize)]
+pub struct TrackedNode {
+    pub node: ViewNode,
+    pub path: Vec<Crumb>,
+    pub progress: TrackedProgress,
+    pub tracked_at: String,
+}
+
+/// Every tracked node, newest tracked first; closed ones stay listed.
+pub fn tracked(conn: &Connection, today: NaiveDate, now: &str) -> ViewResult<Vec<TrackedNode>> {
+    let rows: Vec<(i64, String)> = conn
+        .prepare_cached(
+            "SELECT id, tracked_at FROM nodes WHERE user_id = ?1 AND tracked_at IS NOT NULL
+             ORDER BY tracked_at DESC, id DESC",
+        )?
+        .query_map(params![DEFAULT_USER], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, tracked_at) in rows {
+        let q = SliceQuery {
+            root: NodeId(id),
+            depth: 0,
+            include_closed: true,
+            include_dropped: true,
+        };
+        let Slice { path, nodes, .. } = slice(conn, q, today, now)?;
+        let Some(node) = nodes.into_iter().next() else {
+            continue;
+        };
+        let progress = conn.query_row(
+            "WITH RECURSIVE sub(id) AS (
+               SELECT id FROM nodes WHERE parent_id = ?1
+               UNION ALL
+               SELECT c.id FROM nodes c JOIN sub ON c.parent_id = sub.id
+             )
+             SELECT COALESCE(SUM(status = 'done'), 0), COALESCE(SUM(status = 'in_progress'), 0),
+                    COUNT(*)
+             FROM nodes WHERE id IN (SELECT id FROM sub) AND kind = 'task' AND status != 'dropped'",
+            params![id],
+            |r| {
+                Ok(TrackedProgress {
+                    done: r.get(0)?,
+                    in_progress: r.get(1)?,
+                    total: r.get(2)?,
+                })
+            },
+        )?;
+        out.push(TrackedNode {
+            node,
+            path,
+            progress,
+            tracked_at,
+        });
+    }
+    Ok(out)
 }
 
 /// The revision (largest event id; every write logs an event) and how many claims have
@@ -742,6 +812,7 @@ fn view_node(n: Node, c: ViewCounts, today: NaiveDate, now: &str) -> ViewNode {
         ordered: n.ordered,
         work_type: n.work_type.map(|t| t.as_str()),
         refinement: n.refinement.map(|s| s.as_str()),
+        tracked: n.tracked_at.is_some(),
         status: n.status.as_str(),
         priority: n.priority,
         effective_priority: c.effective,

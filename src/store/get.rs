@@ -47,6 +47,9 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
     if let Some(line) = claim_line(&node, tz) {
         out.push(line);
     }
+    if let Some(at) = &node.tracked_at {
+        out.push(format!("Tracked since {}", local_date(at, tz)));
+    }
     if let Some(rule) = node
         .recur
         .as_deref()
@@ -115,6 +118,14 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
         out.extend(history(conn, id, tz)?);
     }
     Ok(out.join("\n"))
+}
+
+/// The day of a stored UTC instant in the user's time zone, `2026-11-27`.
+fn local_date(timestamp: &str, tz: Tz) -> String {
+    match chrono::DateTime::parse_from_rfc3339(timestamp) {
+        Ok(t) => t.with_timezone(&tz).date_naive().to_string(),
+        Err(_) => timestamp.to_string(),
+    }
 }
 
 /// Who holds the node, what it waits on, or that a question was answered.

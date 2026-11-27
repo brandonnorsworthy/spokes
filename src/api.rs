@@ -7,6 +7,8 @@
 //!   oldest first, for replaying its history.
 //! - `GET /api/search?q=&limit=&include_closed=&include_dropped=&scope=`: the `search` tool's ranked
 //!   matches as data, each with its breadcrumb ids, for finding a node in the view.
+//! - `GET /api/tracked`: the nodes the user tracks (set through MCP), newest first, each with
+//!   its breadcrumb and progress over its descendant tasks, for the view's Tracked list.
 //!
 //! It reads through its own read-only SQLite connection (WAL lets it read while MCP
 //! writes), so it can neither write nor hold the MCP connection's lock. Responses carry
@@ -73,10 +75,11 @@ pub fn router(config: &Config) -> anyhow::Result<Router> {
         .route("/nodes/{id}", get(node))
         .route("/history", get(history))
         .route("/search", get(search))
+        .route("/tracked", get(tracked))
         .fallback(|| async {
             error(
                 StatusCode::NOT_FOUND,
-                "no such endpoint; use /api/tree, /api/nodes/{id}, /api/history or /api/search",
+                "no such endpoint; use /api/tree, /api/nodes/{id}, /api/history, /api/search or /api/tracked",
             )
         })
         .method_not_allowed_fallback(|| async {
@@ -407,6 +410,31 @@ async fn history(
             history,
         })
     })
+    .await)
+}
+
+#[derive(Serialize)]
+struct TrackedBody {
+    #[serde(flatten)]
+    meta: Meta,
+    nodes: Vec<view::TrackedNode>,
+}
+
+async fn tracked(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    params(query, &[])?;
+    Ok(respond(
+        api,
+        headers,
+        "k".to_string(),
+        move |conn, meta, today, now| {
+            let nodes = view::tracked(conn, today, now)?;
+            Ok(TrackedBody { meta, nodes })
+        },
+    )
     .await)
 }
 
