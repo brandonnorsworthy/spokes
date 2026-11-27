@@ -345,6 +345,7 @@ pub fn release(conn: &mut Connection, args: ReleaseArgs, tz: Tz) -> ToolResult {
             &format!("Released by {agent} ({}): {note}", today_in(tz)),
         )?;
     }
+    let handoff = note.is_some() || noted_since_claim(&tx, id)?;
     log_event(&tx, id, &now, Some(&agent), "released", note.unwrap_or("")).map_err(db_err)?;
     touch(&tx, id, &now).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
@@ -355,7 +356,30 @@ pub fn release(conn: &mut Connection, args: ReleaseArgs, tz: Tz) -> ToolResult {
     if note.is_some() {
         reply.push_str(" Your note was added to its notes.");
     }
+    let action = crate::hints::Action::Released {
+        node: &node,
+        handoff,
+    };
+    if let Some(line) = crate::hints::hint(&action) {
+        reply.push('\n');
+        reply.push_str(&line);
+    }
     Ok(reply)
+}
+
+/// Whether notes were appended or replaced on the node since it was last claimed (a
+/// renewal does not count as a new claim).
+fn noted_since_claim(conn: &Connection, id: NodeId) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events
+          WHERE node_id = ?1 AND type = 'updated'
+            AND (detail LIKE '%notes appended%' OR detail LIKE '%notes replaced%')
+            AND id > COALESCE((SELECT MAX(id) FROM events
+                  WHERE node_id = ?1 AND type = 'claimed' AND detail NOT LIKE 'renewed%'), 0))",
+        params![id.0],
+        |r| r.get(0),
+    )
+    .map_err(db_err)
 }
 
 pub fn ask(conn: &mut Connection, args: AskArgs, tz: Tz) -> ToolResult {
