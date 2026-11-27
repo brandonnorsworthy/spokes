@@ -168,6 +168,25 @@ pub(crate) fn breadcrumb(ancestors: &[Node]) -> String {
         .join(" / ")
 }
 
+/// Like [`breadcrumb`], with the parent's id after the last title:
+/// `Hobbies / Programming (SPOKE-7)`.
+pub(crate) fn breadcrumb_with_parent_id(ancestors: &[Node]) -> String {
+    let below: Vec<&Node> = ancestors.iter().filter(|a| a.parent_id.is_some()).collect();
+    let last = below.len().saturating_sub(1);
+    below
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if i == last {
+                format!("{} ({})", a.title, a.id)
+            } else {
+                a.title.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 /// Sets `touched_at` on the node and every ancestor (activity bubbles up).
 pub(crate) fn touch(conn: &Connection, id: NodeId, now: &str) -> rusqlite::Result<()> {
     conn.execute(

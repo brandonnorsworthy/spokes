@@ -288,6 +288,7 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
                 .to_string(),
         );
     }
+    let full_paths = args.full_paths.unwrap_or(false);
     let limit = match &args.limit {
         Some(l) => l.parse("limit")?.clamp(1, MAX_LIMIT),
         None => DEFAULT_LIMIT,
@@ -347,7 +348,7 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
         let node = require(conn, hit.id)?;
         out.push(format!(
             "  {}",
-            result_line(&node, &meta, &focus, hit, today)
+            result_line(&node, &meta, &focus, hit, today, full_paths)
         ));
     }
     if hits.len() > limit {
@@ -456,13 +457,14 @@ pub fn api_search(
     })
 }
 
-/// `SPOKE-30 task p1 (0/4)  Homelab server migration  in Hobbies / Homelab  (alias "nas")`.
+/// `SPOKE-30 task p1 (0/4)  Homelab server migration  in Hobbies (SPOKE-2) / Homelab (SPOKE-9)  (alias "nas")`.
 fn result_line(
     node: &Node,
     meta: &HashMap<NodeId, Meta>,
     focus: &HashMap<NodeId, usize>,
     hit: &Hit,
     today: NaiveDate,
+    full_paths: bool,
 ) -> String {
     let mut flags = vec![node.id.to_string(), node.kind.as_str().to_string()];
     if node.status != Status::Open {
@@ -503,7 +505,7 @@ fn result_line(
     if is_unplanned(node) {
         flags.push("unplanned".to_string());
     }
-    let path = path_of(meta, node.id);
+    let path = path_of(meta, node.id, full_paths);
     let mut line = format!(
         "{}  {}  in {}",
         flags.join(" "),
@@ -757,15 +759,22 @@ fn effective_level(meta: &HashMap<NodeId, Meta>, id: NodeId) -> Option<i64> {
     lineage(meta, id).find_map(|(_, m)| m.priority)
 }
 
-/// Breadcrumb below the root: `Hobbies / Homelab`.
-fn path_of(meta: &HashMap<NodeId, Meta>, id: NodeId) -> String {
-    let mut titles: Vec<&str> = lineage(meta, id)
+/// Ancestors shown per result unless `full_paths` is set.
+const SHORT_PATH: usize = 3;
+
+/// Ancestors below the root with ids: `… / Spokes (SPOKE-5) / agent-feedback (SPOKE-182)`.
+/// Only the last `SHORT_PATH` unless `full`; an empty string for a top-level node.
+fn path_of(meta: &HashMap<NodeId, Meta>, id: NodeId, full: bool) -> String {
+    let mut up: Vec<String> = lineage(meta, id)
         .skip(1)
         .filter(|(_, m)| m.parent.is_some())
-        .map(|(_, m)| m.title.as_str())
+        .map(|(a, m)| format!("{} ({a})", m.title))
         .collect();
-    titles.reverse();
-    titles.join(" / ")
+    up.reverse();
+    if full || up.len() <= SHORT_PATH {
+        return up.join(" / ");
+    }
+    format!("… / {}", up[up.len() - SHORT_PATH..].join(" / "))
 }
 
 #[cfg(test)]
@@ -784,6 +793,7 @@ mod tests {
             limit: None,
             work_type: work_type.map(String::from),
             refinement: refinement.map(String::from),
+            full_paths: None,
         }
     }
 
@@ -956,6 +966,67 @@ mod tests {
         assert!(!out.contains("SPOKE-3 "), "{out}");
         let out = search(&conn, search_args("3", Some("feature"), None), today()).unwrap();
         assert!(first_result(&out).starts_with("  SPOKE-3 "), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Alpha (SPOKE-2) > Bravo (3) > Charlie (4) > Delta (5) > Echo (6) > `Zebra leaf` (7),
+    /// plus top-level `Zebra solo` (8) and `Zebra pair` (9) under Bravo.
+    fn chain(name: &str) -> (Connection, std::path::PathBuf) {
+        let (mut conn, dir) = temp_db(name);
+        add::add(&mut conn, args(None, "Alpha", Kind::Area)).unwrap();
+        for (i, t) in ["Bravo", "Charlie", "Delta", "Echo"].iter().enumerate() {
+            add::add(&mut conn, args(Some(i as i64 + 2), t, Kind::Area)).unwrap();
+        }
+        add::add(&mut conn, args(Some(6), "Zebra leaf", Kind::Task)).unwrap();
+        add::add(&mut conn, args(None, "Zebra solo", Kind::Task)).unwrap();
+        add::add(&mut conn, args(Some(3), "Zebra pair", Kind::Task)).unwrap();
+        (conn, dir)
+    }
+
+    fn line_of(out: &str, title: &str) -> String {
+        out.lines().find(|l| l.contains(title)).unwrap().to_string()
+    }
+
+    #[test]
+    fn deep_paths_keep_the_last_three_ancestors_with_ids() {
+        let (conn, dir) = chain("search-deep");
+        let out = search(&conn, search_args("zebra", None, None), today()).unwrap();
+        assert!(
+            line_of(&out, "Zebra leaf")
+                .ends_with("in … / Charlie (SPOKE-4) / Delta (SPOKE-5) / Echo (SPOKE-6)"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn short_and_top_level_paths_have_no_ellipsis() {
+        let (conn, dir) = chain("search-short");
+        let out = search(&conn, search_args("zebra", None, None), today()).unwrap();
+        assert!(
+            line_of(&out, "Zebra pair").ends_with("in Alpha (SPOKE-2) / Bravo (SPOKE-3)"),
+            "{out}"
+        );
+        assert!(
+            line_of(&out, "Zebra solo").ends_with("in To do (top level)"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_paths_shows_every_ancestor_with_ids() {
+        let (conn, dir) = chain("search-full");
+        let mut a = search_args("zebra", None, None);
+        a.full_paths = Some(true);
+        let out = search(&conn, a, today()).unwrap();
+        assert!(
+            line_of(&out, "Zebra leaf").ends_with(
+                "in Alpha (SPOKE-2) / Bravo (SPOKE-3) / Charlie (SPOKE-4) / Delta (SPOKE-5) / Echo (SPOKE-6)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains('…'), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
