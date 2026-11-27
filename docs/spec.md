@@ -232,7 +232,7 @@ The queue lists work items, not every leaf. A node appears if it carries its own
 ### Claim lifecycle
 
 1. `claim(SPOKE-142, agent: "opus-red")` sets the task to `in_progress` with a lease, 60 minutes by default. The check and the write are a single SQL statement, so two agents cannot both win.
-2. The claimed node and everything under it vanish from `next` for everyone else.
+2. The claimed node and everything under it vanish from `next` for everyone else. The claim is on that node only: it neither takes over nor blocks claims above or beneath it.
 3. Any write by that agent on the node or its descendants renews the lease.
 4. The task ends one of four ways: `set_status done`, `release`, `ask`, or the lease running out.
 
@@ -247,7 +247,7 @@ Expiry is evaluated when the queue is read, so there is no background job to run
 
 ### Orchestrator and workers
 
-The frontier model claims the project, writes the plan as children, then hands child IDs to cheaper agents. Each worker claims its own step under its own `agent` label, reads the step's notes, does the work, appends what it did, and marks it done. Workers can run in parallel on the children of an unordered parent; an ordered parent releases one step at a time.
+The frontier model claims the project, writes the plan as children, then hands child IDs to cheaper agents. The order does not matter: a claim is refused only when another agent holds that same node, so an orchestrator can claim a project after a worker has already taken a step in it, and the reply names what others hold beneath it (SPOKE-551). Each worker claims its own step under its own `agent` label, reads the step's notes, does the work, appends what it did, and marks it done. Workers can run in parallel on the children of an unordered parent; an ordered parent releases one step at a time.
 
 Agent labels are free text supplied by the caller. Nothing verifies them in v1, which is acceptable for one user and is the first thing auth tightens.
 

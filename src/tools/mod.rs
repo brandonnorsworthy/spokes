@@ -170,7 +170,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Take a task before working on it: it leaves next for everyone else until you finish (set_status done), release or ask. The lease (default 60 min) renews with every write you make on it. Refused if another agent holds it. Claiming a task with open children names them: claim the one you are working on too."
+        description = "Take a task before working on it: it leaves next for everyone else until you finish (set_status done), release or ask. The lease (default 60 min) renews with every write you make on it. Refused only if another agent holds that same task; claims above or below it do not block it. Claiming a task with open children names them: claim the one you are working on too."
     )]
     async fn claim(&self, Parameters(args): Parameters<ClaimArgs>) -> ToolResult {
         let tz = self.tz;
