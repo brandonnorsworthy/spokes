@@ -8,7 +8,7 @@
 //! working on or finishing an area or a closed node.
 //! `SPOKES_HINTS=0` turns them all off ([`strip`], applied by the MCP layer).
 
-use crate::model::{Kind, Node, Status};
+use crate::model::{Kind, Node, NodeId, ROOT_ID, Status, id_ranges};
 
 /// Every hint line starts with this.
 pub const PREFIX: &str = "Next: ";
@@ -42,6 +42,13 @@ pub enum Action<'a> {
     /// `set_status` dropped nodes that still have unfinished work somewhere beneath them.
     /// Each entry is a dropped node with that work, in tree order.
     DroppedWithOpen { leftovers: &'a [(Node, Vec<Node>)] },
+    /// `add` created `top`, perhaps with a plan beneath it. `unaliased` are the new tasks
+    /// that have no aliases; `first_step` is the first child when `top` is ordered.
+    Added {
+        top: &'a Node,
+        unaliased: &'a [NodeId],
+        first_step: Option<&'a Node>,
+    },
 }
 
 /// The claim hint on a task someone may be about to work on (SPOKE-1006).
@@ -73,6 +80,11 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             held_below,
         } => parent_claimed(parent, open, *held_below)?,
         Action::DroppedWithOpen { leftovers } => dropped_with_open(leftovers)?,
+        Action::Added {
+            top,
+            unaliased,
+            first_step,
+        } => added(top, unaliased, *first_step)?,
     };
     Some(format!("{PREFIX}{text}"))
 }
@@ -119,6 +131,29 @@ fn parent_claimed(parent: &Node, open: &[Node], held_below: bool) -> Option<Stri
         "{} has {n} open {subtasks} ({which}). Working on one? Claim that one too. Orchestrating? Keep this claim; workers can claim their own subtasks inside it.",
         parent.id
     ))
+}
+
+/// A new node's loose ends, in one line: which step starts the plan, a task left under
+/// the root, and tasks search will have a hard time finding.
+fn added(top: &Node, unaliased: &[NodeId], first_step: Option<&Node>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(step) = first_step.filter(|_| top.kind == Kind::Task) {
+        parts.push(format!("The first step is {} {}.", step.id, step.title));
+    }
+    if top.kind == Kind::Task && top.parent_id == Some(ROOT_ID) {
+        parts.push(format!(
+            "{} is directly under the root; move it if it belongs in an area.",
+            top.id
+        ));
+    }
+    if !unaliased.is_empty() {
+        let them = if unaliased.len() == 1 { "it" } else { "them" };
+        parts.push(format!(
+            "No aliases on {}: add 2 to 5 each with update so search finds {them}.",
+            id_ranges(unaliased)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Dropping a node leaves what is under it open but out of sight, so name it.
@@ -175,7 +210,6 @@ pub fn strip(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::NodeId;
 
     fn node(id: i64, title: &str) -> Node {
         Node {
@@ -485,6 +519,47 @@ mod tests {
         let none = [(node(2, "Plan"), Vec::new())];
         assert_eq!(hint(&Action::DroppedWithOpen { leftovers: &none }), None);
         assert_eq!(hint(&Action::DroppedWithOpen { leftovers: &[] }), None);
+    }
+
+    #[test]
+    fn add_names_the_first_step_the_root_and_missing_aliases() {
+        let top = Node {
+            ordered: true,
+            ..node(2, "Plan")
+        };
+        let step = node(3, "One");
+        let bare = [NodeId(2), NodeId(3), NodeId(4)];
+        let h = hint(&Action::Added {
+            top: &top,
+            unaliased: &bare,
+            first_step: Some(&step),
+        });
+        assert_eq!(
+            h.as_deref(),
+            Some(
+                "Next: The first step is SPOKE-3 One. SPOKE-2 is directly under the root; move it if it belongs in an area. No aliases on SPOKE-2..SPOKE-4: add 2 to 5 each with update so search finds them."
+            )
+        );
+        let placed = Node {
+            parent_id: Some(NodeId(9)),
+            ..node(10, "Task")
+        };
+        let action = Action::Added {
+            top: &placed,
+            unaliased: &[],
+            first_step: None,
+        };
+        assert_eq!(hint(&action), None);
+        let area = Node {
+            kind: Kind::Area,
+            ..node(2, "Home")
+        };
+        let action = Action::Added {
+            top: &area,
+            unaliased: &[],
+            first_step: None,
+        };
+        assert_eq!(hint(&action), None);
     }
 
     #[test]

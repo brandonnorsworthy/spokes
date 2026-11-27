@@ -7,7 +7,8 @@ use super::{
 };
 use crate::db::{now, position};
 use crate::format::parse_date;
-use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, WorkType};
+use crate::hints;
+use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, WorkType, id_ranges};
 use crate::recur::{RecurArg, RecurChange};
 use crate::tools::args::{AddArgs, NodeSpec};
 
@@ -73,6 +74,7 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
     let top = ids[0];
     touch(&tx, ids[ids.len() - 1], &now).map_err(db_err)?;
     renew_leases(&tx, parent_id, agent.as_deref(), &now).map_err(db_err)?;
+    let hint = add_hint(&tx, &spec, &ids)?;
     tx.commit().map_err(db_err)?;
 
     let mut line = format!(
@@ -89,7 +91,40 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
             id_ranges(&ids[1..])
         ));
     }
+    if let Some(hint) = hint {
+        line.push('\n');
+        line.push_str(&hint);
+    }
     Ok(line)
+}
+
+/// The hint for what `add` just created (SPOKE-1079). `ids` are in the order `insert`
+/// made them: the node itself, then its children depth-first.
+fn add_hint(conn: &Connection, spec: &Clean, ids: &[NodeId]) -> Result<Option<String>, String> {
+    let mut tasks_without_aliases = Vec::new();
+    without_aliases(spec, &mut ids.iter().copied(), &mut tasks_without_aliases);
+    let top = require(conn, ids[0])?;
+    let first_step = match ids.get(1) {
+        Some(&id) if spec.ordered => Some(require(conn, id)?),
+        _ => None,
+    };
+    let action = hints::Action::Added {
+        top: &top,
+        unaliased: &tasks_without_aliases,
+        first_step: first_step.as_ref(),
+    };
+    Ok(hints::hint(&action))
+}
+
+/// Walks `spec` in insert order beside its new ids.
+fn without_aliases(spec: &Clean, ids: &mut impl Iterator<Item = NodeId>, out: &mut Vec<NodeId>) {
+    let Some(id) = ids.next() else { return };
+    if spec.kind == Kind::Task && spec.aliases.is_none() {
+        out.push(id);
+    }
+    for child in &spec.children {
+        without_aliases(child, ids, out);
+    }
 }
 
 /// Inserts `spec` as the last child of `parent`, then its children depth-first.
@@ -279,25 +314,6 @@ pub(crate) fn clean_updated<T>(
         Some(r) if r.trim().is_empty() => Ok(Some(None)),
         Some(r) => parse(r).map(|v| Some(Some(v))),
     }
-}
-
-/// `SPOKE-3..SPOKE-8, SPOKE-10`: consecutive ids collapse into ranges.
-fn id_ranges(ids: &[NodeId]) -> String {
-    let mut parts = Vec::new();
-    let mut i = 0;
-    while i < ids.len() {
-        let mut j = i;
-        while j + 1 < ids.len() && ids[j + 1].0 == ids[j].0 + 1 {
-            j += 1;
-        }
-        parts.push(match j - i {
-            0 => ids[i].to_string(),
-            1 => format!("{}, {}", ids[i], ids[j]),
-            _ => format!("{}..{}", ids[i], ids[j]),
-        });
-        i = j + 1;
-    }
-    parts.join(", ")
 }
 
 /// 1 to 4; with `allow_clear`, 0 means "unset, inherit again".
@@ -574,8 +590,9 @@ pub(crate) mod tests {
         s2.children = Some(vec![step("Draft"), step("Review")]);
         a.node.children = Some(vec![step("Map"), s2, step("Ship")]);
         let out = add(&mut conn, a).unwrap();
+        // The second line is the add hint (SPOKE-1079).
         assert_eq!(
-            out,
+            out.lines().next().unwrap(),
             "Added SPOKE-2 task  Deploy  (under SPOKE-1 To do), with 5 beneath it in the order given: SPOKE-3..SPOKE-7"
         );
         let titles: Vec<String> = crate::store::children(&conn, NodeId(2))

@@ -25,6 +25,25 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// `SPOKE-3..SPOKE-8, SPOKE-10`: consecutive ids collapse into ranges.
+pub fn id_ranges(ids: &[NodeId]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        let mut j = i;
+        while j + 1 < ids.len() && ids[j + 1].0 == ids[j].0 + 1 {
+            j += 1;
+        }
+        parts.push(match j - i {
+            0 => ids[i].to_string(),
+            1 => format!("{}, {}", ids[i], ids[j]),
+            _ => format!("{}..{}", ids[i], ids[j]),
+        });
+        i = j + 1;
+    }
+    parts.join(", ")
+}
+
 impl FromStr for NodeId {
     type Err = String;
 

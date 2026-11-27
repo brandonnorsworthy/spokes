@@ -389,8 +389,9 @@ async fn tree_over_http() {
                    "agent": "it", "children": children}),
         )
         .await;
+    // The second line is the add hint (SPOKE-1079).
     assert_eq!(
-        added,
+        added.lines().next().unwrap(),
         "Added SPOKE-5 task  Deploy game to production  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11"
     );
 
@@ -2965,5 +2966,52 @@ async fn dropping_a_parent_names_the_open_work_under_it_over_http() {
         )
         .await;
     assert!(!out.contains("Unfinished work"), "{out}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `add` says which step starts a plan, flags a task left under the root, and names new
+/// tasks without aliases (SPOKE-1079). Silent for a placed node with aliases.
+#[tokio::test]
+async fn add_hints_at_loose_ends_over_http() {
+    let dir = temp_dir("hint-add");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let home = mcp
+        .ok(
+            "add",
+            json!({"title": "Home", "kind": "area", "aliases": ["house", "flat"]}),
+        )
+        .await;
+    assert!(!home.contains("Next: "), "{home}");
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": 2, "title": "Paint", "aliases": ["walls", "painting"]}),
+        )
+        .await;
+    assert!(!out.contains("Next: "), "{out}");
+
+    let out = mcp
+        .ok(
+            "add",
+            json!({"title": "Move", "ordered": true, "children": [
+                {"title": "Pack", "aliases": ["boxes", "packing"]}, {"title": "Drive"}]}),
+        )
+        .await;
+    assert!(
+        out.ends_with(
+            "\nNext: The first step is SPOKE-5 Pack. SPOKE-4 is directly under the root; move it if it belongs in an area. No aliases on SPOKE-4, SPOKE-6: add 2 to 5 each with update so search finds them."
+        ),
+        "{out}"
+    );
+
+    let out = mcp.ok("add", json!({"parent": 2, "title": "Mop"})).await;
+    assert!(
+        out.ends_with(
+            "\nNext: No aliases on SPOKE-7: add 2 to 5 each with update so search finds it."
+        ),
+        "{out}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
