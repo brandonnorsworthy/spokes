@@ -25,6 +25,11 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
     }
 
     refuse_stage(args.stage.as_ref())?;
+    if args.children.is_some() {
+        return Err(format!(
+            "update does not take children, so nothing was changed. To add them under {id}, call add with parent: \"{id}\" and children (leave title out); they go in one call, in order."
+        ));
+    }
     if args.source.is_some() {
         return Err(
             "source can't be replaced or cleared: it is the user's original words. Use source_append to add a later message."

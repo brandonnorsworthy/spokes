@@ -676,6 +676,65 @@ async fn tree_over_http() {
 // ---------------------------------------------------------------------------
 
 /// The first `SPOKE-n` in a reply, e.g. the id `add` just created.
+/// SPOKE-228: several children under a node that already exists, in one call, as an
+/// MCP client sends it (no title), and update refusing children instead of dropping them.
+#[tokio::test]
+async fn add_children_to_an_existing_parent_over_http() {
+    let dir = temp_dir("add-batch");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let project = add_node(
+        &mcp,
+        json!({"title": "Project", "ordered": true, "agent": "t"}),
+    )
+    .await;
+    let (refused, is_error) = mcp
+        .call(
+            "update",
+            json!({"id": project, "children": [{"title": "Lost"}], "agent": "t"}),
+        )
+        .await;
+    assert!(is_error, "{refused}");
+    assert!(
+        refused.contains("call add with parent: \"SPOKE-2\" and children (leave title out)"),
+        "{refused}"
+    );
+
+    let added = mcp
+        .ok(
+            "add",
+            json!({"parent": project, "agent": "t", "children": [
+                {"title": "Step one", "aliases": ["first", "one"]},
+                {"title": "Step two", "aliases": ["second", "two"], "children": [
+                    {"title": "Detail", "aliases": ["sub", "part"]}
+                ]}
+            ]}),
+        )
+        .await;
+    assert!(
+        added.starts_with(
+            "Added 3 under SPOKE-2 Project, in the order given:\n  SPOKE-3 task  Step one\n  SPOKE-4 task  Step two\n    SPOKE-5 task  Detail"
+        ),
+        "{added}"
+    );
+    let listing = mcp.ok("get", json!({"id": project})).await;
+    assert!(
+        listing.contains("1. SPOKE-3 open  Step one  <- next"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("2. SPOKE-4 open (0/1)  Step two"),
+        "{listing}"
+    );
+    // The schema no longer requires title, so the tool list must still say how to use it.
+    let tools = mcp.rpc("tools/list", json!({})).await.to_string();
+    assert!(tools.contains("leave title out"), "{tools}");
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn first_id(text: &str) -> String {
     let at = text
         .find("SPOKE-")
