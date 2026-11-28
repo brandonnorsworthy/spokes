@@ -15,7 +15,7 @@ use chrono::NaiveDate;
 use crate::db::now;
 use crate::format::{parse_date, short_date};
 use crate::hints;
-use crate::model::{Kind, Node, NodeId, Status, id_ranges};
+use crate::model::{Kind, Node, NodeId, Status};
 use crate::recur::Rule;
 use crate::tools::args::SetStatusArgs;
 
@@ -187,7 +187,9 @@ fn change_one(
         let mut open = Vec::new();
         open_below(conn, id, &mut open)?;
         if !open.is_empty() {
-            return Ok(Outcome::Refused(open_below_refusal(&node, target, &open)));
+            return Ok(Outcome::Refused(open_below_refusal(
+                &node, target, &open, agent, now,
+            )));
         }
     } else if node.status.is_closed() {
         let closed: Vec<Node> = ancestors(conn, id)?
@@ -224,48 +226,72 @@ fn change_one(
     Ok(Outcome::Changed(Box::new(node)))
 }
 
-/// Why a node cannot close yet. Every blocking id is given, so the caller can pass them
-/// all in one call.
-fn open_below_refusal(node: &Node, target: Status, open: &[Node]) -> String {
-    let word = if target == Status::Done {
-        "marked done"
+/// Why a node cannot close yet: what is unfinished under it, who is on any of it, and what
+/// to do. The ids are written out so they can be passed straight back, but the advice is to
+/// close only what has earned it, since closing also ends other agents' claims.
+fn open_below_refusal(
+    node: &Node,
+    target: Status,
+    open: &[Node],
+    agent: Option<&str>,
+    now: &str,
+) -> String {
+    let (word, advice) = if target == Status::Done {
+        (
+            "marked done",
+            "Mark done only what is really finished, and drop or move the rest",
+        )
     } else {
-        "dropped"
+        (
+            "dropped",
+            "Drop only what nobody wants, and move what you keep",
+        )
     };
+    // The node itself takes one of the call's ids.
+    let fits = open.len() < MAX_IDS;
     let mut named: Vec<String> = open
         .iter()
         .take(LISTED_OPEN)
         .map(|n| format!("{} {}", n.id, short_title(&n.title)))
         .collect();
-    // The node itself takes one of the call's ids.
-    let fits = open.len() < MAX_IDS;
     if open.len() > LISTED_OPEN {
-        let mut rest: Vec<NodeId> = open[LISTED_OPEN..].iter().map(|n| n.id).collect();
-        rest.sort_by_key(|id| id.0);
+        let rest = &open[LISTED_OPEN..];
         named.push(if fits {
-            format!("+{} more ({})", rest.len(), id_ranges(&rest))
+            let ids: Vec<String> = rest.iter().map(|n| n.id.to_string()).collect();
+            format!("+{} more ({})", rest.len(), ids.join(", "))
         } else {
-            format!(
-                "+{} more (search with scope {} lists them)",
-                rest.len(),
-                node.id
-            )
+            format!("+{} more", rest.len())
         });
     }
-    let how = if fits {
-        "Finish, drop or move them first, or pass their ids in this same call.".to_string()
-    } else {
-        format!(
-            "Finish, drop or move them first, deepest ones first: one call takes {MAX_IDS} ids."
-        )
-    };
     let mut line = format!(
-        "{} {} was not {word}: {} unfinished under it: {}. {how}",
+        "{} {} was not {word}: {} unfinished under it: {}.",
         node.id,
         node.title,
         open.len(),
         named.join(", ")
     );
+    let mut held: Vec<String> = open.iter().filter_map(|n| held_by(n, agent, now)).collect();
+    if !held.is_empty() {
+        if held.len() > LISTED_OPEN {
+            let more = held.len() - LISTED_OPEN;
+            held.truncate(LISTED_OPEN);
+            held.push(format!("+{more} more"));
+        }
+        line.push_str(&format!(
+            " Held right now: {}. Check before closing those.",
+            held.join(", ")
+        ));
+    }
+    if fits {
+        line.push_str(&format!(
+            " {advice}; ids passed in this same call close together."
+        ));
+    } else {
+        line.push_str(&format!(
+            " {advice}. To list it all, search with scope {} once with state open, once with in_progress and once with waiting. One call takes {MAX_IDS} ids, so close the deepest first.",
+            node.id
+        ));
+    }
     // Done only reschedules a repeating task, so passing its id would not clear the way.
     if target == Status::Done {
         for n in open.iter().filter(|n| n.recur.is_some()).take(LISTED_OPEN) {
@@ -276,6 +302,27 @@ fn open_below_refusal(node: &Node, target: Status, open: &[Node]) -> String {
         }
     }
     line
+}
+
+/// A live claim by someone other than the caller, or a question waiting on the user.
+fn held_by(node: &Node, agent: Option<&str>, now: &str) -> Option<String> {
+    let who = node.claimed_by.as_deref();
+    match node.status {
+        Status::InProgress
+            if who != agent && node.claim_expires.as_deref().is_some_and(|e| e > now) =>
+        {
+            Some(format!(
+                "{} claimed by {}",
+                node.id,
+                who.unwrap_or("another agent")
+            ))
+        }
+        Status::Waiting => {
+            let asked = who.map_or(String::new(), |w| format!(" (asked by {w})"));
+            Some(format!("{} waiting on the user{asked}", node.id))
+        }
+        _ => None,
+    }
 }
 
 fn short_title(title: &str) -> String {
@@ -505,15 +552,23 @@ mod tests {
         let (mut conn, dir) = temp_db("status-open-below");
         plan(&mut conn);
         run(&mut conn, &["5"], SettableStatus::Done).unwrap();
-        for (target, word) in [
-            (SettableStatus::Done, "not marked done"),
-            (SettableStatus::Dropped, "not dropped"),
+        for (target, word, how) in [
+            (
+                SettableStatus::Done,
+                "not marked done",
+                "Mark done only what is really finished, and drop or move the rest",
+            ),
+            (
+                SettableStatus::Dropped,
+                "not dropped",
+                "Drop only what nobody wants, and move what you keep",
+            ),
         ] {
             let err = run(&mut conn, &["2"], target).unwrap_err();
             assert_eq!(
                 err,
                 format!(
-                    "SPOKE-2 Plan was {word}: 2 unfinished under it: SPOKE-3 Build, SPOKE-4 Wire. Finish, drop or move them first, or pass their ids in this same call."
+                    "SPOKE-2 Plan was {word}: 2 unfinished under it: SPOKE-3 Build, SPOKE-4 Wire. {how}; ids passed in this same call close together."
                 )
             );
             assert_eq!(status_of(&conn, 2), Status::Open);
@@ -591,6 +646,33 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_says_who_else_holds_work_under_the_node() {
+        let (mut conn, dir) = temp_db("status-held");
+        add(&mut conn, args(None, "Plan", Kind::Task)).unwrap(); // 2
+        for title in ["Theirs", "Lapsed", "Mine", "Asked"] {
+            add(&mut conn, args(Some(2), title, Kind::Task)).unwrap(); // 3, 4, 5, 6
+        }
+        conn.execute_batch(
+            "UPDATE nodes SET status = 'in_progress', claimed_by = 'blue', claim_expires = '2999-01-01T00:00:00Z' WHERE id = 3;
+             UPDATE nodes SET status = 'in_progress', claimed_by = 'gone', claim_expires = '2000-01-01T00:00:00Z' WHERE id = 4;
+             UPDATE nodes SET status = 'in_progress', claimed_by = 'test', claim_expires = '2999-01-01T00:00:00Z' WHERE id = 5;
+             UPDATE nodes SET status = 'waiting', claimed_by = 'green', waiting_on = 'which?' WHERE id = 6;",
+        )
+        .unwrap();
+        let err = run(&mut conn, &["2"], SettableStatus::Dropped).unwrap_err();
+        assert!(
+            err.contains("SPOKE-6 Asked. Held right now: SPOKE-3 claimed by blue, SPOKE-6 waiting on the user (asked by green). Check before closing those. Drop only"),
+            "{err}"
+        );
+        // Nobody else on it: no such sentence.
+        conn.execute_batch("UPDATE nodes SET status = 'open', claimed_by = NULL, claim_expires = NULL, waiting_on = NULL WHERE id IN (3, 6)")
+            .unwrap();
+        let err = run(&mut conn, &["2"], SettableStatus::Dropped).unwrap_err();
+        assert!(!err.contains("Held right now"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_long_refusal_still_gives_every_id() {
         let (mut conn, dir) = temp_db("status-long");
         add(&mut conn, args(None, "Big", Kind::Task)).unwrap(); // 2
@@ -603,9 +685,20 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains("SPOKE-12 S9, +3 more (SPOKE-13..SPOKE-15)."),
+            err.contains("SPOKE-12 S9, +3 more (SPOKE-13, SPOKE-14, SPOKE-15)."),
             "{err}"
         );
+        // Every id the refusal gives can be passed straight back.
+        let (_, listed) = err.split_once("under it: ").unwrap();
+        let mut ids: Vec<&str> = listed
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+            .map(|w| w.trim_end_matches('.'))
+            .filter(|w| w.starts_with("SPOKE-"))
+            .collect();
+        ids.push("SPOKE-2");
+        assert_eq!(ids.len(), 14, "{ids:?}");
+        let out = run(&mut conn, &ids, SettableStatus::Done).unwrap();
+        assert!(!out.contains("was not"), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -624,7 +717,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.ends_with("+90 more (search with scope SPOKE-2 lists them). Finish, drop or move them first, deepest ones first: one call takes 100 ids."),
+            err.ends_with(", +90 more. Mark done only what is really finished, and drop or move the rest. To list it all, search with scope SPOKE-2 once with state open, once with in_progress and once with waiting. One call takes 100 ids, so close the deepest first."),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);

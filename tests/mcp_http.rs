@@ -3007,6 +3007,76 @@ async fn closing_over_unfinished_work_is_refused_over_http() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Too much under a node for one call: the search calls the refusal names are run here,
+/// and between them they must list everything it refused over.
+#[tokio::test]
+async fn a_huge_refusal_names_search_calls_that_list_everything() {
+    let dir = temp_dir("close-guard-huge");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let children: Vec<Value> = (0..120)
+        .map(|i| json!({"title": format!("Part {i}")}))
+        .collect();
+    let plan = add_node(&mcp, json!({"title": "Plan", "children": children})).await;
+    let g = mcp.ok("get", json!({"id": plan})).await;
+    let held = first_id(line_with(&g, "Part 0"));
+    let asked = first_id(line_with(&g, "Part 1"));
+    mcp.ok("claim", json!({"id": held, "agent": "blue"})).await;
+    mcp.ok(
+        "ask",
+        json!({"id": asked, "agent": "green", "question": "Which one?"}),
+    )
+    .await;
+
+    let e = err(
+        &mcp,
+        "set_status",
+        json!({"ids": [plan], "status": "done", "agent": "red"}),
+    )
+    .await;
+    assert!(
+        e.contains(&format!(
+            "Held right now: {held} claimed by blue, {asked} waiting on the user (asked by green)."
+        )),
+        "{e}"
+    );
+    assert!(
+        e.contains(&format!(
+            "search with scope {plan} once with state open, once with in_progress and once with waiting."
+        )),
+        "{e}"
+    );
+
+    let mut found = std::collections::BTreeSet::new();
+    for state in ["open", "in_progress", "waiting"] {
+        let mut offset = 0;
+        loop {
+            let out = mcp
+                .ok(
+                    "search",
+                    json!({"scope": plan, "state": state, "limit": 50, "offset": offset}),
+                )
+                .await;
+            found.extend(result_ids(&out));
+            if !out.contains("Pass offset:") {
+                break;
+            }
+            offset += 50;
+        }
+    }
+    // All 120 parts, and not the plan itself.
+    let parts: std::collections::BTreeSet<String> = (1..=120)
+        .map(|i| {
+            let n: i64 = plan.trim_start_matches("SPOKE-").parse().unwrap();
+            format!("SPOKE-{}", n + i)
+        })
+        .collect();
+    assert_eq!(found, parts);
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `add` says which step starts a plan, flags a task left under the root, and names new
 /// tasks without aliases (SPOKE-1079). Silent for a placed node with aliases.
 #[tokio::test]

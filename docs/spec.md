@@ -282,7 +282,7 @@ The searching model passes several keywords in one call (`server homelab nas pro
 | `claimed_by` | Claimed, stalled and waiting tasks held by that agent label |
 | `untouched_days` | Tasks with no activity on or beneath them for that many days, deferred ones left out; oldest first without keywords |
 
-They match unfinished tasks only, never areas. Each line ends with the holder and the expiry (or the question, or the idle time). Open work under a done or dropped node stays hidden and counted, as elsewhere in search, until `include_done: true`. Since SPOKE-345 no write can create such work; `under_closed` finds what older data still holds, and an empty answer is the check that there is none.
+They match unfinished tasks only, never areas. Each line ends with the holder and the expiry (or the question, or the idle time). Open work under a done or dropped node stays hidden and counted, as elsewhere in search, until `include_done: true`. Since SPOKE-345 no write on clean data can create such work; `under_closed` finds the tasks older data still holds this way. An empty answer means no task is hidden; it does not list areas, as no state filter does.
 
 If this proves too literal in practice, v2 adds an embedding column with a SQLite vector extension. It is not worth the moving parts on day one.
 
