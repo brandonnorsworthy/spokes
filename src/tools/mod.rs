@@ -24,6 +24,7 @@ pub type Db = Arc<Mutex<Connection>>;
 pub const INSTRUCTIONS: &str = "\
 Spokes is one tree of to-dos. IDs look like SPOKE-12 (a bare 12 also works). The root is SPOKE-1 \"To do\".
 Areas (kind area: Home, Work) hold work forever and never finish; tasks get done or dropped. Nothing is deleted.
+Nothing closes over unfinished work: done or dropped is refused while anything under the node is unfinished.
 An ordered parent's children are steps: only the first unfinished one is actionable (marked <- next).
 - \"What should I do?\" -> next (scope narrows it to one subtree).
 - To find something (\"my server\"), search first, with several keywords at once: names, synonyms, likely spellings. A number or SPOKE-958 finds that node first. Nodes matching more of the rarer words rank first; much weaker matches are left out (match: \"any\" lists them, \"all\" needs every word) and the footer gives the offset for the next page. Each result shows its last 3 ancestors with ids, so you can add under one directly; ask the user only if it is truly ambiguous.
@@ -110,7 +111,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. A node id (958, SPOKE-958) puts that node first. Each result shows its path (last 3 ancestors with ids; full_paths for all). Nodes matching more of the rarer words rank first and much weaker matches are left out (match: \"any\" for all, \"all\" to need every word). Search before adding. type, refinement and tracked filter; with an empty query they list every match. To find leftover work, filter by state (stalled, claimed, in_progress, waiting, open, children_done), claimed_by or untouched_days: it also lists tasks under held or waiting parents, with the holder and claim expiry."
+        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. A node id (958, SPOKE-958) puts that node first. Each result shows its path (last 3 ancestors with ids; full_paths for all). Nodes matching more of the rarer words rank first and much weaker matches are left out (match: \"any\" for all, \"all\" to need every word). Search before adding. type, refinement and tracked filter; with an empty query they list every match. To find leftover work, filter by state (stalled, claimed, in_progress, waiting, open, children_done, under_closed), claimed_by or untouched_days: it also lists tasks under held or waiting parents, with the holder and claim expiry."
     )]
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> ToolResult {
         let today = today_in(self.tz);
@@ -156,7 +157,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Mark nodes done, dropped (won't do; there is no delete) or open (reopen). Areas can be dropped but never done. A repeating task marked done comes back with its next due date; dropping it stops it."
+        description = "Mark nodes done, dropped (won't do; there is no delete) or open (reopen). A node closes (done or dropped) only when nothing under it is unfinished: pass the children's ids in the same call, or finish, drop or move them first; the refusal lists them. Reopening needs the nodes above it open too (pass them together). Areas can be dropped but never done. A repeating task marked done comes back with its next due date; dropping it stops it."
     )]
     async fn set_status(&self, Parameters(args): Parameters<SetStatusArgs>) -> ToolResult {
         let today = today_in(self.tz);

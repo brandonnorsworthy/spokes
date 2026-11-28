@@ -112,6 +112,8 @@ struct Meta {
     open_below: bool,
     /// A direct child is done.
     done_child: bool,
+    /// The nearest done or dropped node above it.
+    closed_above: Option<(NodeId, Status)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -215,16 +217,19 @@ enum State {
     InProgress,
     Waiting,
     ChildrenDone,
+    /// Unfinished under a done or dropped node, where no other listing shows it (SPOKE-345).
+    UnderClosed,
 }
 
 impl State {
-    const ALL: [State; 6] = [
+    const ALL: [State; 7] = [
         State::Stalled,
         State::Claimed,
         State::InProgress,
         State::Waiting,
         State::Open,
         State::ChildrenDone,
+        State::UnderClosed,
     ];
 
     fn as_str(self) -> &'static str {
@@ -235,6 +240,7 @@ impl State {
             State::InProgress => "in_progress",
             State::Waiting => "waiting",
             State::ChildrenDone => "children_done",
+            State::UnderClosed => "under_closed",
         }
     }
 
@@ -527,6 +533,7 @@ fn matches_work(m: &Meta, filters: Filters<'_>) -> bool {
         State::InProgress => in_progress,
         State::Waiting => m.status == Status::Waiting,
         State::ChildrenDone => m.done_child && !m.open_below,
+        State::UnderClosed => m.closed_above.is_some(),
     });
     // A claim or a question names its holder; a released or reopened task has none.
     let holder = filters.claimed_by.is_none_or(|who| {
@@ -677,7 +684,9 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate, tz: Tz) -> 
         Some(s) => require(conn, s.parse()?)?.id,
         None => ROOT_ID,
     };
-    let include_done = args.include_done.unwrap_or(false);
+    // Everything an under_closed listing looks for is hidden by the closed node above it.
+    let include_done =
+        args.include_done.unwrap_or(false) || filters.state == Some(State::UnderClosed);
     let mode = match &args.match_mode {
         Some(m) => MatchMode::parse(m)?,
         None => MatchMode::Best,
@@ -768,7 +777,12 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate, tz: Tz) -> 
         let node = require(conn, hit.id)?;
         let mut line = result_line(&node, &meta, &focus, hit, live, today, full_paths);
         if filters.is_work() {
-            let detail = work_detail(&node, filters, now_dt, tz);
+            let mut detail = work_detail(&node, filters, now_dt, tz);
+            if filters.state == Some(State::UnderClosed)
+                && let Some((id, status)) = meta.get(&node.id).and_then(|m| m.closed_above)
+            {
+                detail.push(format!("under {} {id}", status.as_str()));
+            }
             if !detail.is_empty() {
                 line.push_str(&format!("  ({})", detail.join("; ")));
             }
@@ -1178,12 +1192,14 @@ fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
                     touched_at: r.get(12)?,
                     open_below: false,
                     done_child: false,
+                    closed_above: None,
                 },
             ))
         })
         .and_then(|rows| rows.collect())
         .map_err(db_err)?;
     mark_subtrees(&mut meta);
+    mark_closed_above(&mut meta);
     Ok(meta)
 }
 
@@ -1229,6 +1245,24 @@ fn lineage(meta: &HashMap<NodeId, Meta>, id: NodeId) -> impl Iterator<Item = (No
 
 fn within(meta: &HashMap<NodeId, Meta>, id: NodeId, scope: NodeId) -> bool {
     scope == ROOT_ID || lineage(meta, id).skip(1).any(|(a, _)| a == scope)
+}
+
+/// Fills in the nearest closed ancestor of every node.
+fn mark_closed_above(meta: &mut HashMap<NodeId, Meta>) {
+    let found: Vec<(NodeId, (NodeId, Status))> = meta
+        .keys()
+        .filter_map(|&id| {
+            lineage(meta, id)
+                .skip(1)
+                .find(|(_, m)| m.status.is_closed())
+                .map(|(above, m)| (id, (above, m.status)))
+        })
+        .collect();
+    for (id, above) in found {
+        if let Some(m) = meta.get_mut(&id) {
+            m.closed_above = Some(above);
+        }
+    }
 }
 
 /// A done node (unless `include_done`) or a dropped one (unless `include_dropped`) at or

@@ -189,7 +189,7 @@ pub struct SearchArgs {
     pub refinement: Option<String>,
     /// true = only tracked nodes (with an empty query, every tracked node).
     pub tracked: Option<bool>,
-    /// Only unfinished tasks in this state: "stalled" (the claim ran out), "claimed" (live claim), "in_progress" (both), "waiting" (on the user), "open" (nobody holds it) or "children_done" (nothing open beneath it, a subtask done, itself unfinished).
+    /// Only unfinished tasks in this state: "stalled" (the claim ran out), "claimed" (live claim), "in_progress" (both), "waiting" (on the user), "open" (nobody holds it), "children_done" (nothing open beneath it, a subtask done, itself unfinished) or "under_closed" (unfinished under a done or dropped task).
     #[serde(alias = "status")]
     pub state: Option<String>,
     /// Only tasks this agent label holds: claimed, stalled or waiting.

@@ -1367,7 +1367,7 @@ async fn history_replays_a_subtree() {
         .await;
     m.ok(
         "set_status",
-        json!({"ids": [sid(scr)], "status": "dropped"}),
+        json!({"ids": [sid(scr), sid(scr_kid)], "status": "dropped"}),
     )
     .await;
 
