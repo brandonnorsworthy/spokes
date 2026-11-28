@@ -964,7 +964,7 @@ async fn priority_inheritance_over_http() {
     )
     .await;
 
-    // Level 1 (inherited from the area), then 2, 3, 4, then unset; oldest first within a
+    // Level 1 (inherited from the area), then 2, 3, 4, then unset; tree order within a
     // level. "Deep own level" shows its own p3 under the p1 area. "Deep plain" and
     // "Step one" carry no level or date, and blocked "Step two" stays hidden despite its p2.
     let out = queue(mcp.ok("next", json!({"limit": 50})).await);
@@ -980,7 +980,8 @@ async fn priority_inheritance_over_http() {
          \x20 SPOKE-6   p3                 Deep own level  unplanned\n\
          \x20 SPOKE-12  p3                 Calm task  unplanned\n\
          \x20 SPOKE-14  p4                 Four  unplanned\n\
-         \x20 SPOKE-16                     Unset  unplanned"
+         \x20 SPOKE-16                     Unset  unplanned\n\
+         (Within a level, in tree order: move a task up to rank it higher.)"
     );
     for hidden in ["Deep plain  ", "Step one  ", "Step two"] {
         assert!(!out.contains(hidden), "{hidden}: {out}");
@@ -1315,6 +1316,7 @@ async fn due_and_sections_over_http() {
         "UP NEXT".to_string(),
         format!("  SPOKE-8   {:<upw$}  Plain p1 job  unplanned", "p1"),
         format!("  SPOKE-6   {up_flags:<upw$}  Far job  unplanned"),
+        "(Within a level, in tree order: move a task up to rank it higher.)".to_string(),
         "STALE".to_string(),
         format!("  SPOKE-11  {untouched:<uw$}  Stale one"),
         format!("  SPOKE-12  {untouched:<uw$}  Stale two"),
@@ -1863,7 +1865,8 @@ async fn ask_answer_and_stalled_leases_over_http() {
          \x20 SPOKE-3  waiting  Set up emulator: \"Install to D: or E:?\" (sonnet-2, 3h ago)\n\
          UP NEXT\n\
          \x20 SPOKE-4  p1  Workbench  unplanned\n\
-         \x20 SPOKE-5  p3  Paint shed  unplanned"
+         \x20 SPOKE-5  p3  Paint shed  unplanned\n\
+         (Within a level, in tree order: move a task up to rank it higher.)"
     );
     let e = err(&mcp, "claim", json!({"id": 3, "agent": "opus-red"})).await;
     assert_eq!(
@@ -1901,7 +1904,8 @@ async fn ask_answer_and_stalled_leases_over_http() {
          \x20 SPOKE-3  answered  Set up emulator  (answered just now; claim it and read the notes)\n\
          UP NEXT\n\
          \x20 SPOKE-4  p1  Workbench  unplanned\n\
-         \x20 SPOKE-5  p3  Paint shed  unplanned"
+         \x20 SPOKE-5  p3  Paint shed  unplanned\n\
+         (Within a level, in tree order: move a task up to rank it higher.)"
     );
     // The answer is searchable (notes are indexed).
     assert!(search(&mcp, "more space").await.contains("SPOKE-3"));

@@ -2,7 +2,8 @@
 //!
 //! Sections, in order: NEEDS YOU (questions, then stalled claims), FOCUS (the global
 //! ranked list), DUE SOON (overdue, then due within 7 days), UP NEXT (by priority
-//! level 1..4, oldest first; unset levels inherit the nearest ancestor's) and STALE
+//! level 1..4, then tree order: the depth-first walk in sibling order, so within a level
+//! a task placed higher comes first; unset levels inherit the nearest ancestor's) and STALE
 //! (up to three work items untouched for 30 days). A node is listed once at most, and
 //! so is each actionable step: a line whose `next:` step (or, for a leaf, the node
 //! itself) is already represented higher up is dropped, so a project and its sub-project
@@ -35,6 +36,8 @@ const DUE_SOON_DAYS: i64 = 7;
 /// STALE: untouched for at least this many days, at most this many lines.
 const STALE_DAYS: i64 = 30;
 const STALE_MAX: usize = 3;
+/// Under UP NEXT when it lists two or more lines, so agents can see position counts.
+const ORDER_FOOTER: &str = "(Within a level, in tree order: move a task up to rank it higher.)";
 
 pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
     let scope_id = match &args.scope {
@@ -145,7 +148,8 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
         key(a).cmp(&key(b))
     });
     rest.sort_by(|a, b| {
-        let key = |i: &Item| (i.sort_level(), i.node.created_at.clone(), i.node.id);
+        // Within a level, tree order: sibling position is a rank (SPOKE-1080).
+        let key = |i: &Item| (i.sort_level(), i.walk_order);
         key(a).cmp(&key(b))
     });
 
@@ -254,6 +258,10 @@ pub fn next(conn: &Connection, args: NextArgs, today: NaiveDate) -> ToolResult {
         }
         out.push((*title).to_string());
         out.extend(render_rows(rows, id_width));
+        // Not a hint: it says how the list is sorted, so it shows with hints off too.
+        if *title == "UP NEXT" && rows.len() >= 2 {
+            out.push(ORDER_FOOTER.to_string());
+        }
     }
     if let Some(note) = too_long_note(ranks.len()) {
         out.push(format!("({note})"));
@@ -308,6 +316,8 @@ impl Filter {
 struct Item {
     node: Node,
     level: Option<i64>,
+    /// Where the walk found it: depth-first, children in sibling order.
+    walk_order: usize,
 }
 
 impl Item {
@@ -545,9 +555,11 @@ impl Queue {
             }
             let level = kid.priority.or(at.level);
             let reachable = at.reachable && !blocked;
+            let walk_order = self.focus.len() + self.work.len();
             let item = || Item {
                 node: kid.clone(),
                 level,
+                walk_order,
             };
             if kid.focus_rank.is_some() {
                 // Explicitly ranked, so it is listed even behind an earlier step.
@@ -631,7 +643,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "UP NEXT\n  SPOKE-6  p1  Pay bill  unplanned\n  SPOKE-3  p2  Fix garage (0/2)  next: SPOKE-4 Buy parts\n  SPOKE-7      Someday  unplanned\nNext: Claim the one you pick before starting."
+            "UP NEXT\n  SPOKE-6  p1  Pay bill  unplanned\n  SPOKE-3  p2  Fix garage (0/2)  next: SPOKE-4 Buy parts\n  SPOKE-7      Someday  unplanned\n(Within a level, in tree order: move a task up to rank it higher.)\nNext: Claim the one you pick before starting."
         );
         let out = next(
             &conn,
@@ -643,6 +655,76 @@ mod tests {
             out.ends_with("(+2 more open. Pass scope or limit.)\nNext: Claim the one you pick before starting."),
             "{out}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_level_siblings_follow_position_not_age() {
+        let (mut conn, dir) = temp_db("next-position");
+        add(&mut conn, args(None, "Home", Kind::Area)).unwrap(); // 2
+        add(&mut conn, args(Some(2), "Older", Kind::Task)).unwrap(); // 3
+        let mut newer = args(None, "Newer", Kind::Task); // 4, placed first
+        newer.before = Some(IdArg::Number(3));
+        add(&mut conn, newer).unwrap();
+        let out = next(
+            &conn,
+            next_args(None, None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "UP NEXT\n  SPOKE-4  Newer  unplanned\n  SPOKE-3  Older  unplanned\n(Within a level, in tree order: move a task up to rank it higher.)\nNext: Claim the one you pick before starting."
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_level_across_parents_follows_the_tree_walk() {
+        let (mut conn, dir) = temp_db("next-walk");
+        add(&mut conn, args(None, "First area", Kind::Area)).unwrap(); // 2
+        add(&mut conn, args(None, "Second area", Kind::Area)).unwrap(); // 3
+        // Oldest task in the second area; a deeper task with a level in the first.
+        let mut early = args(Some(3), "In second", Kind::Task); // 4
+        early.node.priority = Some(crate::model::NumArg::Number(2));
+        add(&mut conn, early).unwrap();
+        add(&mut conn, args(Some(2), "Project", Kind::Task)).unwrap(); // 5
+        let mut deep = args(Some(5), "Deep in first", Kind::Task); // 6
+        deep.node.priority = Some(crate::model::NumArg::Number(2));
+        add(&mut conn, deep).unwrap();
+        let mut late = args(Some(2), "Late in first", Kind::Task); // 7
+        late.node.priority = Some(crate::model::NumArg::Number(2));
+        add(&mut conn, late).unwrap();
+        let out = next(
+            &conn,
+            next_args(None, Some(10)),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
+        let order: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| w.starts_with("SPOKE-"))
+            .collect();
+        // p2 in walk order: the first area's 6 (inside project 5) and 7, then the second
+        // area's 4, though 4 is the oldest. Project 5 (no level) points at step 6, which
+        // is already listed, so it is dropped.
+        assert_eq!(order, ["SPOKE-6", "SPOKE-7", "SPOKE-4"], "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_order_footer_for_a_single_line() {
+        let (mut conn, dir) = temp_db("next-one");
+        add(&mut conn, args(None, "Home", Kind::Area)).unwrap();
+        add(&mut conn, args(Some(2), "Only", Kind::Task)).unwrap();
+        let out = next(
+            &conn,
+            next_args(None, None),
+            crate::format::today_in(chrono_tz::UTC),
+        )
+        .unwrap();
+        assert!(!out.contains("tree order"), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
