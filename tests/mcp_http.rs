@@ -2842,6 +2842,88 @@ async fn old_stage_argument_is_refused_and_writes_nothing() {
     server.shutdown().await;
 }
 
+/// SPOKE-459: `after` / `before` on add place the new node in one call, the parent comes
+/// from the sibling, and the schema models read offers both.
+#[tokio::test]
+async fn add_places_the_node_before_or_after_a_sibling() {
+    let dir = temp_dir("add-after");
+    let server = start(&dir.join("spokes.db")).await;
+    let m = Mcp::new(server.addr);
+
+    let tools = m.rpc("tools/list", json!({})).await;
+    let schema = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "add")
+        .unwrap()["inputSchema"]
+        .to_string();
+    assert!(
+        schema.contains("\"after\"") && schema.contains("\"before\""),
+        "{schema}"
+    );
+
+    m.ok(
+        "add",
+        json!({"title": "Ladder", "ordered": true, "agent": "t",
+               "children": [{"title": "M0"}, {"title": "M1"}, {"title": "M2"}]}),
+    )
+    .await; // SPOKE-2, steps 3..5
+    let out = m
+        .ok(
+            "add",
+            json!({"title": "M0.5", "after": "SPOKE-3", "agent": "t"}),
+        )
+        .await;
+    assert!(
+        out.starts_with(
+            "Added SPOKE-6 task  M0.5  (under SPOKE-2 Ladder, after SPOKE-3 M0, 2 of 4)"
+        ),
+        "{out}"
+    );
+    let out = m
+        .ok(
+            "add",
+            json!({"title": "Prep", "parent": "SPOKE-2", "before": "3", "agent": "t"}),
+        )
+        .await;
+    assert!(out.contains("before SPOKE-3 M0, 1 of 5"), "{out}");
+    assert!(
+        out.contains("Next: SPOKE-7 is now the next step of SPOKE-2 Ladder."),
+        "{out}"
+    );
+    let listing = m.ok("get", json!({"id": "SPOKE-2"})).await;
+    let pos = |t: &str| {
+        listing
+            .find(t)
+            .unwrap_or_else(|| panic!("{t} in {listing}"))
+    };
+    assert!(
+        pos("Prep") < pos("  M0") && pos("  M0") < pos("M0.5") && pos("M0.5") < pos("M1"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("1. SPOKE-7 open  Prep  <- next"),
+        "{listing}"
+    );
+
+    let e = err(
+        &m,
+        "add",
+        json!({"title": "x", "before": "SPOKE-3", "after": "SPOKE-4"}),
+    )
+    .await;
+    assert!(e.contains("not both"), "{e}");
+    let e = err(
+        &m,
+        "add",
+        json!({"title": "x", "parent": "SPOKE-1", "after": "SPOKE-3"}),
+    )
+    .await;
+    assert!(e.contains("is not under SPOKE-1"), "{e}");
+    server.shutdown().await;
+}
+
 /// A field `add` does not take is refused by name at any depth, with what to do instead,
 /// and nothing is created (SPOKE-222: `status` on nested children used to vanish).
 #[tokio::test]
@@ -2886,8 +2968,16 @@ async fn add_refuses_unknown_fields_and_writes_nothing() {
             ],
         ),
         (
-            json!({"title": "Zebra", "parent": kept, "after": kept}),
-            vec!["does not take after", "move"],
+            json!({"title": "Zebra", "children": [{"title": "Stripe", "after": kept}]}),
+            vec![
+                "children[0] (\"Stripe\")",
+                "does not take after",
+                "only at the top of the call",
+            ],
+        ),
+        (
+            json!({"title": "Zebra", "parent": kept, "position": 2}),
+            vec!["does not take position", "before or after"],
         ),
         (
             json!({"title": "Zebra", "colour": "black"}),
