@@ -3121,14 +3121,14 @@ async fn add_hints_at_loose_ends_over_http() {
     let home = mcp
         .ok(
             "add",
-            json!({"title": "Home", "kind": "area", "aliases": ["house", "flat"]}),
+            json!({"title": "Home", "kind": "area", "aliases": ["house", "flat"], "agent": "t"}),
         )
         .await;
     assert!(!home.contains("Next: "), "{home}");
     let out = mcp
         .ok(
             "add",
-            json!({"parent": 2, "title": "Paint", "aliases": ["walls", "painting"]}),
+            json!({"parent": 2, "title": "Paint", "aliases": ["walls", "painting"], "agent": "t"}),
         )
         .await;
     assert!(!out.contains("Next: "), "{out}");
@@ -3136,7 +3136,7 @@ async fn add_hints_at_loose_ends_over_http() {
     let out = mcp
         .ok(
             "add",
-            json!({"title": "Move", "ordered": true, "children": [
+            json!({"title": "Move", "ordered": true, "agent": "t", "children": [
                 {"title": "Pack", "aliases": ["boxes", "packing"]}, {"title": "Drive"}]}),
         )
         .await;
@@ -3147,10 +3147,25 @@ async fn add_hints_at_loose_ends_over_http() {
         "{out}"
     );
 
-    let out = mcp.ok("add", json!({"parent": 2, "title": "Mop"})).await;
+    let out = mcp
+        .ok("add", json!({"parent": 2, "title": "Mop", "agent": "t"}))
+        .await;
     assert!(
         out.ends_with(
             "\nNext: No aliases on SPOKE-7: add 2 to 5 each with update so search finds it."
+        ),
+        "{out}"
+    );
+    // No agent label: the hint asks for one (SPOKE-266).
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": 2, "title": "Dust", "aliases": ["dusting", "shelves"]}),
+        )
+        .await;
+    assert!(
+        out.ends_with(
+            "\nNext: Pass agent (your label, the same all session) on writes, so the creator is recorded."
         ),
         "{out}"
     );
@@ -3684,5 +3699,246 @@ async fn search_lists_finished_parents_and_untouched_tasks_over_http() {
     assert_eq!(result_ids(&out), sorted(&[&abandoned]), "{out}");
 
     server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Duplicate protection (SPOKE-260): the original scenario (a second agent-feedback area
+/// under the same parent) is refused, also when spelled differently, and the refusal
+/// names the existing node and writes nothing. The same title under another parent, or
+/// next to a finished sibling, is allowed and flagged in the reply.
+#[tokio::test]
+async fn duplicate_siblings_are_refused_over_http() {
+    let dir = temp_dir("dupes");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let spokes = add_node(
+        &mcp,
+        json!({"title": "Spokes", "kind": "area", "agent": "t"}),
+    )
+    .await;
+    let view = add_node(
+        &mcp,
+        json!({"title": "Spokes View", "kind": "area", "agent": "t"}),
+    )
+    .await;
+    let fb = add_node(
+        &mcp,
+        json!({"parent": spokes, "title": "agent-feedback", "kind": "area", "agent": "t"}),
+    )
+    .await;
+
+    for title in ["agent-feedback", "Agent Feedback", "  agentfeedback  "] {
+        let e = err(
+            &mcp,
+            "add",
+            json!({"parent": spokes, "title": title, "kind": "area", "agent": "t"}),
+        )
+        .await;
+        assert!(
+            e.starts_with(&format!(
+                "{spokes} Spokes already has {fb} agent-feedback (open)"
+            )),
+            "{e}"
+        );
+        assert!(e.contains("nothing was changed"), "{e}");
+    }
+    let count = mcp
+        .ok("search", json!({"query": "agent feedback", "match": "any"}))
+        .await;
+    assert_eq!(count.matches("agent-feedback").count(), 1, "{count}");
+
+    // Another parent: allowed, and the reply points at the one that exists.
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": view, "title": "Agent feedback", "kind": "area", "agent": "t"}),
+        )
+        .await;
+    let other = first_id(&out);
+    assert!(
+        out.contains(&format!(
+            "\nPossible duplicates of {other}: {fb} agent-feedback (same title, under {spokes})."
+        )),
+        "{out}"
+    );
+
+    // A finished sibling never blocks; the reply says it could be reopened instead.
+    let old = add_node(
+        &mcp,
+        json!({"parent": spokes, "title": "Release 1.0", "agent": "t"}),
+    )
+    .await;
+    mcp.ok(
+        "set_status",
+        json!({"ids": [old], "status": "done", "agent": "t"}),
+    )
+    .await;
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": spokes, "title": "release 1.0", "agent": "t"}),
+        )
+        .await;
+    let again = first_id(&out);
+    assert!(
+        out.contains(&format!("{old} Release 1.0 (done, same title, same parent")),
+        "{out}"
+    );
+    // ...and reopening it next to the new one still works (status is never blocked).
+    mcp.ok(
+        "set_status",
+        json!({"ids": [old], "status": "open", "agent": "t"}),
+    )
+    .await;
+    let _ = again;
+
+    // Aliases and mostly-the-same words are flagged, not refused.
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": view, "title": "Feedback inbox", "aliases": ["agent feedback"], "agent": "t"}),
+        )
+        .await;
+    assert!(out.contains("(alias match"), "{out}");
+    add_node(
+        &mcp,
+        json!({"parent": spokes, "title": "Warn about likely duplicate nodes", "agent": "t"}),
+    )
+    .await;
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": view, "title": "Warn about likely duplicate nodes on add", "agent": "t"}),
+        )
+        .await;
+    assert!(out.contains("(similar title"), "{out}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Two children of one add with the same title are refused and nothing is written; move
+/// and update title are refused when they would make a duplicate, and allowed otherwise.
+#[tokio::test]
+async fn duplicate_checks_cover_plans_moves_and_renames_over_http() {
+    let dir = temp_dir("dupes-more");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+
+    let e = err(
+        &mcp,
+        "add",
+        json!({"title": "Plan", "agent": "t", "children": [
+            {"title": "Write tests"}, {"title": "Ship"}, {"title": "write-tests"}]}),
+    )
+    .await;
+    assert!(
+        e.starts_with("children[0] (\"Write tests\") and children[2] (\"write-tests\") have the same title under \"Plan\""),
+        "{e}"
+    );
+    let e = err(
+        &mcp,
+        "add",
+        json!({"title": "Plan", "agent": "t", "children": [
+            {"title": "Step", "children": [{"title": "a"}, {"title": "A"}]}]}),
+    )
+    .await;
+    assert!(
+        e.starts_with("children[0].children[0] (\"a\") and children[0].children[1]"),
+        "{e}"
+    );
+    let recent = mcp.ok("recent", json!({})).await;
+    assert!(!recent.contains("Plan"), "{recent}");
+
+    let a = add_node(&mcp, json!({"title": "A", "kind": "area", "agent": "t"})).await;
+    let b = add_node(&mcp, json!({"title": "B", "kind": "area", "agent": "t"})).await;
+    let in_a = add_node(&mcp, json!({"parent": a, "title": "Backup", "agent": "t"})).await;
+    let in_b = add_node(&mcp, json!({"parent": b, "title": "backup!", "agent": "t"})).await;
+    let other = add_node(&mcp, json!({"parent": a, "title": "Restore", "agent": "t"})).await;
+
+    let e = err(&mcp, "move", json!({"id": in_b, "parent": a, "agent": "t"})).await;
+    assert!(
+        e.starts_with(&format!(
+            "{a} A already has {in_a} Backup (open) with \"Backup\", the same title"
+        )),
+        "{e}"
+    );
+    let e = err(
+        &mcp,
+        "update",
+        json!({"id": other, "title": "BACKUP", "agent": "t"}),
+    )
+    .await;
+    assert!(
+        e.starts_with(&format!("{a} A already has {in_a} Backup (open)")),
+        "{e}"
+    );
+    let got = mcp.ok("get", json!({"id": other})).await;
+    assert!(got.contains("Restore"), "{got}");
+
+    // Renaming a node to its own title (different case) and reordering are fine.
+    mcp.ok(
+        "update",
+        json!({"id": in_a, "title": "backup", "agent": "t"}),
+    )
+    .await;
+    mcp.ok("move", json!({"id": other, "before": in_a, "agent": "t"}))
+        .await;
+    // A finished node can move next to a same-title sibling; it blocks nothing.
+    mcp.ok(
+        "set_status",
+        json!({"ids": [in_b], "status": "dropped", "agent": "t"}),
+    )
+    .await;
+    mcp.ok("move", json!({"id": in_b, "parent": a, "agent": "t"}))
+        .await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Two agents adding the same node at the same moment: exactly one wins (the race that
+/// a search beforehand cannot catch).
+#[tokio::test]
+async fn concurrent_duplicate_adds_leave_one_node_over_http() {
+    let dir = temp_dir("dupes-race");
+    let server = start(&dir.join("spokes.db")).await;
+    let mcp = Mcp::new(server.addr);
+    let p = add_node(&mcp, json!({"title": "P", "kind": "area", "agent": "t"})).await;
+
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..8 {
+        let mcp = Mcp::new(server.addr);
+        let p = p.clone();
+        set.spawn(async move {
+            mcp.call(
+                "add",
+                json!({"parent": p, "title": "agent-feedback", "kind": "area", "agent": format!("w{i}")}),
+            )
+            .await
+        });
+    }
+    let results = set.join_all().await;
+    let ok = results.iter().filter(|(_, is_error)| !is_error).count();
+    assert_eq!(ok, 1, "{results:?}");
+    let got = mcp.ok("get", json!({"id": p})).await;
+    assert_eq!(got.matches("agent-feedback").count(), 1, "{got}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The duplicate line is information, not a hint: it stays with SPOKES_HINTS=0.
+#[tokio::test]
+async fn duplicate_warning_survives_hints_off_over_http() {
+    let dir = temp_dir("dupes-nohints");
+    let server = start_with(&dir.join("spokes.db"), chrono_tz::UTC, false).await;
+    let mcp = Mcp::new(server.addr);
+    let a = add_node(&mcp, json!({"title": "A", "kind": "area"})).await;
+    let b = add_node(&mcp, json!({"title": "B", "kind": "area"})).await;
+    let x = add_node(&mcp, json!({"parent": a, "title": "Groceries"})).await;
+    let out = mcp
+        .ok("add", json!({"parent": b, "title": "groceries"}))
+        .await;
+    assert!(
+        out.contains(&format!("{x} Groceries (same title, under {a})")),
+        "{out}"
+    );
+    assert!(!out.contains("Next: "), "{out}");
     let _ = std::fs::remove_dir_all(dir);
 }

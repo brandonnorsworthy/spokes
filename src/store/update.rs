@@ -142,6 +142,16 @@ pub fn update(conn: &mut Connection, args: UpdateArgs) -> ToolResult {
         check_kind_change(&tx, &node, kind)?;
     }
     check_recur(&tx, &node, args.kind, args.ordered, recur.as_ref())?;
+    if let Some(t) = &args.title
+        && !node.status.is_closed()
+        && let Some(parent_id) = node.parent_id
+    {
+        let title = clean_title(t)?;
+        if let Some(existing) = super::dupes::sibling_clash(&tx, parent_id, &title, Some(id))? {
+            let parent = require(&tx, parent_id)?;
+            return Err(super::dupes::refusal(&existing, &parent, &title));
+        }
+    }
 
     let now = now();
     if !sets.is_empty() {
