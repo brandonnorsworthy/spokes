@@ -355,6 +355,39 @@ async fn hints_off_over_http() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `SPOKES_HINTS=0` leaves out hints only: a note or source line the user wrote that
+/// starts with "Next: " comes back untouched, in get and in a write reply (SPOKE-1110).
+#[tokio::test]
+async fn hints_off_keeps_the_users_next_lines_over_http() {
+    let dir = temp_dir("hints-off-user-lines");
+    let db = dir.join("spokes.db");
+    let _ = std::fs::remove_dir_all(&dir);
+    let server = start_with(&db, chrono_tz::UTC, false).await;
+    let mcp = Mcp::new(server.addr);
+    let notes = "First line.\nNext: a line the user wrote.\nLast line.";
+    let source = "Next: ship it, the user said.";
+    mcp.ok(
+        "add",
+        json!({"title": "Mine", "notes": notes, "source": source}),
+    )
+    .await; // SPOKE-2
+    let got = mcp.ok("get", json!({"id": "SPOKE-2", "notes": true})).await;
+    assert!(got.contains(notes), "{got}");
+    assert!(got.contains(source), "{got}");
+    // The only "Next: " lines are the user's own: no hint was added.
+    let next_lines: Vec<&str> = got.lines().filter(|l| l.starts_with("Next: ")).collect();
+    assert_eq!(
+        next_lines,
+        [
+            "Next: ship it, the user said.",
+            "Next: a line the user wrote."
+        ],
+        "{got}"
+    );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The M1 "done when": a six-step plan is written and walked in three calls, then
 /// move, update and notes round-trip and the tree's error paths answer usefully.
 #[tokio::test]

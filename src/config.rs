@@ -23,8 +23,8 @@ pub struct Config {
     pub tz: chrono_tz::Tz,
     /// Nightly backups of the database file; `None` when `SPOKES_BACKUP_DIR` is unset.
     pub backup: Option<BackupConfig>,
-    /// `SPOKES_HINTS`: `0` (or `false`, `off`, `no`) removes the "Next: " hint lines from
-    /// every tool reply, for benchmarks and scripts that parse replies. Default on.
+    /// `SPOKES_HINTS`: `0` (or `false`, `off`, `no`) leaves the "Next: " hint lines out of
+    /// every tool reply (text the user wrote is never touched), for benchmarks and scripts that parse replies. Default on.
     pub hints: bool,
 }
 

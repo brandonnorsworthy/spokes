@@ -49,7 +49,7 @@ pub struct Spokes {
     tool_router: ToolRouter<Self>,
     /// `SPOKES_TZ`: decides what "today" is for due dates and deferrals.
     tz: chrono_tz::Tz,
-    /// `SPOKES_HINTS`: when false, "Next: " hint lines are removed from every reply.
+    /// `SPOKES_HINTS`: when false, no reply gets a "Next: " hint line.
     hints: bool,
 }
 
@@ -76,23 +76,16 @@ impl Spokes {
     {
         let db = self.db.clone();
         let hints = self.hints;
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             // A panic mid-call rolls its transaction back, so a poisoned lock is safe to reuse.
             let mut conn = db.lock().unwrap_or_else(|p| p.into_inner());
-            op(&mut conn)
+            crate::hints::with_enabled(hints, || op(&mut conn))
         })
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "tool task failed");
             Err("Internal error. Try again; if it persists, check the server log.".to_string())
-        });
-        if hints {
-            result
-        } else {
-            result
-                .map(|t| crate::hints::strip(&t))
-                .map_err(|t| crate::hints::strip(&t))
-        }
+        })
     }
 
     #[tool(
