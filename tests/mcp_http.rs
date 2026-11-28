@@ -3813,6 +3813,27 @@ async fn duplicate_siblings_are_refused_over_http() {
         )
         .await;
     assert!(out.contains("(similar title"), "{out}");
+    // A short title inside a long one is flagged too.
+    let long = add_node(
+        &mcp,
+        json!({"parent": spokes, "title": "Say which Spokes instance a call hit (live vs a test copy): label in replies or a whoami tool", "agent": "t"}),
+    )
+    .await;
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": view, "title": "Say which Spokes instance a call hit", "agent": "t"}),
+        )
+        .await;
+    assert!(out.contains(&format!("{long} Say which")), "{out}");
+    // Unrelated titles get no line.
+    let out = mcp
+        .ok(
+            "add",
+            json!({"parent": view, "title": "Buy groceries", "agent": "t"}),
+        )
+        .await;
+    assert!(!out.contains("Possible duplicates"), "{out}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -18,8 +18,12 @@ use crate::text::{keywords, normalize, squash};
 
 /// How many likely duplicates `add` lists.
 const LISTED: usize = 3;
-/// Share of keywords two titles must have in common to look alike (with at least 3 shared).
-const OVERLAP: f64 = 0.75;
+/// Two titles look alike when they share at least [`MIN_SHARED`] keywords, making up
+/// [`OVERLAP`] of the shorter title's and [`OVERLAP_LONG`] of the longer one's. On the
+/// production tree (2026-11-27) this flags about 4% of open titles, all close pairs.
+const MIN_SHARED: usize = 3;
+const OVERLAP: f64 = 0.8;
+const OVERLAP_LONG: f64 = 0.3;
 
 /// The form titles are compared in. A title with no letters or digits ("???") keeps its
 /// lowercased text, so it still only matches itself.
@@ -165,10 +169,12 @@ pub(crate) fn likely_line(
         }
         let other: HashSet<String> = keywords(&c.title).into_iter().collect();
         let shared = words.intersection(&other).count();
-        let union = words.union(&other).count();
-        if shared >= 3 && union > 0 {
-            let score = shared as f64 / union as f64;
-            if score >= OVERLAP {
+        let (small, large) = (words.len().min(other.len()), words.len().max(other.len()));
+        if shared >= MIN_SHARED && small > 0 {
+            // Most of the shorter title's words, and a fair share of the longer one's: a
+            // short title inside a long one counts ("Say which instance a call hit").
+            let score = shared as f64 / small as f64;
+            if score >= OVERLAP && shared as f64 / large as f64 >= OVERLAP_LONG {
                 found.push((
                     3,
                     score,
