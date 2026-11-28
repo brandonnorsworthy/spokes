@@ -841,8 +841,13 @@ async fn search_over_http() {
     )
     .await;
     assert!(search(&mcp, "quokka").await.contains("Quokka feeding"));
-    mcp.ok("set_status", json!({"ids": [parent], "status": "dropped"}))
-        .await;
+    let g = mcp.ok("get", json!({"id": parent})).await;
+    let kid = first_id(line_with(&g, "Quokka feeding"));
+    mcp.ok(
+        "set_status",
+        json!({"ids": [parent, kid], "status": "dropped"}),
+    )
+    .await;
     let out = search(&mcp, "quokka").await;
     assert!(
         out.starts_with("No matches")
@@ -2197,22 +2202,35 @@ async fn recurrence_over_http() {
     .await;
     let step = mcp.ok("get", json!({"id": review})).await;
     let inbox = first_id(line_with(&step, "Inbox zero"));
+    let week = first_id(line_with(&step, "Plan week"));
     mcp.ok("set_status", json!({"ids": [inbox], "status": "done"}))
+        .await;
+    // An unfinished step holds the whole checklist open.
+    let e = err(
+        &mcp,
+        "set_status",
+        json!({"ids": [review], "status": "done"}),
+    )
+    .await;
+    assert!(e.contains("1 unfinished under it:"), "{e}");
+    mcp.ok("set_status", json!({"ids": [week], "status": "done"}))
         .await;
     let out = mcp
         .ok("set_status", json!({"ids": [review], "status": "done"}))
         .await;
-    assert!(out.ends_with("Its 1 finished steps were reopened"), "{out}");
+    assert!(out.ends_with("Its 2 finished steps were reopened"), "{out}");
     assert_eq!(node_dates(&conn, &inbox).0, "open");
 
     // Dropping ends it.
     let out = mcp
-        .ok("set_status", json!({"ids": [review], "status": "dropped"}))
+        .ok(
+            "set_status",
+            json!({"ids": [review, inbox, week], "status": "dropped"}),
+        )
         .await;
-    // Its steps are still open, so the reply names them too.
     assert!(
         out.starts_with(&format!(
-            "{review} dropped  Weekly review  (it stops repeating)\nNext: Unfinished work is still under dropped {review} "
+            "{review} dropped  Weekly review  (it stops repeating)\n"
         )),
         "{out}"
     );
@@ -2927,11 +2945,12 @@ async fn tracked_mark_is_set_shown_found_and_cleared() {
     server.shutdown().await;
 }
 
-/// Dropping a node with unfinished work beneath it names that work (SPOKE-1079).
+/// Unfinished work never ends up under a done or dropped node (SPOKE-345): closing over
+/// it, reopening, adding and moving beneath closed work are all refused, hints on or off.
 #[tokio::test]
-async fn dropping_a_parent_names_the_open_work_under_it_over_http() {
-    let dir = temp_dir("hint-dropped");
-    let server = start(&dir.join("spokes.db")).await;
+async fn closing_over_unfinished_work_is_refused_over_http() {
+    let dir = temp_dir("close-guard");
+    let server = start_with(&dir.join("spokes.db"), chrono_tz::UTC, false).await;
     let mcp = Mcp::new(server.addr);
 
     let plan = add_node(
@@ -2945,32 +2964,46 @@ async fn dropping_a_parent_names_the_open_work_under_it_over_http() {
     let draw = first_id(line_with(&g, "Draw"));
     let write = first_id(line_with(&g, "Write"));
 
-    // A finished leaf leaves nothing behind.
-    let out = mcp
-        .ok("set_status", json!({"ids": [write], "status": "dropped"}))
-        .await;
-    assert!(!out.contains("Unfinished work"), "{out}");
+    for status in ["done", "dropped"] {
+        let e = err(&mcp, "set_status", json!({"ids": [plan], "status": status})).await;
+        assert!(
+            e.contains(&format!(
+                "3 unfinished under it: {map} Map, {draw} Draw, {write} Write."
+            )),
+            "{e}"
+        );
+    }
+    let g = mcp.ok("get", json!({"id": plan})).await;
+    assert!(g.starts_with(&format!("{plan} task (0/2)")), "{g}");
 
-    let out = mcp
-        .ok("set_status", json!({"ids": [plan], "status": "dropped"}))
-        .await;
+    // The whole branch closes in one call, parent first or not.
+    mcp.ok(
+        "set_status",
+        json!({"ids": [plan, map, draw, write], "status": "done"}),
+    )
+    .await;
+    let e = err(&mcp, "set_status", json!({"ids": [draw], "status": "open"})).await;
     assert!(
-        out.ends_with(&format!(
-            "\nNext: Unfinished work is still under dropped {plan} Plan ({map} Map, {draw} Draw). Drop what nobody wants with set_status, or move what you keep."
-        )),
+        e.contains(&format!("Pass {plan}, {map} in this same call")),
+        "{e}"
+    );
+    let e = err(&mcp, "add", json!({"parent": plan, "title": "More"})).await;
+    assert!(e.contains("is done"), "{e}");
+    let loose = add_node(&mcp, json!({"title": "Loose"})).await;
+    let e = err(&mcp, "move", json!({"id": loose, "parent": map})).await;
+    assert!(e.contains("is done"), "{e}");
+    mcp.ok(
+        "set_status",
+        json!({"ids": [draw, map, plan], "status": "open"}),
+    )
+    .await;
+
+    let out = mcp.ok("search", json!({"state": "under_closed"})).await;
+    assert!(
+        out.starts_with("No matches for state under_closed."),
         "{out}"
     );
-
-    // Dropping the rest in one call leaves nothing to name.
-    mcp.ok("set_status", json!({"ids": [plan], "status": "open"}))
-        .await;
-    let out = mcp
-        .ok(
-            "set_status",
-            json!({"ids": [plan, map, draw], "status": "dropped"}),
-        )
-        .await;
-    assert!(!out.contains("Unfinished work"), "{out}");
+    server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -3485,11 +3518,10 @@ async fn search_lists_finished_parents_and_untouched_tasks_over_http() {
     let shed = add_node(&mcp, json!({"title": "Shed", "kind": "area"})).await;
     let s1 = add_node(&mcp, task("S one", &shed)).await;
 
-    mcp.ok(
-        "set_status",
-        json!({"ids": [f1, h1, mid, s1], "status": "done"}),
-    )
-    .await;
+    mcp.ok("set_status", json!({"ids": [f1, h1, s1], "status": "done"}))
+        .await;
+    // Only data from before the close rule has work under a closed node.
+    set_column(&path, &mid, "status", "done");
     mcp.ok("set_status", json!({"ids": [f2, a1], "status": "dropped"}))
         .await;
 
@@ -3518,6 +3550,15 @@ async fn search_lists_finished_parents_and_untouched_tasks_over_http() {
         )
         .await;
     assert_eq!(result_ids(&out), sorted(&[&buried]), "{out}");
+
+    // under_closed lists exactly that work, wherever it is, and says what hides it.
+    let out = mcp.ok("search", json!({"state": "under_closed"})).await;
+    assert!(out.starts_with("1 match for state under_closed:"), "{out}");
+    assert_eq!(result_ids(&out), sorted(&[&buried]), "{out}");
+    assert!(
+        line_with(&out, "Buried step").ends_with(&format!("(under done {mid})")),
+        "{out}"
+    );
 
     // Untouched: only old unfinished tasks, oldest first; deferred ones are left out.
     set_column(&path, &half, "touched_at", &ts_ago(60 * 24 * 10));

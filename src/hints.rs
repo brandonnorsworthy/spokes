@@ -39,9 +39,6 @@ pub enum Action<'a> {
         open: &'a [Node],
         held_below: bool,
     },
-    /// `set_status` dropped nodes that still have unfinished work somewhere beneath them.
-    /// Each entry is a dropped node with that work, in tree order.
-    DroppedWithOpen { leftovers: &'a [(Node, Vec<Node>)] },
     /// `add` created `top`, perhaps with a plan beneath it. `unaliased` are the new tasks
     /// that have no aliases; `first_step` is the first child when `top` is ordered.
     Added {
@@ -113,7 +110,6 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             open,
             held_below,
         } => parent_claimed(parent, open, *held_below)?,
-        Action::DroppedWithOpen { leftovers } => dropped_with_open(leftovers)?,
         Action::Added {
             top,
             unaliased,
@@ -259,21 +255,6 @@ fn added(top: &Node, unaliased: &[NodeId], first_step: Option<&Node>) -> Option<
         ));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
-}
-
-/// Dropping a node leaves what is under it open but out of sight, so name it.
-fn dropped_with_open(leftovers: &[(Node, Vec<Node>)]) -> Option<String> {
-    let parts: Vec<String> = leftovers
-        .iter()
-        .filter(|(_, open)| !open.is_empty())
-        .map(|(node, open)| format!("{} {} ({})", node.id, node.title, names(open)))
-        .collect();
-    (!parts.is_empty()).then(|| {
-        format!(
-            "Unfinished work is still under dropped {}. Drop what nobody wants with set_status, or move what you keep.",
-            parts.join(" and ")
-        )
-    })
 }
 
 /// `SPOKE-4 Two, SPOKE-5 Three, SPOKE-6 Four, +2 more`.
@@ -600,30 +581,6 @@ mod tests {
             };
             assert_eq!(hint(&action), None);
         }
-    }
-
-    #[test]
-    fn dropped_names_the_open_work_left_under_each_node() {
-        let open: Vec<Node> = (4..9).map(|i| node(i, &format!("C{i}"))).collect();
-        let one = [(node(2, "Plan"), open.clone())];
-        assert_eq!(
-            hint(&Action::DroppedWithOpen { leftovers: &one }).as_deref(),
-            Some(
-                "Next: Unfinished work is still under dropped SPOKE-2 Plan (SPOKE-4 C4, SPOKE-5 C5, SPOKE-6 C6, +2 more). Drop what nobody wants with set_status, or move what you keep."
-            )
-        );
-        let two = [
-            (node(2, "Plan"), open[..1].to_vec()),
-            (node(3, "Other"), open[1..2].to_vec()),
-        ];
-        let h = hint(&Action::DroppedWithOpen { leftovers: &two }).unwrap();
-        assert!(
-            h.contains("dropped SPOKE-2 Plan (SPOKE-4 C4) and SPOKE-3 Other (SPOKE-5 C5)."),
-            "{h}"
-        );
-        let none = [(node(2, "Plan"), Vec::new())];
-        assert_eq!(hint(&Action::DroppedWithOpen { leftovers: &none }), None);
-        assert_eq!(hint(&Action::DroppedWithOpen { leftovers: &[] }), None);
     }
 
     #[test]

@@ -169,7 +169,7 @@ Twelve tools with flat arguments. The count is deliberately small: every tool's 
 | `search` | Find nodes by keywords, or list work by state | `query`, `scope`, `include_done`, `tracked`, `state`, `claimed_by`, `untouched_days` |
 | `add` | Create a node, or a whole nested plan in one call | `parent`, `title`, optional fields (`tracked`), `children[]` |
 | `update` | Change fields, replace or append notes | `id`, fields (`tracked`), `notes_append` |
-| `set_status` | Mark done, dropped or reopened | `ids[]`, `status` |
+| `set_status` | Mark done, dropped or reopened; nothing closes over unfinished work | `ids[]`, `status` |
 | `move` | Reparent or reorder | `id`, `parent`, `before` or `after` |
 | `focus` | Place a node on, or remove it from, the global ranked list | `id`, `rank` or `before`/`after` |
 | `claim` | Take a task; hides it from the queue | `id`, `agent`, `lease_minutes` |
@@ -278,11 +278,11 @@ The searching model passes several keywords in one call (`server homelab nas pro
 
 | Filter | Matches |
 | --- | --- |
-| `state` (`status` is accepted too) | `stalled` (the lease ran out), `claimed` (live lease), `in_progress` (both), `waiting` (on the user), `open` (nobody holds it), `children_done` (nothing open at any depth beneath it, at least one direct subtask done, itself unfinished) |
+| `state` (`status` is accepted too) | `stalled` (the lease ran out), `claimed` (live lease), `in_progress` (both), `waiting` (on the user), `open` (nobody holds it), `children_done` (nothing open at any depth beneath it, at least one direct subtask done, itself unfinished), `under_closed` (unfinished under a done or dropped node) |
 | `claimed_by` | Claimed, stalled and waiting tasks held by that agent label |
 | `untouched_days` | Tasks with no activity on or beneath them for that many days, deferred ones left out; oldest first without keywords |
 
-They match unfinished tasks only, never areas. Each line ends with the holder and the expiry (or the question, or the idle time). Open work under a done or dropped node stays hidden and counted, as elsewhere in search, until `include_done: true`.
+They match unfinished tasks only, never areas. Each line ends with the holder and the expiry (or the question, or the idle time). Open work under a done or dropped node stays hidden and counted, as elsewhere in search, until `include_done: true`. Since SPOKE-345 no write can create such work; `under_closed` finds what older data still holds, and an empty answer is the check that there is none.
 
 If this proves too literal in practice, v2 adds an embedding column with a SQLite vector extension. It is not worth the moving parts on day one.
 
@@ -358,6 +358,7 @@ Settled on 2026-11-14:
 | Clients | Claude Code, OpenCode and open models, all on your own network. No public URL or token is needed for these. The Claude web and mobile apps are deferred |
 | Lease length | 60 minutes for now, renewed by any write; revisit once agents are running |
 | Closing parents | The server suggests closing a parent when its last child is done; it never closes one itself |
+| Closing over open work | Settled 2026-11-27 (SPOKE-345): done and dropped are refused while anything beneath is unfinished, and reopening under closed work is refused, so unfinished work is never hidden. Nothing cascades; the caller names every id |
 | IDs | `SPOKE-123` |
 
 Still open:

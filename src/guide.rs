@@ -17,6 +17,9 @@ STATUS (what happened to the work)
   done         finished. set_status done. A repeating task comes back with its next due date.
   dropped      won't do. set_status dropped. There is no delete.
   Areas (kind area) never finish: they can be dropped but never done.
+  Nothing closes over unfinished work. done and dropped are refused while anything under the node, at
+  any depth, is unfinished: pass those ids in the same set_status call, or finish, drop or move them
+  first. Reopening is refused under a done or dropped node unless that one is reopened in the same call.
 
 REFINEMENT (how ready the work is to pick up; it stops at ready)
   idea          a rough thought; nothing is decided.
@@ -51,9 +54,10 @@ HOW AN AGENT WORKS A TASK
 FINDING LEFTOVER WORK
   next is a queue: it hides what sits under a held or waiting parent. search lists all of it. Leave
   query out and pass state: stalled (a claim ran out), claimed (a live claim), in_progress (both),
-  waiting (on the user), open (nobody holds it) or children_done (nothing open beneath, a subtask
-  done, the task itself unfinished). claimed_by lists what one agent label holds; untouched_days the
-  tasks idle that long. scope narrows it, filters combine, and each line names the holder and the
+  waiting (on the user), open (nobody holds it), children_done (nothing open beneath, a subtask
+  done, the task itself unfinished) or under_closed (unfinished under a done or dropped task, which
+  only older data can have: move it, close it or reopen what is above). claimed_by lists what one
+  agent label holds; untouched_days the tasks idle that long. scope narrows it, filters combine, and each line names the holder and the
   expiry. When you finish work, search for other open nodes it covers and close them or note them.
 
 HINTS
@@ -65,8 +69,7 @@ HINTS
   where to find other work. After other writes: on add, the first step of a plan, a task left under the
   root and tasks without aliases; on release with nothing written down, a hand-off note to add; on ask
   and answer, the call that comes next; on move, a changed next step or a parent left finished; on
-  set_status dropped, unfinished work still under the node; on a search by state, how to take over a
-  stalled task or close a finished parent. It appears
+  a search by state, how to take over a stalled task or close a finished parent. It appears
   only when the state calls for it. Follow it unless you know better; it never repeats what you just
   did.
 
