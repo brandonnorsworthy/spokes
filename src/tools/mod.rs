@@ -128,7 +128,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Show one node, its path, who holds it, and an outline of its children (depth levels, default 1). Ordered steps are numbered and the actionable one is marked <- next. Notes only with notes: true; recent history with history: true."
+        description = "Show one node, its path (last 3 ancestors with ids; full_paths for all), who holds it, and an outline of its children (depth levels, default 1). Ordered steps are numbered and the actionable one is marked <- next. Notes only with notes: true; recent history with history: true."
     )]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> ToolResult {
         let tz = self.tz;

@@ -171,23 +171,28 @@ pub(crate) fn breadcrumb(ancestors: &[Node]) -> String {
         .join(" / ")
 }
 
-/// Like [`breadcrumb`], with the parent's id after the last title:
-/// `Hobbies / Programming (SPOKE-7)`.
-pub(crate) fn breadcrumb_with_parent_id(ancestors: &[Node]) -> String {
-    let below: Vec<&Node> = ancestors.iter().filter(|a| a.parent_id.is_some()).collect();
-    let last = below.len().saturating_sub(1);
-    below
+/// Ancestors shown in a path unless `full_paths` is set (`get` and `search`).
+pub(crate) const SHORT_PATH: usize = 3;
+
+/// Joins ancestor entries (top first, root left out) into a path:
+/// `… / Spokes (SPOKE-5) / agent-feedback (SPOKE-182)`. Only the last
+/// [`SHORT_PATH`] unless `full`; `… / ` in front when some were cut.
+pub(crate) fn join_path(up: &[String], full: bool) -> String {
+    if full || up.len() <= SHORT_PATH {
+        return up.join(" / ");
+    }
+    format!("… / {}", up[up.len() - SHORT_PATH..].join(" / "))
+}
+
+/// The path `get` prints: ancestors below the root, each with its id, cut to
+/// the last [`SHORT_PATH`] unless `full` (the same form as `search`).
+pub(crate) fn path_with_ids(ancestors: &[Node], full: bool) -> String {
+    let up: Vec<String> = ancestors
         .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            if i == last {
-                format!("{} ({})", a.title, a.id)
-            } else {
-                a.title.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" / ")
+        .filter(|a| a.parent_id.is_some())
+        .map(|a| format!("{} ({})", a.title, a.id))
+        .collect();
+    join_path(&up, full)
 }
 
 /// Sets `touched_at` on the node and every ancestor (activity bubbles up).
