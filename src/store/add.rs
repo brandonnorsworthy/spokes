@@ -9,9 +9,7 @@ use super::{
 use crate::db::{now, position};
 use crate::format::parse_date;
 use crate::hints;
-use crate::model::{
-    DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, Status, WorkType, id_ranges,
-};
+use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, Status, WorkType};
 use crate::recur::{RecurArg, RecurChange};
 use crate::tools::args::{AddArgs, NodeSpec};
 
@@ -261,12 +259,17 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
             parent.title,
             placed.unwrap_or_default()
         );
+        // The created tree, one line per node with its id, indented by depth, so the
+        // caller can tell which id is which without a follow-up get (SPOKE-324).
         if ids.len() > 1 {
             line.push_str(&format!(
-                ", with {} beneath it in the order given: {}",
-                ids.len() - 1,
-                id_ranges(&ids[1..])
+                ", with {} beneath it in the order given:",
+                ids.len() - 1
             ));
+            let mut it = ids[1..].iter().copied();
+            for child in &spec.children {
+                outline(child, &mut it, 1, &mut line);
+            }
         }
         line
     };
@@ -759,7 +762,7 @@ pub(crate) fn clean_aliases(raw: &[String]) -> Result<Option<String>, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::IdArg;
+    use crate::model::{IdArg, id_ranges};
     use crate::store::test_support::temp_db;
 
     fn step(title: &str) -> NodeSpec {
@@ -1027,11 +1030,22 @@ pub(crate) mod tests {
         s2.children = Some(vec![step("Draft"), step("Review")]);
         a.node.children = Some(vec![step("Map"), s2, step("Ship")]);
         let out = add(&mut conn, a).unwrap();
-        // The second line is the add hint (SPOKE-1079).
+        // The created tree, one line per node (SPOKE-324); the add hint (SPOKE-1079)
+        // follows it.
+        let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
-            out.lines().next().unwrap(),
-            "Added SPOKE-2 task  Deploy  (under SPOKE-1 To do), with 5 beneath it in the order given: SPOKE-3..SPOKE-7"
+            lines[..6],
+            [
+                "Added SPOKE-2 task  Deploy  (under SPOKE-1 To do), with 5 beneath it in the order given:",
+                "  SPOKE-3 task  Map",
+                "  SPOKE-4 task  Write",
+                "    SPOKE-5 task  Draft",
+                "    SPOKE-6 task  Review",
+                "  SPOKE-7 task  Ship",
+            ],
+            "{out}"
         );
+        assert!(lines[6..].iter().all(|l| l.starts_with("Next: ")), "{out}");
         let titles: Vec<String> = crate::store::children(&conn, NodeId(2))
             .unwrap()
             .into_iter()

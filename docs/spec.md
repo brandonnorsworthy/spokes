@@ -211,7 +211,7 @@ Hobbies / Programming / Skyforge
 
 - `+notes` tells the model a body exists; the body only comes back with `notes: true`.
 - `add` accepts nested `children`, so writing a six-step plan is one call, not seven.
-- Writes return one confirmation line with the new IDs, not the whole node.
+- Writes return one confirmation line with the new IDs, not the whole node. A nested `add` adds one line per node created beneath it (id, kind, title, indented by depth) so each id can be told apart without a follow-up `get` (SPOKE-324).
 - Errors say what to do next: "SPOKE-142 is claimed by opus-red until 14:20. Pick another or ask the user."
 - The server's `instructions` field carries the conventions in a few lines: search before adding (and `add` itself refuses a same-title unfinished sibling and names likely duplicates), give new nodes 2 to 5 aliases, claim before working, ask rather than guess.
 

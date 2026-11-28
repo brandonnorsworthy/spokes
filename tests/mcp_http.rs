@@ -422,10 +422,18 @@ async fn tree_over_http() {
                    "agent": "it", "children": children}),
         )
         .await;
-    // The second line is the add hint (SPOKE-1079).
-    assert_eq!(
-        added.lines().next().unwrap(),
-        "Added SPOKE-5 task  Deploy game to production  (under SPOKE-4 Skyforge), with 6 beneath it in the order given: SPOKE-6..SPOKE-11"
+    // The created tree, one line per node (SPOKE-324); the add hint (SPOKE-1079) follows.
+    assert!(
+        added.starts_with(
+            "Added SPOKE-5 task  Deploy game to production  (under SPOKE-4 Skyforge), with 6 beneath it in the order given:\n  \
+             SPOKE-6 task  Map the pipeline\n  \
+             SPOKE-7 task  Write the pipeline\n  \
+             SPOKE-8 task  Add secrets\n  \
+             SPOKE-9 task  Push and run the deployment\n  \
+             SPOKE-10 task  Verify in production\n  \
+             SPOKE-11 task  Retro\n"
+        ),
+        "{added}"
     );
 
     // Call 2: the plan with its next step.
