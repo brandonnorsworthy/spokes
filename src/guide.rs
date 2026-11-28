@@ -59,7 +59,8 @@ HOW AN AGENT WORKS A TASK
   spacing ignored; done and dropped siblings do not count), on add, move and a rename with update.
   add's reply names likely duplicates anywhere in the tree (\"Possible duplicates of ...\"): if one is
   the same work, use it and drop the new node. To insert a step, pass before or after a sibling id
-  on add (parent can then be left out); without either the node goes last.
+  on add (parent can then be left out); without either the node goes last. To add several nodes
+  under an existing node (a plan for a task that exists), pass parent and children with no title.
 
 FINDING LEFTOVER WORK
   next is a queue: it hides what sits under a held or waiting parent. search lists all of it. Leave

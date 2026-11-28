@@ -54,7 +54,33 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
     }
     let agent = clean_agent(args.agent.as_deref())?;
     let mut count = 0;
-    let spec = clean_spec(&args.node, "", 0, &mut count)?;
+    // Without a title, the children go straight under the existing parent (SPOKE-228).
+    let batch = is_batch(&args.node)?;
+    let tops: Vec<Clean> = if batch {
+        let kids = args.node.children.as_deref().unwrap_or_default();
+        let mut tops = Vec::with_capacity(kids.len());
+        for (i, kid) in kids.iter().enumerate() {
+            tops.push(clean_spec(kid, &format!("children[{i}]"), 1, &mut count)?);
+        }
+        let titles: Vec<&str> = tops.iter().map(|c| c.title.as_str()).collect();
+        if let Some((i, j)) = dupes::batch_clash(&titles) {
+            return Err(format!(
+                "children[{i}] (\"{}\") and children[{j}] (\"{}\") have the same title, so nothing was added. Give each its own title, or merge them into one.",
+                titles[i], titles[j]
+            ));
+        }
+        tops
+    } else {
+        vec![clean_spec(&args.node, "", 0, &mut count)?]
+    };
+    // How a top node is named in an error: by its path in a batch, plainly otherwise.
+    let label = |i: usize, t: &Clean| {
+        if batch {
+            format!("children[{i}] (\"{}\"): ", t.title)
+        } else {
+            String::new()
+        }
+    };
 
     let tx = conn.transaction().map_err(db_err)?;
     // A sibling to sit next to (SPOKE-459): its parent is the parent when none is given.
@@ -90,17 +116,29 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
             parent.status.as_str()
         ));
     }
-    if spec.kind == Kind::Area && parent.kind == Kind::Task {
-        return Err(format!(
-            "{} {} is a task; areas can only go under areas. Add a task instead, or pick an area as parent.",
-            parent.id, parent.title
-        ));
-    }
-    if spec.recur.is_some() && parent.ordered {
-        return Err(recur_step_error(&parent.id.to_string(), &parent.title));
-    }
-    if let Some(existing) = dupes::sibling_clash(&tx, parent_id, &spec.title, None)? {
-        return Err(dupes::refusal(&existing, &parent, &spec.title));
+    for (i, spec) in tops.iter().enumerate() {
+        if spec.kind == Kind::Area && parent.kind == Kind::Task {
+            return Err(format!(
+                "{}{} {} is a task; areas can only go under areas. Add a task instead, or pick an area as parent.",
+                label(i, spec),
+                parent.id,
+                parent.title
+            ));
+        }
+        if spec.recur.is_some() && parent.ordered {
+            return Err(format!(
+                "{}{}",
+                label(i, spec),
+                recur_step_error(&parent.id.to_string(), &parent.title)
+            ));
+        }
+        if let Some(existing) = dupes::sibling_clash(&tx, parent_id, &spec.title, None)? {
+            return Err(format!(
+                "{}{}",
+                label(i, spec),
+                dupes::refusal(&existing, &parent, &spec.title)
+            ));
+        }
     }
 
     let siblings = children(&tx, parent_id)?;
@@ -108,46 +146,57 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
         .iter()
         .find(|c| !c.status.is_closed())
         .map(|c| c.id);
-    let pos = match &anchor {
+    // The gap the new nodes fill, as (position before, position after).
+    let (mut prev, next): (Option<String>, Option<String>) = match &anchor {
         Some(a) => {
             let i = siblings.iter().position(|s| s.id == a.id).unwrap_or(0);
             if before.is_some() {
-                let prev = i.checked_sub(1).map(|j| siblings[j].position.as_str());
-                position::between(prev, Some(&a.position))
+                let prev = i.checked_sub(1).map(|j| siblings[j].position.clone());
+                (prev, Some(a.position.clone()))
             } else {
-                let next = siblings.get(i + 1).map(|s| s.position.as_str());
-                position::between(Some(&a.position), next)
+                let next = siblings.get(i + 1).map(|s| s.position.clone());
+                (Some(a.position.clone()), next)
             }
         }
-        None => match siblings.last() {
-            Some(last) => position::after(&last.position),
-            None => position::first(),
-        },
+        None => (siblings.last().map(|s| s.position.clone()), None),
     };
 
     let now = now();
     let mut ids = Vec::new();
-    insert(
-        &tx,
-        parent_id,
-        &spec,
-        Some(pos),
-        &now,
-        agent.as_deref(),
-        &mut ids,
-    )?;
-    let top = ids[0];
+    let mut top_ids = Vec::with_capacity(tops.len());
+    for spec in &tops {
+        let pos = position::between(prev.as_deref(), next.as_deref());
+        top_ids.push(NodeId(0));
+        let first = ids.len();
+        insert(
+            &tx,
+            parent_id,
+            spec,
+            Some(pos.clone()),
+            &now,
+            agent.as_deref(),
+            &mut ids,
+        )?;
+        *top_ids.last_mut().expect("pushed above") = ids[first];
+        prev = Some(pos);
+    }
+    let top = top_ids[0];
     // Where it landed, counted like the outline and move (dropped siblings are hidden).
     let placed = match &anchor {
         Some(a) => {
             let live: Vec<_> = children(&tx, parent_id)?
                 .into_iter()
-                .filter(|s| s.status != Status::Dropped || s.id == top)
+                .filter(|s| s.status != Status::Dropped || top_ids.contains(&s.id))
                 .collect();
             let place = live.iter().position(|s| s.id == top).map_or(0, |i| i + 1);
             let side = if before.is_some() { "before" } else { "after" };
+            let places = if top_ids.len() > 1 {
+                format!("places {place} to {}", place + top_ids.len() - 1)
+            } else {
+                place.to_string()
+            };
             Some(format!(
-                ", {side} {} {}, {place} of {}",
+                ", {side} {} {}, {places} of {}",
                 a.id,
                 a.title,
                 live.len()
@@ -155,50 +204,75 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
         }
         None => None,
     };
-    // An ordered parent whose next step the new node took over.
+    // An ordered parent whose next step a new node took over.
+    let first_open = children(&tx, parent_id)?
+        .into_iter()
+        .find(|c| !c.status.is_closed())
+        .map(|c| c.id);
     let now_next = parent.ordered
-        && step_before.is_some()
-        && children(&tx, parent_id)?
-            .iter()
-            .find(|c| !c.status.is_closed())
-            .is_some_and(|c| c.id == top);
+        && (step_before.is_some() || batch)
+        && first_open.is_some_and(|c| top_ids.contains(&c));
     touch(&tx, ids[ids.len() - 1], &now).map_err(db_err)?;
     renew_leases(&tx, parent_id, agent.as_deref(), &now).map_err(db_err)?;
-    let likely = dupes::likely_line(
-        &tx,
-        top,
-        parent_id,
-        &spec.title,
-        spec.aliases.as_deref(),
-        &ids,
-    )?;
+    let mut likely = Vec::new();
+    for (spec, &id) in tops.iter().zip(&top_ids) {
+        if let Some(line) = dupes::likely_line(
+            &tx,
+            id,
+            parent_id,
+            &spec.title,
+            spec.aliases.as_deref(),
+            &ids,
+        )? {
+            likely.push(line);
+        }
+    }
     let hint = add_hint(
         &tx,
-        &spec,
+        &tops,
         &ids,
+        first_open.filter(|_| now_next),
         agent.is_none(),
         now_next.then_some(&parent),
+        batch,
     )?;
     tx.commit().map_err(db_err)?;
 
-    let mut line = format!(
-        "Added {top} {}  {}  (under {} {}{})",
-        spec.kind.as_str(),
-        spec.title,
-        parent.id,
-        parent.title,
-        placed.unwrap_or_default()
-    );
-    if ids.len() > 1 {
-        line.push_str(&format!(
-            ", with {} beneath it in the order given: {}",
-            ids.len() - 1,
-            id_ranges(&ids[1..])
-        ));
-    }
-    if let Some(likely) = likely {
+    let mut line = if batch {
+        let mut line = format!(
+            "Added {} under {} {}{}, in the order given:",
+            ids.len(),
+            parent.id,
+            parent.title,
+            placed.unwrap_or_default()
+        );
+        let mut it = ids.iter().copied();
+        for spec in &tops {
+            outline(spec, &mut it, 1, &mut line);
+        }
+        line
+    } else {
+        let spec = &tops[0];
+        let mut line = format!(
+            "Added {top} {}  {}  (under {} {}{})",
+            spec.kind.as_str(),
+            spec.title,
+            parent.id,
+            parent.title,
+            placed.unwrap_or_default()
+        );
+        if ids.len() > 1 {
+            line.push_str(&format!(
+                ", with {} beneath it in the order given: {}",
+                ids.len() - 1,
+                id_ranges(&ids[1..])
+            ));
+        }
+        line
+    };
+    for l in likely {
         line.push('\n');
-        line.push_str(&likely);
+        line.push_str(&l);
     }
     if let Some(hint) = hint {
         line.push('\n');
@@ -207,20 +281,79 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
     Ok(line)
 }
 
+/// Whether the call adds children straight under an existing parent: no title, but
+/// children. The fields that describe a new node are refused then, by name.
+fn is_batch(node: &NodeSpec) -> Result<bool, String> {
+    if !node.title.trim().is_empty() {
+        return Ok(false);
+    }
+    if node.children.as_deref().is_none_or(<[_]>::is_empty) {
+        return Err(
+            "title is empty. Give the node a short title, or leave title out and pass children to add them under an existing parent."
+                .to_string(),
+        );
+    }
+    let given: Vec<&str> = [
+        ("kind", node.kind.is_some()),
+        ("ordered", node.ordered.is_some()),
+        ("priority", node.priority.is_some()),
+        ("due", node.due.is_some()),
+        ("defer_until", node.defer_until.is_some()),
+        ("aliases", node.aliases.is_some()),
+        ("recur", node.recur.is_some()),
+        ("type", node.work_type.is_some()),
+        ("refinement", node.refinement.is_some()),
+        ("tracked", node.tracked.is_some()),
+        ("notes", node.notes.is_some()),
+        ("source", node.source.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
+    if !given.is_empty() {
+        return Err(format!(
+            "{} describe a new node, but there is no title, so nothing was added. Give a title to create that node with the children under it, or leave {} out to add the children straight under parent (change the parent itself with update).",
+            given.join(", "),
+            if given.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    refuse_stage(node.stage.as_ref())?;
+    refuse_unknown(&node.unknown, true)?;
+    Ok(true)
+}
+
+/// One line per created node, indented by depth, beside its new id (insert order).
+fn outline(spec: &Clean, ids: &mut impl Iterator<Item = NodeId>, depth: usize, out: &mut String) {
+    let Some(id) = ids.next() else { return };
+    out.push('\n');
+    out.push_str(&"  ".repeat(depth));
+    out.push_str(&format!("{id} {}  {}", spec.kind.as_str(), spec.title));
+    for child in &spec.children {
+        outline(child, ids, depth + 1, out);
+    }
+}
+
 /// The hint for what `add` just created (SPOKE-1079). `ids` are in the order `insert`
-/// made them: the node itself, then its children depth-first.
+/// made them: each top node, then its children depth-first. In a batch (SPOKE-228)
+/// the top nodes are the children given for an existing parent, and `took_next` is the
+/// one that became that ordered parent's next step.
 fn add_hint(
     conn: &Connection,
-    spec: &Clean,
+    tops: &[Clean],
     ids: &[NodeId],
+    took_next: Option<NodeId>,
     no_agent: bool,
     next_step_of: Option<&crate::model::Node>,
+    batch: bool,
 ) -> Result<Option<String>, String> {
     let mut tasks_without_aliases = Vec::new();
-    without_aliases(spec, &mut ids.iter().copied(), &mut tasks_without_aliases);
-    let top = require(conn, ids[0])?;
+    let mut it = ids.iter().copied();
+    for spec in tops {
+        without_aliases(spec, &mut it, &mut tasks_without_aliases);
+    }
+    let top = require(conn, took_next.unwrap_or(ids[0]))?;
     let first_step = match ids.get(1) {
-        Some(&id) if spec.ordered => Some(require(conn, id)?),
+        Some(&id) if !batch && tops[0].ordered => Some(require(conn, id)?),
         _ => None,
     };
     let action = hints::Action::Added {
@@ -940,6 +1073,167 @@ pub(crate) mod tests {
             id_ranges(&[NodeId(3), NodeId(4), NodeId(5), NodeId(9), NodeId(10)]),
             "SPOKE-3..SPOKE-5, SPOKE-9, SPOKE-10"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `add` with parent and children but no title (SPOKE-228).
+    fn batch(parent: i64, kids: Vec<NodeSpec>) -> AddArgs {
+        AddArgs {
+            parent: Some(IdArg::Number(parent)),
+            node: NodeSpec {
+                children: Some(kids),
+                ..NodeSpec::default()
+            },
+            before: None,
+            after: None,
+            agent: Some("test".into()),
+        }
+    }
+
+    fn titles_under(conn: &Connection, parent: i64) -> Vec<String> {
+        crate::store::children(conn, NodeId(parent))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.title)
+            .collect()
+    }
+
+    fn with_aliases(title: &str) -> NodeSpec {
+        NodeSpec {
+            aliases: Some(vec!["a".into(), "b".into()]),
+            ..step(title)
+        }
+    }
+
+    #[test]
+    fn batch_adds_children_under_an_existing_parent_in_order() {
+        let (mut conn, dir) = temp_db("add-batch");
+        add(&mut conn, args(None, "Project", Kind::Task)).unwrap(); // SPOKE-2
+        add(&mut conn, batch(2, vec![with_aliases("Old step")])).unwrap(); // SPOKE-3
+        let mut nested = with_aliases("Two");
+        nested.children = Some(vec![with_aliases("Two a"), with_aliases("Two b")]);
+        let out = add(
+            &mut conn,
+            batch(2, vec![with_aliases("One"), nested, with_aliases("Three")]),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "Added 5 under SPOKE-2 Project, in the order given:\n  SPOKE-4 task  One\n  SPOKE-5 task  Two\n    SPOKE-6 task  Two a\n    SPOKE-7 task  Two b\n  SPOKE-8 task  Three"
+        );
+        assert_eq!(titles_under(&conn, 2), ["Old step", "One", "Two", "Three"]);
+        assert_eq!(titles_under(&conn, 5), ["Two a", "Two b"]);
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'created' AND node_id BETWEEN 4 AND 8",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_after_a_sibling_keeps_the_children_together() {
+        let (mut conn, dir) = temp_db("add-batch-after");
+        add(&mut conn, args(None, "Plan", Kind::Task)).unwrap(); // SPOKE-2
+        add(
+            &mut conn,
+            batch(2, vec![with_aliases("A"), with_aliases("D")]),
+        )
+        .unwrap(); // SPOKE-3, SPOKE-4
+        let mut a = batch(2, vec![with_aliases("B"), with_aliases("C")]);
+        a.parent = None;
+        a.after = Some(IdArg::Number(3));
+        let out = add(&mut conn, a).unwrap();
+        assert!(
+            out.starts_with("Added 2 under SPOKE-2 Plan, after SPOKE-3 A, places 2 to 3 of 4, in the order given:"),
+            "{out}"
+        );
+        assert_eq!(titles_under(&conn, 2), ["A", "B", "C", "D"]);
+        let mut b = batch(2, vec![with_aliases("Z1"), with_aliases("Z2")]);
+        b.before = Some(IdArg::Number(3));
+        add(&mut conn, b).unwrap();
+        assert_eq!(titles_under(&conn, 2), ["Z1", "Z2", "A", "B", "C", "D"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_into_an_ordered_parent_names_the_next_step() {
+        let (mut conn, dir) = temp_db("add-batch-ordered");
+        let mut p = args(None, "Ladder", Kind::Task);
+        p.node.ordered = Some(true);
+        add(&mut conn, p).unwrap(); // SPOKE-2
+        let out = add(
+            &mut conn,
+            batch(2, vec![with_aliases("Rung 1"), with_aliases("Rung 2")]),
+        )
+        .unwrap();
+        assert!(
+            out.ends_with("Next: SPOKE-3 is now the next step of SPOKE-2 Ladder."),
+            "{out}"
+        );
+        // A later batch behind an open step does not take it over.
+        let out = add(&mut conn, batch(2, vec![with_aliases("Rung 3")])).unwrap();
+        assert!(!out.contains("next step"), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_hint_lists_unaliased_tasks() {
+        let (mut conn, dir) = temp_db("add-batch-hint");
+        add(&mut conn, args(None, "Project", Kind::Task)).unwrap(); // SPOKE-2
+        let out = add(&mut conn, batch(2, vec![step("x"), step("y")])).unwrap();
+        assert!(out.contains("No aliases on SPOKE-3, SPOKE-4"), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_refusals_name_the_child_and_write_nothing() {
+        let (mut conn, dir) = temp_db("add-batch-bad");
+        add(&mut conn, args(None, "Task", Kind::Task)).unwrap(); // SPOKE-2
+        add(&mut conn, batch(2, vec![with_aliases("Taken")])).unwrap(); // SPOKE-3
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+
+        let err = add(&mut conn, batch(2, vec![step("New"), step("taken!")])).unwrap_err();
+        assert!(err.starts_with("children[1] (\"taken!\"): "), "{err}");
+        let err = add(&mut conn, batch(2, vec![step("Same"), step("same")])).unwrap_err();
+        assert!(
+            err.contains("children[0] (\"Same\") and children[1] (\"same\") have the same title"),
+            "{err}"
+        );
+        let area = NodeSpec {
+            kind: Some(Kind::Area),
+            ..step("Area")
+        };
+        let err = add(&mut conn, batch(2, vec![step("Fine"), area])).unwrap_err();
+        assert!(err.contains("children[1] (\"Area\"): "), "{err}");
+        assert!(err.contains("areas can only go under areas"), "{err}");
+        let err = add(&mut conn, batch(2, vec![step("  ")])).unwrap_err();
+        assert!(err.starts_with("children[0]"), "{err}");
+
+        // Fields that describe a new node, with no title for it.
+        let mut a = batch(2, vec![step("Kid")]);
+        a.node.notes = Some("hi".into());
+        a.node.ordered = Some(true);
+        let err = add(&mut conn, a).unwrap_err();
+        assert!(
+            err.starts_with("ordered, notes describe a new node, but there is no title"),
+            "{err}"
+        );
+        // No title and no children.
+        let mut a = batch(2, vec![]);
+        a.node.children = None;
+        let err = add(&mut conn, a).unwrap_err();
+        assert!(err.contains("leave title out and pass children"), "{err}");
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

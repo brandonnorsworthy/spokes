@@ -11,7 +11,8 @@ use crate::recur::RecurArg;
 /// One node to create, with optional nested children (a whole plan in one call).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct NodeSpec {
-    /// Short title.
+    /// Short title. At the top of the call, leave it out and pass children to add them straight under an existing parent (several nodes in one call).
+    #[serde(default)]
     pub title: String,
     /// "task" (can be finished, the default) or "area" (a permanent bucket like Home or Work that never finishes).
     pub kind: Option<Kind>,
@@ -157,6 +158,10 @@ pub struct UpdateArgs {
     /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
     #[schemars(skip)]
     pub stage: Option<serde_json::Value>,
+    /// Not taken: children are added with `add`. Taken only so that it can be refused
+    /// instead of ignored (SPOKE-228).
+    #[schemars(skip)]
+    pub children: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
