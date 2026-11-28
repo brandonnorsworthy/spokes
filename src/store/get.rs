@@ -6,9 +6,7 @@ use chrono::NaiveDate;
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{
-    NODE_COLS, ToolResult, ancestors, breadcrumb_with_parent_id, db_err, node_from_row, require,
-};
+use super::{NODE_COLS, ToolResult, ancestors, db_err, node_from_row, path_with_ids, require};
 use crate::format::{child_line, clock, earliest, header_line, today_in};
 use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Status};
 use crate::tools::args::GetArgs;
@@ -37,7 +35,7 @@ pub fn get(conn: &Connection, args: GetArgs, tz: Tz) -> ToolResult {
         .fold(None, |acc, a| earliest(acc, a.due_at.as_deref()));
     let mut out = vec![header_line(&node, today, above_due)];
     if node.parent_id.is_some() {
-        let path = breadcrumb_with_parent_id(&above);
+        let path = path_with_ids(&above, args.full_paths.unwrap_or(false));
         out.push(if path.is_empty() {
             "(top level)".to_string()
         } else {
@@ -339,7 +337,45 @@ mod tests {
             depth: depth.map(NumArg::Number),
             notes: None,
             history: None,
+            full_paths: None,
         }
+    }
+
+    #[test]
+    fn deep_path_shows_last_three_ancestors_with_ids_unless_full_paths() {
+        let (mut conn, dir) = temp_db("get-deep-path");
+        add(&mut conn, args(None, "Personal", Kind::Area)).unwrap(); // 2
+        add(&mut conn, args(Some(2), "Development", Kind::Area)).unwrap(); // 3
+        add(&mut conn, args(Some(3), "Projects", Kind::Area)).unwrap(); // 4
+        add(&mut conn, args(Some(4), "Spokes", Kind::Task)).unwrap(); // 5
+        add(&mut conn, args(Some(5), "Leaf", Kind::Task)).unwrap(); // 6
+        let path_line = |full: Option<bool>| {
+            let mut a = get_args(Some(6), None);
+            a.full_paths = full;
+            get(&conn, a, chrono_tz::UTC)
+                .unwrap()
+                .lines()
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            path_line(None),
+            "… / Development (SPOKE-3) / Projects (SPOKE-4) / Spokes (SPOKE-5)"
+        );
+        assert_eq!(
+            path_line(Some(true)),
+            "Personal (SPOKE-2) / Development (SPOKE-3) / Projects (SPOKE-4) / Spokes (SPOKE-5)"
+        );
+        // Three ancestors or fewer: nothing is cut, no leading "… / ".
+        let mut a = get_args(Some(5), None);
+        a.full_paths = None;
+        let out = get(&conn, a, chrono_tz::UTC).unwrap();
+        assert_eq!(
+            out.lines().nth(1).unwrap(),
+            "Personal (SPOKE-2) / Development (SPOKE-3) / Projects (SPOKE-4)"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -373,6 +409,7 @@ mod tests {
                 depth: None,
                 notes: Some(true),
                 history: None,
+                full_paths: None,
             },
             chrono_tz::UTC,
         )

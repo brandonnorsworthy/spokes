@@ -438,7 +438,7 @@ async fn tree_over_http() {
 
     // Call 2: the plan with its next step.
     let plan = "SPOKE-5 task p1 due Nov 20 2030 ordered (0/6) +notes  Deploy game to production\n\
-                Hobbies / Programming / Skyforge (SPOKE-4)\n  \
+                Hobbies (SPOKE-2) / Programming (SPOKE-3) / Skyforge (SPOKE-4)\n  \
                 1. SPOKE-6 open  Map the pipeline  <- next\n  \
                 2. SPOKE-7 open  Write the pipeline\n  \
                 3. SPOKE-8 open  Add secrets\n  \

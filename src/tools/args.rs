@@ -85,6 +85,8 @@ pub struct GetArgs {
     pub notes: Option<bool>,
     /// Include the node's last 10 history events: who claimed, asked, answered, changed it (default false).
     pub history: Option<bool>,
+    /// Show every ancestor in the path (default: the last 3, each with its id, as search shows them).
+    pub full_paths: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

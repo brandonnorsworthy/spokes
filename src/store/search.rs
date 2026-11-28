@@ -1303,9 +1303,6 @@ fn effective_level(meta: &HashMap<NodeId, Meta>, id: NodeId) -> Option<i64> {
     lineage(meta, id).find_map(|(_, m)| m.priority)
 }
 
-/// Ancestors shown per result unless `full_paths` is set.
-const SHORT_PATH: usize = 3;
-
 /// Ancestors below the root with ids: `… / Spokes (SPOKE-5) / agent-feedback (SPOKE-182)`.
 /// Only the last `SHORT_PATH` unless `full`; an empty string for a top-level node.
 fn path_of(meta: &HashMap<NodeId, Meta>, id: NodeId, full: bool) -> String {
@@ -1315,10 +1312,7 @@ fn path_of(meta: &HashMap<NodeId, Meta>, id: NodeId, full: bool) -> String {
         .map(|(a, m)| format!("{} ({a})", m.title))
         .collect();
     up.reverse();
-    if full || up.len() <= SHORT_PATH {
-        return up.join(" / ");
-    }
-    format!("… / {}", up[up.len() - SHORT_PATH..].join(" / "))
+    super::join_path(&up, full)
 }
 
 #[cfg(test)]
