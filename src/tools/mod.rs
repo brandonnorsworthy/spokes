@@ -37,6 +37,7 @@ An ordered parent's children are steps: only the first unfinished one is actiona
 - Dates are YYYY-MM-DD in the user's time zone. defer_until hides a node until then. Repeating chores and bills: add with recur (\"every 2 weeks\"); set_status done brings it back with the next due date.
 - Three independent fields: status (is it finished? open, in_progress, waiting, done, dropped; claim and ask set the middle two), refinement (can an agent start it? idea, brainstormed, understood, planned, ready) and type (bug, feature, chore, idea, epic, spike). Refinement and type are optional: leave them unset unless you know. Call guide for what every state means.
 - When the user asks to track a node (\"track SPOKE-1017\"), update it with tracked: true; spokes-view lists tracked nodes with their progress. Tracking changes nothing else.
+- Leftover work (dead claims, finished parents left open): search with only state, claimed_by or untouched_days; next does not show all of it.
 - Ask rather than guess: if you need the user, call ask with the exact question and stop work on that task. When the user replies, record it with answer.";
 
 /// One MCP server instance. Built per request (the transport is stateless), so it only
@@ -109,11 +110,12 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. A node id (958, SPOKE-958) puts that node first. Each result shows its path (last 3 ancestors with ids; full_paths for all). Nodes matching more of the rarer words rank first and much weaker matches are left out (match: \"any\" for all, \"all\" to need every word). Search before adding. type, refinement and tracked filter; with an empty query they list every match."
+        description = "Find nodes by keywords. Pass several at once as alternatives (\"server homelab nas proxmox\"): names, synonyms, likely spellings. Tolerates typos. A node id (958, SPOKE-958) puts that node first. Each result shows its path (last 3 ancestors with ids; full_paths for all). Nodes matching more of the rarer words rank first and much weaker matches are left out (match: \"any\" for all, \"all\" to need every word). Search before adding. type, refinement and tracked filter; with an empty query they list every match. To find leftover work, filter by state (stalled, claimed, in_progress, waiting, open, children_done), claimed_by or untouched_days: it also lists tasks under held or waiting parents, with the holder and claim expiry."
     )]
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> ToolResult {
         let today = today_in(self.tz);
-        self.run(move |c| store::search(c, args, today)).await
+        let tz = self.tz;
+        self.run(move |c| store::search(c, args, today, tz)).await
     }
 
     #[tool(

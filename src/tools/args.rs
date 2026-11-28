@@ -168,7 +168,8 @@ pub struct MoveArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchArgs {
-    /// Several keywords at once, matched as alternatives: names, synonyms, likely misspellings, e.g. "server homelab nas proxmox".
+    /// Several keywords at once, matched as alternatives: names, synonyms, likely misspellings, e.g. "server homelab nas proxmox". Leave it out to list every match of a filter.
+    #[serde(default)]
     pub query: String,
     /// Only search under this node, e.g. "SPOKE-3". Omit for everything.
     #[schemars(with = "Option<String>")]
@@ -188,6 +189,14 @@ pub struct SearchArgs {
     pub refinement: Option<String>,
     /// true = only tracked nodes (with an empty query, every tracked node).
     pub tracked: Option<bool>,
+    /// Only unfinished tasks in this state: "stalled" (the claim ran out), "claimed" (live claim), "in_progress" (both), "waiting" (on the user), "open" (nobody holds it) or "children_done" (nothing open beneath it, a subtask done, itself unfinished).
+    #[serde(alias = "status")]
+    pub state: Option<String>,
+    /// Only tasks this agent label holds: claimed, stalled or waiting.
+    pub claimed_by: Option<String>,
+    /// Only unfinished, not deferred tasks with no activity on or beneath them for at least this many days.
+    #[schemars(with = "Option<u32>")]
+    pub untouched_days: Option<NumArg>,
     /// Show every ancestor in each result's path (default: the last 3, with ids).
     pub full_paths: Option<bool>,
     /// How keywords combine: "best" (default: any keyword, much weaker matches left out), "any" (every node matching any keyword) or "all" (only nodes matching every keyword).

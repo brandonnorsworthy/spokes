@@ -6,17 +6,18 @@
 //! title (x3) > aliases (x2) > notes (x1, exact matches only). Keywords under three
 //! letters, which trigrams cannot see, match whole words in titles and aliases only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use chrono::NaiveDate;
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
+use chrono_tz::Tz;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use super::focus::focus_numbers;
 use super::view::Crumb;
 use super::{ToolResult, db_err, refuse_stage, require};
-use crate::format::{due_flag, is_unplanned, parse_date, progress, short_date};
-use crate::model::{DEFAULT_USER, Node, NodeId, ROOT_ID, Refinement, Status, WorkType};
+use crate::format::{ago, clock, due_flag, is_unplanned, parse_date, progress, short_date};
+use crate::model::{DEFAULT_USER, Kind, Node, NodeId, ROOT_ID, Refinement, Status, WorkType};
 use crate::text::{keywords, match_strength, normalize, squash, trigrams};
 use crate::tools::args::SearchArgs;
 
@@ -25,6 +26,8 @@ const MAX_LIMIT: i64 = 50;
 const MAX_KEYWORDS: usize = 12;
 /// Furthest page start (`offset`) a search accepts.
 pub const MAX_OFFSET: usize = 10_000;
+/// Longest idle time `untouched_days` accepts.
+const MAX_UNTOUCHED_DAYS: i64 = 3650;
 /// FTS candidates scored per call; ranked by bm25 first, so the best survive the cut.
 const MAX_CANDIDATES: i64 = 500;
 
@@ -100,6 +103,15 @@ struct Meta {
     work_type: Option<WorkType>,
     refinement: Option<Refinement>,
     tracked: bool,
+    kind: Kind,
+    claimed_by: Option<String>,
+    claim_expires: Option<String>,
+    defer_until: Option<String>,
+    touched_at: String,
+    /// Something at any depth beneath it is neither done nor dropped.
+    open_below: bool,
+    /// A direct child is done.
+    done_child: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -194,17 +206,88 @@ pub struct Show {
     pub dropped: bool,
 }
 
-/// Type, refinement and tracked filters: a node's own values must equal every filter given.
+/// The `state` filter: which unfinished tasks a listing wants (SPOKE-1029).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum State {
+    Open,
+    Claimed,
+    Stalled,
+    InProgress,
+    Waiting,
+    ChildrenDone,
+}
+
+impl State {
+    const ALL: [State; 6] = [
+        State::Stalled,
+        State::Claimed,
+        State::InProgress,
+        State::Waiting,
+        State::Open,
+        State::ChildrenDone,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            State::Open => "open",
+            State::Claimed => "claimed",
+            State::Stalled => "stalled",
+            State::InProgress => "in_progress",
+            State::Waiting => "waiting",
+            State::ChildrenDone => "children_done",
+        }
+    }
+
+    /// Case-insensitive; spaces and hyphens count as underscores.
+    fn parse(s: &str) -> Result<Self, String> {
+        let wanted = s.trim().to_lowercase().replace([' ', '-'], "_");
+        if let Some(state) = Self::ALL.into_iter().find(|v| v.as_str() == wanted) {
+            return Ok(state);
+        }
+        if wanted == "done" || wanted == "dropped" {
+            return Err(format!(
+                "state lists unfinished tasks only. To find {wanted} nodes, search with keywords or another filter and include_done: true."
+            ));
+        }
+        let valid: Vec<&str> = Self::ALL.iter().map(|v| v.as_str()).collect();
+        Err(format!(
+            "unknown state '{s}'. Use one of: {}.",
+            valid.join(", ")
+        ))
+    }
+}
+
+/// Only tasks with no activity since `cutoff`, which is `days` before now.
+#[derive(Clone, Copy)]
+struct Untouched<'a> {
+    days: i64,
+    cutoff: &'a str,
+}
+
+/// The filters of a search: a node must pass every one given. Type, refinement and tracked
+/// look at the node's own values; the work filters (state, holder, idle time) match only
+/// unfinished tasks.
 #[derive(Clone, Copy, Default)]
-struct Filters {
+struct Filters<'a> {
     work_type: Option<WorkType>,
     refinement: Option<Refinement>,
     tracked: bool,
+    state: Option<State>,
+    claimed_by: Option<&'a str>,
+    untouched: Option<Untouched<'a>>,
+    /// What "live claim" and "deferred" are judged against; read only by the work filters.
+    now: &'a str,
+    today: NaiveDate,
 }
 
-impl Filters {
+impl Filters<'_> {
     fn is_empty(&self) -> bool {
-        self.work_type.is_none() && self.refinement.is_none() && !self.tracked
+        self.work_type.is_none() && self.refinement.is_none() && !self.tracked && !self.is_work()
+    }
+
+    /// True when the caller is listing work by state, holder or idle time.
+    fn is_work(&self) -> bool {
+        self.state.is_some() || self.claimed_by.is_some() || self.untouched.is_some()
     }
 }
 
@@ -215,7 +298,7 @@ fn find(
     conn: &Connection,
     query: &str,
     kws: &[String],
-    filters: Filters,
+    filters: Filters<'_>,
     mode: MatchMode,
     scope: NodeId,
     show: Show,
@@ -295,6 +378,13 @@ fn find(
             })
             .then(a.id.cmp(&b.id))
     });
+    // A listing of idle work reads best oldest first.
+    if kws.is_empty() && filters.untouched.is_some() {
+        hits.sort_by(|a, b| {
+            let touched = |id: &NodeId| meta.get(id).map(|m| m.touched_at.as_str());
+            touched(&a.id).cmp(&touched(&b.id)).then(a.id.cmp(&b.id))
+        });
+    }
     let mut weaker_hidden = 0;
     if mode == MatchMode::Best
         && kws.len() >= 2
@@ -392,9 +482,8 @@ fn live_keywords(hits: &[Hit], n_kws: usize) -> usize {
 /// A parent (any node with children) whose title or aliases carry at least a third of
 /// the matched keywords is the likely place to add under, so it gets a small lift.
 fn parent_bonus(hits: &mut [Hit], meta: &HashMap<NodeId, Meta>, n_kws: usize) {
-    let parents: std::collections::HashSet<NodeId> =
-        meta.values().filter_map(|m| m.parent).collect();
-    let matched: std::collections::HashSet<NodeId> = hits.iter().map(|h| h.id).collect();
+    let parents: HashSet<NodeId> = meta.values().filter_map(|m| m.parent).collect();
+    let matched: HashSet<NodeId> = hits.iter().map(|h| h.id).collect();
     let mut below: HashMap<NodeId, usize> = HashMap::new();
     for h in hits.iter() {
         for (a, _) in lineage(meta, h.id).skip(1) {
@@ -412,18 +501,50 @@ fn parent_bonus(hits: &mut [Hit], meta: &HashMap<NodeId, Meta>, n_kws: usize) {
     }
 }
 
-/// The node's own type, refinement and tracked mark must equal every filter given.
-fn matches_filters(meta: &HashMap<NodeId, Meta>, id: NodeId, filters: Filters) -> bool {
+/// The node must pass every filter given.
+fn matches_filters(meta: &HashMap<NodeId, Meta>, id: NodeId, filters: Filters<'_>) -> bool {
     let Some(m) = meta.get(&id) else {
         return false;
     };
     filters.work_type.is_none_or(|t| m.work_type == Some(t))
         && filters.refinement.is_none_or(|s| m.refinement == Some(s))
         && (!filters.tracked || m.tracked)
+        && (!filters.is_work() || matches_work(m, filters))
 }
 
-/// `type bug, refinement planned`.
-fn filter_label(filters: Filters) -> String {
+/// The work filters: an unfinished task in the wanted state, held by the wanted agent and
+/// idle long enough.
+fn matches_work(m: &Meta, filters: Filters<'_>) -> bool {
+    if m.kind != Kind::Task || m.parent.is_none() || m.status.is_closed() {
+        return false;
+    }
+    let live = m.claim_expires.as_deref().is_some_and(|e| e > filters.now);
+    let in_progress = m.status == Status::InProgress;
+    let state = filters.state.is_none_or(|s| match s {
+        State::Open => m.status == Status::Open,
+        State::Claimed => in_progress && live,
+        State::Stalled => in_progress && !live,
+        State::InProgress => in_progress,
+        State::Waiting => m.status == Status::Waiting,
+        State::ChildrenDone => m.done_child && !m.open_below,
+    });
+    // A claim or a question names its holder; a released or reopened task has none.
+    let holder = filters.claimed_by.is_none_or(|who| {
+        (in_progress || m.status == Status::Waiting) && m.claimed_by.as_deref() == Some(who)
+    });
+    let idle = filters.untouched.is_none_or(|u| {
+        m.touched_at.as_str() <= u.cutoff
+            && !m
+                .defer_until
+                .as_deref()
+                .and_then(parse_date)
+                .is_some_and(|d| d > filters.today)
+    });
+    state && holder && idle
+}
+
+/// `type bug, refinement planned, state stalled`.
+fn filter_label(filters: Filters<'_>) -> String {
     let mut parts = Vec::new();
     if let Some(t) = filters.work_type {
         parts.push(format!("type {t}"));
@@ -434,11 +555,81 @@ fn filter_label(filters: Filters) -> String {
     if filters.tracked {
         parts.push("tracked".to_string());
     }
+    if let Some(s) = filters.state {
+        parts.push(format!("state {}", s.as_str()));
+    }
+    if let Some(who) = filters.claimed_by {
+        parts.push(format!("claimed by {who}"));
+    }
+    if let Some(u) = filters.untouched {
+        parts.push(format!("untouched {}+ days", u.days));
+    }
     parts.join(", ")
 }
 
-pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResult {
+/// What a work listing adds to a line: who holds the task and until when, the question it
+/// waits on, and how long it has been idle.
+fn work_detail(node: &Node, filters: Filters<'_>, now: DateTime<Utc>, tz: Tz) -> Vec<String> {
+    let mut out = Vec::new();
+    let who = node.claimed_by.as_deref();
+    match node.status {
+        Status::InProgress => {
+            let who = who.unwrap_or("an agent");
+            let expires = node.claim_expires.as_deref().unwrap_or_default();
+            out.push(if expires > filters.now {
+                format!("held by {who} until {}", clock(expires, tz))
+            } else if expires.is_empty() {
+                format!("claim by {who} has no lease")
+            } else {
+                format!("claim by {who} expired {}", ago(expires, now))
+            });
+        }
+        Status::Waiting => {
+            let asked = who.map_or("asked".to_string(), |w| format!("{w} asked"));
+            out.push(match node.waiting_on.as_deref() {
+                // One line per result, however the question was written.
+                Some(q) => format!(
+                    "{asked}: \"{}\"",
+                    q.split_whitespace().collect::<Vec<_>>().join(" ")
+                ),
+                None => "waiting on the user".to_string(),
+            });
+        }
+        _ => {}
+    }
+    if filters.untouched.is_some() {
+        out.push(format!(
+            "untouched {}",
+            ago(&node.touched_at, now).trim_end_matches(" ago")
+        ));
+    }
+    out
+}
+
+pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate, tz: Tz) -> ToolResult {
     refuse_stage(args.stage.as_ref())?;
+    let now_dt = Utc::now();
+    let now = crate::db::now();
+    let claimed_by = match args.claimed_by.as_deref().map(str::trim) {
+        Some("") => {
+            return Err(
+                "claimed_by needs an agent label, e.g. \"opus-red\". Omit it to list every holder."
+                    .to_string(),
+            );
+        }
+        who => who,
+    };
+    let idle = match &args.untouched_days {
+        Some(d) => {
+            let days = d.parse("untouched_days")?;
+            if !(1..=MAX_UNTOUCHED_DAYS).contains(&days) {
+                return Err(format!("untouched_days must be 1 to {MAX_UNTOUCHED_DAYS}."));
+            }
+            let cutoff = (now_dt - Duration::days(days)).to_rfc3339_opts(SecondsFormat::Secs, true);
+            Some((days, cutoff))
+        }
+        None => None,
+    };
     let filters = Filters {
         work_type: args
             .work_type
@@ -451,11 +642,19 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
             .map(Refinement::parse_loose)
             .transpose()?,
         tracked: args.tracked.unwrap_or(false),
+        state: args.state.as_deref().map(State::parse).transpose()?,
+        claimed_by,
+        untouched: idle.as_ref().map(|(days, cutoff)| Untouched {
+            days: *days,
+            cutoff,
+        }),
+        now: &now,
+        today,
     };
     let kws = query_keywords(&args.query);
     if kws.is_empty() && filters.is_empty() {
         return Err(
-            "query has no words. Pass a few keywords as alternatives, e.g. \"server homelab nas\"."
+            "query has no words. Pass a few keywords as alternatives, e.g. \"server homelab nas\", or a filter (type, refinement, tracked, state, claimed_by, untouched_days) to list every match."
                 .to_string(),
         );
     }
@@ -507,9 +706,14 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
     });
 
     let hidden_note = (hidden_closed > 0).then(|| {
-        format!(
-            "({hidden_closed} done or dropped matches hidden; pass include_done: true to see them.)"
-        )
+        // A work listing matches only unfinished tasks, so what is hidden sits under a
+        // closed node.
+        let what = if filters.is_work() {
+            format!("{hidden_closed} more under done or dropped nodes")
+        } else {
+            format!("{hidden_closed} done or dropped matches hidden")
+        };
+        format!("({what}; pass include_done: true to see them.)")
     });
     let subject = if kws.is_empty() {
         filter_label(filters)
@@ -559,12 +763,23 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
             "(offset {offset} is past the last match; pass a smaller offset, or none.)"
         ));
     }
+    let (mut stalled, mut children_done) = (false, false);
     for hit in hits.iter().skip(offset).take(limit) {
         let node = require(conn, hit.id)?;
-        out.push(format!(
-            "  {}",
-            result_line(&node, &meta, &focus, hit, live, today, full_paths)
-        ));
+        let mut line = result_line(&node, &meta, &focus, hit, live, today, full_paths);
+        if filters.is_work() {
+            let detail = work_detail(&node, filters, now_dt, tz);
+            if !detail.is_empty() {
+                line.push_str(&format!("  ({})", detail.join("; ")));
+            }
+            stalled |= node.status == Status::InProgress
+                && node
+                    .claim_expires
+                    .as_deref()
+                    .is_none_or(|e| e <= now.as_str());
+            children_done |= filters.state == Some(State::ChildrenDone);
+        }
+        out.push(format!("  {line}"));
     }
     if hits.len() > shown_end && offset < hits.len() {
         out.push(format!(
@@ -577,6 +792,13 @@ pub fn search(conn: &Connection, args: SearchArgs, today: NaiveDate) -> ToolResu
     }
     if let Some(note) = hidden_note {
         out.push(note);
+    }
+    let action = crate::hints::Action::Listed {
+        stalled,
+        children_done,
+    };
+    if let Some(line) = crate::hints::hint(&action) {
+        out.push(line);
     }
     Ok(out.join("\n"))
 }
@@ -923,34 +1145,73 @@ fn score(id: NodeId, doc: &Doc, kws: &[String], phrase: &str) -> Option<Hit> {
 fn load_meta(conn: &Connection) -> Result<HashMap<NodeId, Meta>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, parent_id, title, status, priority, work_type, refinement, tracked_at
+            "SELECT id, parent_id, title, status, priority, work_type, refinement, tracked_at,
+                    kind, claimed_by, claim_expires, defer_until, touched_at
              FROM nodes WHERE user_id = ?1",
         )
         .map_err(db_err)?;
-    stmt.query_map(params![DEFAULT_USER], |r| {
-        let status: String = r.get(3)?;
-        let status: Status = status.parse().unwrap_or(Status::Open);
-        Ok((
-            NodeId(r.get(0)?),
-            Meta {
-                parent: r.get::<_, Option<i64>>(1)?.map(NodeId),
-                title: r.get(2)?,
-                status,
-                priority: r.get(4)?,
-                work_type: r
-                    .get::<_, Option<String>>(5)?
-                    .and_then(|t| WorkType::parse_loose(&t).ok()),
-                refinement: r
-                    .get::<_, Option<String>>(6)?
-                    .and_then(|t| Refinement::parse_loose(&t).ok())
-                    // Closed nodes have no refinement to match (see `node_from_row`).
-                    .filter(|_| !status.is_closed()),
-                tracked: r.get::<_, Option<String>>(7)?.is_some(),
-            },
-        ))
-    })
-    .and_then(|rows| rows.collect())
-    .map_err(db_err)
+    let mut meta: HashMap<NodeId, Meta> = stmt
+        .query_map(params![DEFAULT_USER], |r| {
+            let status: String = r.get(3)?;
+            let status: Status = status.parse().unwrap_or(Status::Open);
+            let kind: String = r.get(8)?;
+            Ok((
+                NodeId(r.get(0)?),
+                Meta {
+                    parent: r.get::<_, Option<i64>>(1)?.map(NodeId),
+                    title: r.get(2)?,
+                    status,
+                    priority: r.get(4)?,
+                    work_type: r
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|t| WorkType::parse_loose(&t).ok()),
+                    refinement: r
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|t| Refinement::parse_loose(&t).ok())
+                        // Closed nodes have no refinement to match (see `node_from_row`).
+                        .filter(|_| !status.is_closed()),
+                    tracked: r.get::<_, Option<String>>(7)?.is_some(),
+                    kind: kind.parse().unwrap_or(Kind::Task),
+                    claimed_by: r.get(9)?,
+                    claim_expires: r.get(10)?,
+                    defer_until: r.get(11)?,
+                    touched_at: r.get(12)?,
+                    open_below: false,
+                    done_child: false,
+                },
+            ))
+        })
+        .and_then(|rows| rows.collect())
+        .map_err(db_err)?;
+    mark_subtrees(&mut meta);
+    Ok(meta)
+}
+
+/// Fills `open_below` and `done_child` from each node's status and parent.
+fn mark_subtrees(meta: &mut HashMap<NodeId, Meta>) {
+    let done_parents: HashSet<NodeId> = meta
+        .values()
+        .filter(|m| m.status == Status::Done)
+        .filter_map(|m| m.parent)
+        .collect();
+    let above_open: HashSet<NodeId> = {
+        let mut seen = HashSet::new();
+        for m in meta.values().filter(|m| !m.status.is_closed()) {
+            let mut up = m.parent;
+            // Stop at an ancestor already marked: everything above it is marked too.
+            while let Some(id) = up {
+                if !seen.insert(id) {
+                    break;
+                }
+                up = meta.get(&id).and_then(|a| a.parent);
+            }
+        }
+        seen
+    };
+    for (id, m) in meta.iter_mut() {
+        m.done_child = done_parents.contains(id);
+        m.open_below = above_open.contains(id);
+    }
 }
 
 /// Walks from `id` up to the root, yielding `id` first. Bounded so a corrupt cycle
@@ -1046,6 +1307,9 @@ mod tests {
             full_paths: None,
             match_mode: None,
             offset: None,
+            state: None,
+            claimed_by: None,
+            untouched_days: None,
         }
     }
 
@@ -1074,7 +1338,13 @@ mod tests {
     #[test]
     fn empty_query_with_refinement_lists_only_that_refinement() {
         let (conn, dir) = seeded("search-refinement");
-        let out = search(&conn, search_args("", None, Some("Ready")), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("", None, Some("Ready")),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(out.starts_with("1 match for refinement ready:"), "{out}");
         assert!(out.contains("Crash bug"));
         assert!(!out.contains("Crash feature") && !out.contains("Plain crash"));
@@ -1091,7 +1361,7 @@ mod tests {
         .unwrap();
         let mut a = search_args("", None, None);
         a.tracked = Some(true);
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(out.starts_with("1 match for tracked:"), "{out}");
         assert!(
             out.contains("Crash feature") && out.contains(" tracked "),
@@ -1100,7 +1370,7 @@ mod tests {
         assert!(!out.contains("Crash bug") && !out.contains("Plain crash"));
         let mut a = search_args("crash", None, None);
         a.tracked = Some(true);
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(out.contains("Crash feature"), "{out}");
         assert!(
             !out.contains("Crash bug") && !out.contains("Plain crash"),
@@ -1109,7 +1379,7 @@ mod tests {
         // false is no filter.
         let mut a = search_args("crash", None, None);
         a.tracked = Some(false);
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(
             out.contains("Crash bug") && out.contains("Crash feature"),
             "{out}"
@@ -1120,12 +1390,24 @@ mod tests {
     #[test]
     fn empty_query_combines_filters_with_and() {
         let (conn, dir) = seeded("search-and");
-        let out = search(&conn, search_args("", Some("bug"), Some("idea")), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("", Some("bug"), Some("idea")),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(
             out.starts_with("No matches for type bug, refinement idea."),
             "{out}"
         );
-        let out = search(&conn, search_args("", Some("bug"), Some("ready")), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("", Some("bug"), Some("ready")),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(
             out.starts_with("1 match for type bug, refinement ready:"),
             "{out}"
@@ -1136,9 +1418,21 @@ mod tests {
     #[test]
     fn type_filter_drops_non_matching_keyword_hits() {
         let (conn, dir) = seeded("search-type");
-        let out = search(&conn, search_args("crash", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("crash", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(out.starts_with("3 matches for crash:"), "{out}");
-        let out = search(&conn, search_args("crash", Some("bug"), None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("crash", Some("bug"), None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(out.starts_with("1 match for crash:"), "{out}");
         assert!(out.contains("Crash bug") && !out.contains("Crash feature"));
         let _ = std::fs::remove_dir_all(dir);
@@ -1147,9 +1441,21 @@ mod tests {
     #[test]
     fn bad_filter_value_errors() {
         let (conn, dir) = seeded("search-bad");
-        let err = search(&conn, search_args("crash", Some("gremlin"), None), today()).unwrap_err();
+        let err = search(
+            &conn,
+            search_args("crash", Some("gremlin"), None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap_err();
         assert!(err.contains("Use one of"), "{err}");
-        let err = search(&conn, search_args("", None, Some("nope")), today()).unwrap_err();
+        let err = search(
+            &conn,
+            search_args("", None, Some("nope")),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap_err();
         assert!(err.contains("Use one of"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1157,7 +1463,7 @@ mod tests {
     #[test]
     fn empty_query_without_filter_still_errors() {
         let (conn, dir) = seeded("search-empty");
-        let err = search(&conn, search_args("", None, None), today()).unwrap_err();
+        let err = search(&conn, search_args("", None, None), today(), chrono_tz::UTC).unwrap_err();
         assert!(err.contains("query has no words"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1165,7 +1471,13 @@ mod tests {
     #[test]
     fn result_lines_show_type_and_refinement() {
         let (conn, dir) = seeded("search-flags");
-        let out = search(&conn, search_args("crash bug", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("crash bug", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         let line = out.lines().find(|l| l.contains("Crash bug")).unwrap();
         assert!(line.contains(" task bug ready "), "{line}");
         let _ = std::fs::remove_dir_all(dir);
@@ -1182,7 +1494,7 @@ mod tests {
         for q in [
             "4", "#4", "SPOKE-4", "spoke-4", "spoke4", "SPOKE 4", "spoke #4",
         ] {
-            let out = search(&conn, search_args(q, None, None), today()).unwrap();
+            let out = search(&conn, search_args(q, None, None), today(), chrono_tz::UTC).unwrap();
             let line = first_result(&out);
             assert!(line.starts_with("  SPOKE-4 task"), "{q}: {out}");
             assert!(line.ends_with("(id)"), "{q}: {line}");
@@ -1193,11 +1505,23 @@ mod tests {
     #[test]
     fn id_comes_before_text_matches_and_text_still_follows() {
         let (conn, dir) = seeded("search-id-text");
-        let out = search(&conn, search_args("crash 3", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("crash 3", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(out.starts_with("3 matches for crash, 3:"), "{out}");
         assert!(first_result(&out).starts_with("  SPOKE-3 "), "{out}");
         // Two ids keep the order typed.
-        let out = search(&conn, search_args("4 2", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("4 2", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert!(
             lines[1].starts_with("  SPOKE-4 ") && lines[2].starts_with("  SPOKE-2 "),
@@ -1221,9 +1545,15 @@ mod tests {
     #[test]
     fn unknown_id_and_root_fall_back_to_text() {
         let (conn, dir) = seeded("search-id-missing");
-        let out = search(&conn, search_args("999", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("999", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(out.starts_with("No matches for 999."), "{out}");
-        let out = search(&conn, search_args("1", None, None), today()).unwrap();
+        let out = search(&conn, search_args("1", None, None), today(), chrono_tz::UTC).unwrap();
         assert!(!out.contains("SPOKE-1 "), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1233,12 +1563,18 @@ mod tests {
         let (conn, dir) = seeded("search-id-closed");
         conn.execute("UPDATE nodes SET status = 'done' WHERE id = 3", [])
             .unwrap();
-        let out = search(&conn, search_args("3", None, None), today()).unwrap();
+        let out = search(&conn, search_args("3", None, None), today(), chrono_tz::UTC).unwrap();
         assert!(
             first_result(&out).starts_with("  SPOKE-3 task done "),
             "{out}"
         );
-        let out = search(&conn, search_args("crash", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("crash", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(!out.contains("SPOKE-3 "), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1248,11 +1584,23 @@ mod tests {
         let (conn, dir) = seeded("search-id-scope");
         let mut a = search_args("3", None, None);
         a.scope = Some(crate::model::IdArg::Number(2));
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(!out.contains("SPOKE-3 "), "{out}");
-        let out = search(&conn, search_args("3", Some("bug"), None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("3", Some("bug"), None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(!out.contains("SPOKE-3 "), "{out}");
-        let out = search(&conn, search_args("3", Some("feature"), None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("3", Some("feature"), None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(first_result(&out).starts_with("  SPOKE-3 "), "{out}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1278,7 +1626,13 @@ mod tests {
     #[test]
     fn deep_paths_keep_the_last_three_ancestors_with_ids() {
         let (conn, dir) = chain("search-deep");
-        let out = search(&conn, search_args("zebra", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("zebra", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(
             line_of(&out, "Zebra leaf")
                 .ends_with("in … / Charlie (SPOKE-4) / Delta (SPOKE-5) / Echo (SPOKE-6)"),
@@ -1290,7 +1644,13 @@ mod tests {
     #[test]
     fn short_and_top_level_paths_have_no_ellipsis() {
         let (conn, dir) = chain("search-short");
-        let out = search(&conn, search_args("zebra", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("zebra", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(
             line_of(&out, "Zebra pair").ends_with("in Alpha (SPOKE-2) / Bravo (SPOKE-3)"),
             "{out}"
@@ -1307,7 +1667,7 @@ mod tests {
         let (conn, dir) = chain("search-full");
         let mut a = search_args("zebra", None, None);
         a.full_paths = Some(true);
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(
             line_of(&out, "Zebra leaf").ends_with(
                 "in Alpha (SPOKE-2) / Bravo (SPOKE-3) / Charlie (SPOKE-4) / Delta (SPOKE-5) / Echo (SPOKE-6)"
@@ -1412,7 +1772,7 @@ mod tests {
     fn loose_youtube_query_finds_the_area_first_and_stays_short() {
         let (conn, dir) = loose_tree("search-loose-yt");
         let q = "youtube video editing transition ideas video content channel";
-        let out = search(&conn, search_args(q, None, None), today()).unwrap();
+        let out = search(&conn, search_args(q, None, None), today(), chrono_tz::UTC).unwrap();
         let ids = ids_in(&out);
         assert_eq!(ids[0], "SPOKE-3", "{out}");
         assert!(ids.len() <= 5, "{out}");
@@ -1426,7 +1786,7 @@ mod tests {
         // match: any lists everything again.
         let mut a = search_args(q, None, None);
         a.match_mode = Some("any".into());
-        let all = search(&conn, a, today()).unwrap();
+        let all = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(
             ids_in(&all).len() > ids.len() || all.contains("more matches"),
             "{all}"
@@ -1439,7 +1799,7 @@ mod tests {
     fn loose_discord_query_puts_the_parent_first() {
         let (conn, dir) = loose_tree("search-loose-discord");
         let q = "discord status bot server tile chart image offline";
-        let out = search(&conn, search_args(q, None, None), today()).unwrap();
+        let out = search(&conn, search_args(q, None, None), today(), chrono_tz::UTC).unwrap();
         assert_eq!(ids_in(&out)[0], "SPOKE-7", "{out}");
         assert!(ids_in(&out).len() <= 6, "{out}");
         let _ = std::fs::remove_dir_all(dir);
@@ -1450,16 +1810,16 @@ mod tests {
         let (conn, dir) = loose_tree("search-all");
         let mut a = search_args("duplicate tile", None, None);
         a.match_mode = Some("ALL".into());
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert_eq!(ids_in(&out), vec!["SPOKE-8"], "{out}");
         let mut a = search_args("duplicate zzqqxx", None, None);
         a.match_mode = Some("all".into());
-        let out = search(&conn, a, today()).unwrap();
+        let out = search(&conn, a, today(), chrono_tz::UTC).unwrap();
         assert!(out.starts_with("No matches"), "{out}");
         let mut a = search_args("tile", None, None);
         a.match_mode = Some("most".into());
         assert!(
-            search(&conn, a, today())
+            search(&conn, a, today(), chrono_tz::UTC)
                 .unwrap_err()
                 .contains("best (the default), any or all")
         );
@@ -1469,11 +1829,23 @@ mod tests {
     #[test]
     fn partial_matches_say_which_keywords_they_had() {
         let (conn, dir) = loose_tree("search-matched");
-        let out = search(&conn, search_args("duplicate rerun", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("duplicate rerun", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         let line = line_of(&out, "Duplicate tile");
         assert!(line.ends_with("(matched 1 of 2: duplicate)"), "{line}");
         // A keyword nothing has does not count: no note when every live keyword matched.
-        let out = search(&conn, search_args("duplicate zzqqxx", None, None), today()).unwrap();
+        let out = search(
+            &conn,
+            search_args("duplicate zzqqxx", None, None),
+            today(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
         assert!(
             !line_of(&out, "Duplicate tile").contains("matched"),
             "{out}"
@@ -1494,7 +1866,7 @@ mod tests {
         let page = |offset: Option<i64>| {
             let mut a = search_args("pager", None, None);
             a.offset = offset.map(crate::model::NumArg::Number);
-            search(&conn, a, today()).unwrap()
+            search(&conn, a, today(), chrono_tz::UTC).unwrap()
         };
         let p1 = page(None);
         assert!(p1.starts_with("25 matches for pager:"), "{p1}");
@@ -1524,7 +1896,7 @@ mod tests {
         let mut a = search_args("pager", None, None);
         a.offset = Some(crate::model::NumArg::Number(-1));
         assert!(
-            search(&conn, a, today())
+            search(&conn, a, today(), chrono_tz::UTC)
                 .unwrap_err()
                 .contains("offset must be 0 to")
         );

@@ -48,6 +48,14 @@ HOW AN AGENT WORKS A TASK
   Stuck or need a decision: ask (it waits for the user), do not guess. Giving up: release with a note.
   Adding: search first, then add with 2 to 5 aliases; pass the user's own words in source.
 
+FINDING LEFTOVER WORK
+  next is a queue: it hides what sits under a held or waiting parent. search lists all of it. Leave
+  query out and pass state: stalled (a claim ran out), claimed (a live claim), in_progress (both),
+  waiting (on the user), open (nobody holds it) or children_done (nothing open beneath, a subtask
+  done, the task itself unfinished). claimed_by lists what one agent label holds; untouched_days the
+  tasks idle that long. scope narrows it, filters combine, and each line names the holder and the
+  expiry. When you finish work, search for other open nodes it covers and close them or note them.
+
 HINTS
   A reply may end with a line starting \"Next: \". It is a hint from the node's current state: the next
   step of an ordered parent, or that all steps are done so the parent can be closed; on get, next and
@@ -57,8 +65,10 @@ HINTS
   where to find other work. After other writes: on add, the first step of a plan, a task left under the
   root and tasks without aliases; on release with nothing written down, a hand-off note to add; on ask
   and answer, the call that comes next; on move, a changed next step or a parent left finished; on
-  set_status dropped, unfinished work still under the node. It appears only when the state calls for
-  it. Follow it unless you know better; it never repeats what you just did.
+  set_status dropped, unfinished work still under the node; on a search by state, how to take over a
+  stalled task or close a finished parent. It appears
+  only when the state calls for it. Follow it unless you know better; it never repeats what you just
+  did.
 
 SEARCHING
   Several keywords at once, as alternatives. A typed id (958, #958, SPOKE-958) puts that node first,

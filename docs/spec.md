@@ -166,7 +166,7 @@ Twelve tools with flat arguments. The count is deliberately small: every tool's 
 | --- | --- | --- |
 | `next` | The queue: what needs you, what is top priority, what is due, what is stale | `scope`, `limit` (default 5) |
 | `get` | One node and an outline of its children | `id`, `depth` (default 1), `notes` (default false) |
-| `search` | Find nodes by keywords | `query`, `scope`, `include_done`, `tracked` |
+| `search` | Find nodes by keywords, or list work by state | `query`, `scope`, `include_done`, `tracked`, `state`, `claimed_by`, `untouched_days` |
 | `add` | Create a node, or a whole nested plan in one call | `parent`, `title`, optional fields (`tracked`), `children[]` |
 | `update` | Change fields, replace or append notes | `id`, fields (`tracked`), `notes_append` |
 | `set_status` | Mark done, dropped or reopened | `ids[]`, `status` |
@@ -271,6 +271,18 @@ Search has to work when the model only half knows what you mean ("my server") an
 4. **Ranking by coverage of the rarer words** (0.13.0, from agent feedback SPOKE-226, SPOKE-183 and SPOKE-774: a 7-keyword query returned 68 to 158 matches). Each keyword counts by how rare it is among the matches, times where it matched; notes-only hits are capped near one title word, because feedback notes often quote whole queries; a parent named by the words gets a small lift, more when its descendants match too, since the usual job is finding where to add. By default (`match: "best"`) matches far weaker than the best are left out and counted; `any` restores plain alternatives and `all` keeps only nodes with every keyword. Partial matches say which keywords they had.
 
 The searching model passes several keywords in one call (`server homelab nas proxmox`) and they are matched as alternatives, ranked by layer 4. Each result line includes the breadcrumb path, which is what lets the model tell "Server" under Work from "Server" under Hobbies and ask you only when it is truly ambiguous.
+
+### Listing leftover work
+
+`next` is a queue, so it hides what sits under a held or waiting parent, and nothing else matched on status: after agents died mid-task the only way to find their claims was to walk the tree (SPOKE-1029). `search` therefore takes three more filters, which combine with each other, with keywords and with `scope`, and which list every match when the query is left out:
+
+| Filter | Matches |
+| --- | --- |
+| `state` (`status` is accepted too) | `stalled` (the lease ran out), `claimed` (live lease), `in_progress` (both), `waiting` (on the user), `open` (nobody holds it), `children_done` (nothing open at any depth beneath it, at least one direct subtask done, itself unfinished) |
+| `claimed_by` | Claimed, stalled and waiting tasks held by that agent label |
+| `untouched_days` | Tasks with no activity on or beneath them for that many days, deferred ones left out; oldest first without keywords |
+
+They match unfinished tasks only, never areas. Each line ends with the holder and the expiry (or the question, or the idle time). Open work under a done or dropped node stays hidden and counted, as elsewhere in search, until `include_done: true`.
 
 If this proves too literal in practice, v2 adds an embedding column with a SQLite vector extension. It is not worth the moving parts on day one.
 
