@@ -6,9 +6,32 @@
 //! a hint fires only when the state calls for it, one line each, and it says the
 //! consequence or the next step, never what the caller just did. Hints do not suggest
 //! working on or finishing an area or a closed node.
-//! `SPOKES_HINTS=0` turns them all off ([`strip`], applied by the MCP layer).
+//! `SPOKES_HINTS=0` turns them all off: the MCP layer runs each tool call inside
+//! [`with_enabled`], and [`hint`] then makes none. Hints are never cut out of finished
+//! reply text, so a line the user wrote that starts with "Next: " always comes back
+//! (SPOKE-1110).
+
+use std::cell::Cell;
 
 use crate::model::{Kind, Node, NodeId, ROOT_ID, Status, id_ranges};
+
+thread_local! {
+    /// Whether [`hint`] makes hints on this thread. On unless [`with_enabled`] says off.
+    static ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Runs `f` with hints on or off on this thread, and restores the previous setting
+/// afterwards, even if `f` panics (the blocking pool reuses threads).
+pub fn with_enabled<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ENABLED.with(|e| e.set(self.0));
+        }
+    }
+    let _restore = Restore(ENABLED.with(|e| e.replace(on)));
+    f()
+}
 
 /// Every hint line starts with this.
 pub const PREFIX: &str = "Next: ";
@@ -92,8 +115,11 @@ pub const CHECK_FINISHED: &str =
 const LISTED: usize = 3;
 
 /// The hint for an action, as one line starting with [`PREFIX`], or `None` when the state
-/// does not call for one.
+/// does not call for one, or hints are off ([`with_enabled`]).
 pub fn hint(action: &Action<'_>) -> Option<String> {
+    if !ENABLED.with(Cell::get) {
+        return None;
+    }
     let text = match action {
         Action::StepClosed { parent, next_step } => step_closed(parent, *next_step)?,
         Action::Read { node, later_step } => {
@@ -278,19 +304,6 @@ fn unheld_task(node: &Node) -> bool {
 /// Open children mean the work is in a subtask; claiming the parent is SPOKE-692's hint.
 fn has_open_children(node: &Node) -> bool {
     node.child_total > node.child_done
-}
-
-/// Whether a reply line is a hint.
-pub fn is_hint(line: &str) -> bool {
-    line.starts_with(PREFIX)
-}
-
-/// The reply with its hint lines removed, for `SPOKES_HINTS=0`.
-pub fn strip(text: &str) -> String {
-    text.lines()
-        .filter(|l| !is_hint(l))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]
@@ -757,9 +770,17 @@ mod tests {
     }
 
     #[test]
-    fn strip_removes_only_hint_lines() {
-        let reply = "SPOKE-3 done  One\nNext: SPOKE-4 Two, the next step of SPOKE-2 Plan.\nSPOKE-5 done  Other";
-        assert_eq!(strip(reply), "SPOKE-3 done  One\nSPOKE-5 done  Other");
-        assert_eq!(strip("no hints here"), "no hints here");
+    fn off_makes_no_hint_and_restores_the_setting() {
+        let asked = node(4, "Ask");
+        let action = Action::Asked { node: &asked };
+        assert!(hint(&action).is_some());
+        assert_eq!(with_enabled(false, || hint(&action)), None);
+        // Nested calls restore the outer setting, and a panic restores it too.
+        with_enabled(false, || {
+            assert!(with_enabled(true, || hint(&action)).is_some());
+            assert_eq!(hint(&action), None);
+        });
+        let _ = std::panic::catch_unwind(|| with_enabled(false, || panic!("mid-call")));
+        assert!(hint(&action).is_some());
     }
 }
