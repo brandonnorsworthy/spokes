@@ -28,7 +28,7 @@ Nothing closes over unfinished work: done or dropped is refused while anything u
 An ordered parent's children are steps: only the first unfinished one is actionable (marked <- next).
 - \"What should I do?\" -> next (scope narrows it to one subtree).
 - To find something (\"my server\"), search first, with several keywords at once: names, synonyms, likely spellings. A number or SPOKE-958 finds that node first. Nodes matching more of the rarer words rank first; much weaker matches are left out (match: \"any\" lists them, \"all\" needs every word) and the footer gives the offset for the next page. Each result shows its last 3 ancestors with ids, so you can add under one directly; ask the user only if it is truly ambiguous.
-- Search before adding, so you don't create duplicates and the node lands under the right parent.
+- Search before adding, so the node lands under the right parent. add refuses a second unfinished node with the same title under one parent and names likely duplicates elsewhere.
 - Write a whole plan in one add with nested children. Give every new node 2 to 5 aliases (synonyms, plain spelling, what you'd call it out loud). Long detail goes in notes, not the title.
 - Priority: level 1-4 (inherits downward) for \"this matters\"; focus for the short ranked top list.
 - When the user's own words started a node, pass them exactly as typed in source (never a summary). It is kept apart from notes and only grows (source_append). +source means it exists; get notes: true shows it.
@@ -136,7 +136,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Create a task or area under a parent (default: the root), or a whole plan in one call via nested children (set ordered: true on the parent for sequential steps). Returns the new ids. Include 2 to 5 aliases. Optional type (bug, feature, chore, idea, epic, spike) and refinement (idea, brainstormed, understood, planned, ready) per node, and tracked: true to mark one the user follows."
+        description = "Create a task or area under a parent (default: the root), or a whole plan in one call via nested children (set ordered: true on the parent for sequential steps). Returns the new ids. Include 2 to 5 aliases. A second unfinished node with the same title (case and punctuation ignored) under the same parent is refused, naming the one that exists; the reply lists likely duplicates elsewhere. Optional type (bug, feature, chore, idea, epic, spike) and refinement (idea, brainstormed, understood, planned, ready) per node, and tracked: true to mark one the user follows."
     )]
     async fn add(&self, Parameters(args): Parameters<AddArgs>) -> ToolResult {
         self.run(move |c| store::add(c, args)).await

@@ -213,7 +213,7 @@ Hobbies / Programming / Skyforge
 - `add` accepts nested `children`, so writing a six-step plan is one call, not seven.
 - Writes return one confirmation line with the new IDs, not the whole node.
 - Errors say what to do next: "SPOKE-142 is claimed by opus-red until 14:20. Pick another or ask the user."
-- The server's `instructions` field carries the conventions in a few lines: search before adding, give new nodes 2 to 5 aliases, claim before working, ask rather than guess.
+- The server's `instructions` field carries the conventions in a few lines: search before adding (and `add` itself refuses a same-title unfinished sibling and names likely duplicates), give new nodes 2 to 5 aliases, claim before working, ask rather than guess.
 
 ## Queue, claims and parallel agents
 
@@ -360,6 +360,7 @@ Settled on 2026-11-14:
 | Closing parents | The server suggests closing a parent when its last child is done; it never closes one itself |
 | Closing over open work | Settled 2026-11-27 (SPOKE-345): done and dropped are refused while anything beneath is unfinished, and reopening under closed work is refused, so unfinished work is never hidden. Nothing cascades; the caller names every id |
 | IDs | `SPOKE-123` |
+| Duplicate siblings | Settled 2026-11-27 (SPOKE-260): an unfinished node may not share its title with an unfinished sibling. Titles compare as search normalizes them (case, accents, punctuation, spacing ignored). `add` (nested children included), `move` and `update title` are refused, naming the existing node; done and dropped siblings never block, and `set_status` is never refused for it. Checked in the write's transaction (MCP writes share one connection), not by a unique index, so there is no schema change and the rule can use the search normalization. `add` also lists up to three likely duplicates tree-wide (same title, alias match, most of the same words, or a closed same-title sibling), even with hints off. The agent label stays optional; `add` without one gets a hint asking for it |
 
 Still open:
 

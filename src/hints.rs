@@ -63,11 +63,13 @@ pub enum Action<'a> {
         held_below: bool,
     },
     /// `add` created `top`, perhaps with a plan beneath it. `unaliased` are the new tasks
-    /// that have no aliases; `first_step` is the first child when `top` is ordered.
+    /// that have no aliases; `first_step` is the first child when `top` is ordered;
+    /// `no_agent` is true when the call named no agent label (SPOKE-266).
     Added {
         top: &'a Node,
         unaliased: &'a [NodeId],
         first_step: Option<&'a Node>,
+        no_agent: bool,
     },
     /// `claim` took `node`.
     Claimed { node: &'a Node },
@@ -111,6 +113,9 @@ pub const TAKE_OVER: &str =
 /// After listing parents with nothing open beneath them.
 pub const CHECK_FINISHED: &str =
     "Check the work is really finished before you mark it done with set_status.";
+/// After an add that named no agent label (SPOKE-266).
+pub const AGENT_ON_ADD: &str =
+    "Pass agent (your label, the same all session) on writes, so the creator is recorded.";
 /// How many nodes a hint names before "+N more".
 const LISTED: usize = 3;
 
@@ -140,7 +145,8 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             top,
             unaliased,
             first_step,
-        } => added(top, unaliased, *first_step)?,
+            no_agent,
+        } => added(top, unaliased, *first_step, *no_agent)?,
         // With notes, the claim reply already says to read them, which shows the source too.
         Action::Claimed { node } => (node.has_source && !node.has_notes).then(|| {
             format!(
@@ -262,7 +268,12 @@ fn parent_claimed(parent: &Node, open: &[Node], held_below: bool) -> Option<Stri
 
 /// A new node's loose ends, in one line: which step starts the plan, a task left under
 /// the root, and tasks search will have a hard time finding.
-fn added(top: &Node, unaliased: &[NodeId], first_step: Option<&Node>) -> Option<String> {
+fn added(
+    top: &Node,
+    unaliased: &[NodeId],
+    first_step: Option<&Node>,
+    no_agent: bool,
+) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(step) = first_step.filter(|_| top.kind == Kind::Task) {
         parts.push(format!("The first step is {} {}.", step.id, step.title));
@@ -279,6 +290,9 @@ fn added(top: &Node, unaliased: &[NodeId], first_step: Option<&Node>) -> Option<
             "No aliases on {}: add 2 to 5 each with update so search finds {them}.",
             id_ranges(unaliased)
         ));
+    }
+    if no_agent {
+        parts.push(AGENT_ON_ADD.to_string());
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
@@ -608,6 +622,7 @@ mod tests {
             top: &top,
             unaliased: &bare,
             first_step: Some(&step),
+            no_agent: false,
         });
         assert_eq!(
             h.as_deref(),
@@ -623,6 +638,7 @@ mod tests {
             top: &placed,
             unaliased: &[],
             first_step: None,
+            no_agent: false,
         };
         assert_eq!(hint(&action), None);
         let area = Node {
@@ -633,8 +649,21 @@ mod tests {
             top: &area,
             unaliased: &[],
             first_step: None,
+            no_agent: false,
         };
         assert_eq!(hint(&action), None);
+        let action = Action::Added {
+            top: &placed,
+            unaliased: &[],
+            first_step: None,
+            no_agent: true,
+        };
+        assert_eq!(
+            hint(&action).as_deref(),
+            Some(
+                "Next: Pass agent (your label, the same all session) on writes, so the creator is recorded."
+            )
+        );
     }
 
     #[test]

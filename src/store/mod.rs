@@ -5,6 +5,7 @@
 
 mod add;
 mod claims;
+mod dupes;
 mod focus;
 pub(crate) mod fts;
 mod get;

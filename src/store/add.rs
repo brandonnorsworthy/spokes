@@ -3,7 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{
-    ToolResult, clean_agent, db_err, log_event, refuse_stage, renew_leases, require, touch,
+    ToolResult, clean_agent, db_err, dupes, log_event, refuse_stage, renew_leases, require, touch,
 };
 use crate::db::{now, position};
 use crate::format::parse_date;
@@ -67,6 +67,9 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
     if spec.recur.is_some() && parent.ordered {
         return Err(recur_step_error(&parent.id.to_string(), &parent.title));
     }
+    if let Some(existing) = dupes::sibling_clash(&tx, parent_id, &spec.title, None)? {
+        return Err(dupes::refusal(&existing, &parent, &spec.title));
+    }
 
     let now = now();
     let mut ids = Vec::new();
@@ -74,7 +77,15 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
     let top = ids[0];
     touch(&tx, ids[ids.len() - 1], &now).map_err(db_err)?;
     renew_leases(&tx, parent_id, agent.as_deref(), &now).map_err(db_err)?;
-    let hint = add_hint(&tx, &spec, &ids)?;
+    let likely = dupes::likely_line(
+        &tx,
+        top,
+        parent_id,
+        &spec.title,
+        spec.aliases.as_deref(),
+        &ids,
+    )?;
+    let hint = add_hint(&tx, &spec, &ids, agent.is_none())?;
     tx.commit().map_err(db_err)?;
 
     let mut line = format!(
@@ -91,6 +102,10 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
             id_ranges(&ids[1..])
         ));
     }
+    if let Some(likely) = likely {
+        line.push('\n');
+        line.push_str(&likely);
+    }
     if let Some(hint) = hint {
         line.push('\n');
         line.push_str(&hint);
@@ -100,7 +115,12 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
 
 /// The hint for what `add` just created (SPOKE-1079). `ids` are in the order `insert`
 /// made them: the node itself, then its children depth-first.
-fn add_hint(conn: &Connection, spec: &Clean, ids: &[NodeId]) -> Result<Option<String>, String> {
+fn add_hint(
+    conn: &Connection,
+    spec: &Clean,
+    ids: &[NodeId],
+    no_agent: bool,
+) -> Result<Option<String>, String> {
     let mut tasks_without_aliases = Vec::new();
     without_aliases(spec, &mut ids.iter().copied(), &mut tasks_without_aliases);
     let top = require(conn, ids[0])?;
@@ -112,6 +132,7 @@ fn add_hint(conn: &Connection, spec: &Clean, ids: &[NodeId]) -> Result<Option<St
         top: &top,
         unaliased: &tasks_without_aliases,
         first_step: first_step.as_ref(),
+        no_agent,
     };
     Ok(hints::hint(&action))
 }
@@ -270,6 +291,23 @@ fn clean_spec(
             ));
         }
         children.push(clean);
+    }
+    let titles: Vec<&str> = children.iter().map(|c| c.title.as_str()).collect();
+    if let Some((i, j)) = dupes::batch_clash(&titles) {
+        let child = |k: usize| {
+            if path.is_empty() {
+                format!("children[{k}]")
+            } else {
+                format!("{path}.children[{k}]")
+            }
+        };
+        return Err(format!(
+            "{} (\"{}\") and {} (\"{}\") have the same title under \"{title}\", so nothing was added. Give each step its own title, or merge them into one.",
+            child(i),
+            titles[i],
+            child(j),
+            titles[j]
+        ));
     }
     Ok(Clean {
         title,

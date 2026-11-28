@@ -51,7 +51,11 @@ STRUCTURE
 HOW AN AGENT WORKS A TASK
   next -> claim (use one agent label all session) -> do it, notes_append as you go -> set_status done.
   Stuck or need a decision: ask (it waits for the user), do not guess. Giving up: release with a note.
-  Adding: search first, then add with 2 to 5 aliases; pass the user's own words in source.
+  Adding: search first, then add with 2 to 5 aliases; pass the user's own words in source. A second
+  unfinished node with the same title under one parent is refused (case, accents, punctuation and
+  spacing ignored; done and dropped siblings do not count), on add, move and a rename with update.
+  add's reply names likely duplicates anywhere in the tree (\"Possible duplicates of ...\"): if one is
+  the same work, use it and drop the new node.
 
 FINDING LEFTOVER WORK
   next is a queue: it hides what sits under a held or waiting parent. search lists all of it. Leave
@@ -69,7 +73,7 @@ HINTS
   in_progress; there is no set_status in_progress); on claim of a task with open children, their ids,
   so you claim the subtask you are working on too, or the user's own words to read; on a refused claim,
   where to find other work. After other writes: on add, the first step of a plan, a task left under the
-  root and tasks without aliases; on release with nothing written down, a hand-off note to add; on ask
+  root, tasks without aliases and a missing agent label; on release with nothing written down, a hand-off note to add; on ask
   and answer, the call that comes next; on move, a changed next step or a parent left finished; on
   a search by state, how to take over a stalled task or close a finished parent. It appears
   only when the state calls for it. Follow it unless you know better; it never repeats what you just

@@ -89,6 +89,13 @@ pub fn move_node(conn: &mut Connection, args: MoveArgs) -> ToolResult {
         ));
     }
 
+    if target.id != old_parent
+        && !node.status.is_closed()
+        && let Some(existing) = super::dupes::sibling_clash(&tx, target.id, &node.title, Some(id))?
+    {
+        return Err(super::dupes::refusal(&existing, &target, &node.title));
+    }
+
     // The parents the move touches, and the step each was waiting on, for the hint.
     let mut touched = vec![(old_parent, next_step(&tx, old_parent)?)];
     if target.id != old_parent {
