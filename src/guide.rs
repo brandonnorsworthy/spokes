@@ -55,7 +55,8 @@ HOW AN AGENT WORKS A TASK
   unfinished node with the same title under one parent is refused (case, accents, punctuation and
   spacing ignored; done and dropped siblings do not count), on add, move and a rename with update.
   add's reply names likely duplicates anywhere in the tree (\"Possible duplicates of ...\"): if one is
-  the same work, use it and drop the new node.
+  the same work, use it and drop the new node. To insert a step, pass before or after a sibling id
+  on add (parent can then be left out); without either the node goes last.
 
 FINDING LEFTOVER WORK
   next is a queue: it hides what sits under a held or waiting parent. search lists all of it. Leave
@@ -72,7 +73,7 @@ HINTS
   notes_append, a reminder to claim an open task nobody holds before working on it (claim sets
   in_progress; there is no set_status in_progress); on claim of a task with open children, their ids,
   so you claim the subtask you are working on too, or the user's own words to read; on a refused claim,
-  where to find other work. After other writes: on add, the first step of a plan, a task left under the
+  where to find other work. After other writes: on add, the first step of a plan, a node placed ahead of the next step, a task left under the
   root, tasks without aliases and a missing agent label; on release with nothing written down, a hand-off note to add; on ask
   and answer, the call that comes next; on move, a changed next step or a parent left finished; on
   a search by state, how to take over a stalled task or close a finished parent. It appears

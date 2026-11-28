@@ -62,6 +62,12 @@ pub struct AddArgs {
     pub parent: Option<IdArg>,
     #[serde(flatten)]
     pub node: NodeSpec,
+    /// Place the new node just before this sibling, e.g. "SPOKE-7" (parent may then be omitted). Without before or after it goes last.
+    #[schemars(with = "Option<String>")]
+    pub before: Option<IdArg>,
+    /// Place the new node just after this sibling, e.g. "SPOKE-6" (parent may then be omitted).
+    #[schemars(with = "Option<String>")]
+    pub after: Option<IdArg>,
     /// Your agent label, the same all session (e.g. "opus-red"). Optional; it logs who acted and renews your claim. No need to mention it to the user.
     pub agent: Option<String>,
 }

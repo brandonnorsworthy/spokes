@@ -70,6 +70,9 @@ pub enum Action<'a> {
         unaliased: &'a [NodeId],
         first_step: Option<&'a Node>,
         no_agent: bool,
+        /// The ordered parent whose next step `top` became, ahead of an earlier open step
+        /// (`add` with before or after, SPOKE-459).
+        next_step_of: Option<&'a Node>,
     },
     /// `claim` took `node`.
     Claimed { node: &'a Node },
@@ -146,7 +149,8 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             unaliased,
             first_step,
             no_agent,
-        } => added(top, unaliased, *first_step, *no_agent)?,
+            next_step_of,
+        } => added(top, unaliased, *first_step, *no_agent, *next_step_of)?,
         // With notes, the claim reply already says to read them, which shows the source too.
         Action::Claimed { node } => (node.has_source && !node.has_notes).then(|| {
             format!(
@@ -273,8 +277,15 @@ fn added(
     unaliased: &[NodeId],
     first_step: Option<&Node>,
     no_agent: bool,
+    next_step_of: Option<&Node>,
 ) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(p) = next_step_of {
+        parts.push(format!(
+            "{} is now the next step of {} {}.",
+            top.id, p.id, p.title
+        ));
+    }
     if let Some(step) = first_step.filter(|_| top.kind == Kind::Task) {
         parts.push(format!("The first step is {} {}.", step.id, step.title));
     }
@@ -623,6 +634,7 @@ mod tests {
             unaliased: &bare,
             first_step: Some(&step),
             no_agent: false,
+            next_step_of: None,
         });
         assert_eq!(
             h.as_deref(),
@@ -639,6 +651,7 @@ mod tests {
             unaliased: &[],
             first_step: None,
             no_agent: false,
+            next_step_of: None,
         };
         assert_eq!(hint(&action), None);
         let area = Node {
@@ -650,6 +663,7 @@ mod tests {
             unaliased: &[],
             first_step: None,
             no_agent: false,
+            next_step_of: None,
         };
         assert_eq!(hint(&action), None);
         let action = Action::Added {
@@ -657,12 +671,28 @@ mod tests {
             unaliased: &[],
             first_step: None,
             no_agent: true,
+            next_step_of: None,
         };
         assert_eq!(
             hint(&action).as_deref(),
             Some(
                 "Next: Pass agent (your label, the same all session) on writes, so the creator is recorded."
             )
+        );
+        let ladder = Node {
+            ordered: true,
+            ..node(9, "Ladder")
+        };
+        let action = Action::Added {
+            top: &placed,
+            unaliased: &[],
+            first_step: None,
+            no_agent: false,
+            next_step_of: Some(&ladder),
+        };
+        assert_eq!(
+            hint(&action).as_deref(),
+            Some("Next: SPOKE-10 is now the next step of SPOKE-9 Ladder.")
         );
     }
 

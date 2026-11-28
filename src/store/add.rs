@@ -3,12 +3,15 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{
-    ToolResult, clean_agent, db_err, dupes, log_event, refuse_stage, renew_leases, require, touch,
+    ToolResult, children, clean_agent, db_err, dupes, log_event, refuse_stage, renew_leases,
+    require, touch,
 };
 use crate::db::{now, position};
 use crate::format::parse_date;
 use crate::hints;
-use crate::model::{DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, WorkType, id_ranges};
+use crate::model::{
+    DEFAULT_USER, Kind, NodeId, NumArg, ROOT_ID, Refinement, Status, WorkType, id_ranges,
+};
 use crate::recur::{RecurArg, RecurChange};
 use crate::tools::args::{AddArgs, NodeSpec};
 
@@ -40,15 +43,44 @@ struct Clean {
 }
 
 pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
-    let parent_id = match &args.parent {
-        Some(p) => p.parse()?,
-        None => ROOT_ID,
-    };
+    let parent_arg = args.parent.as_ref().map(|p| p.parse()).transpose()?;
+    let before = args.before.as_ref().map(|p| p.parse()).transpose()?;
+    let after = args.after.as_ref().map(|p| p.parse()).transpose()?;
+    if before.is_some() && after.is_some() {
+        return Err(
+            "pass before or after, not both, so nothing was added. Name one sibling to sit next to."
+                .to_string(),
+        );
+    }
     let agent = clean_agent(args.agent.as_deref())?;
     let mut count = 0;
     let spec = clean_spec(&args.node, "", 0, &mut count)?;
 
     let tx = conn.transaction().map_err(db_err)?;
+    // A sibling to sit next to (SPOKE-459): its parent is the parent when none is given.
+    let anchor = match before.or(after) {
+        Some(a) => Some(require(&tx, a)?),
+        None => None,
+    };
+    let parent_id = match (parent_arg, &anchor) {
+        (Some(p), _) => p,
+        (None, Some(a)) => a.parent_id.ok_or_else(|| {
+            format!(
+                "{} is the root and has no siblings, so nothing was added. Name a sibling, or pass parent.",
+                a.id
+            )
+        })?,
+        (None, None) => ROOT_ID,
+    };
+    if let Some(a) = &anchor
+        && a.parent_id != Some(parent_id)
+    {
+        let side = if before.is_some() { "before" } else { "after" };
+        return Err(format!(
+            "{} {} is not under {parent_id}, so the new node cannot go {side} it there and nothing was added. Name a child of {parent_id}, or omit parent.",
+            a.id, a.title
+        ));
+    }
     let parent = require(&tx, parent_id)?;
     if parent.status.is_closed() {
         return Err(format!(
@@ -71,10 +103,65 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
         return Err(dupes::refusal(&existing, &parent, &spec.title));
     }
 
+    let siblings = children(&tx, parent_id)?;
+    let step_before = siblings
+        .iter()
+        .find(|c| !c.status.is_closed())
+        .map(|c| c.id);
+    let pos = match &anchor {
+        Some(a) => {
+            let i = siblings.iter().position(|s| s.id == a.id).unwrap_or(0);
+            if before.is_some() {
+                let prev = i.checked_sub(1).map(|j| siblings[j].position.as_str());
+                position::between(prev, Some(&a.position))
+            } else {
+                let next = siblings.get(i + 1).map(|s| s.position.as_str());
+                position::between(Some(&a.position), next)
+            }
+        }
+        None => match siblings.last() {
+            Some(last) => position::after(&last.position),
+            None => position::first(),
+        },
+    };
+
     let now = now();
     let mut ids = Vec::new();
-    insert(&tx, parent_id, &spec, &now, agent.as_deref(), &mut ids)?;
+    insert(
+        &tx,
+        parent_id,
+        &spec,
+        Some(pos),
+        &now,
+        agent.as_deref(),
+        &mut ids,
+    )?;
     let top = ids[0];
+    // Where it landed, counted like the outline and move (dropped siblings are hidden).
+    let placed = match &anchor {
+        Some(a) => {
+            let live: Vec<_> = children(&tx, parent_id)?
+                .into_iter()
+                .filter(|s| s.status != Status::Dropped || s.id == top)
+                .collect();
+            let place = live.iter().position(|s| s.id == top).map_or(0, |i| i + 1);
+            let side = if before.is_some() { "before" } else { "after" };
+            Some(format!(
+                ", {side} {} {}, {place} of {}",
+                a.id,
+                a.title,
+                live.len()
+            ))
+        }
+        None => None,
+    };
+    // An ordered parent whose next step the new node took over.
+    let now_next = parent.ordered
+        && step_before.is_some()
+        && children(&tx, parent_id)?
+            .iter()
+            .find(|c| !c.status.is_closed())
+            .is_some_and(|c| c.id == top);
     touch(&tx, ids[ids.len() - 1], &now).map_err(db_err)?;
     renew_leases(&tx, parent_id, agent.as_deref(), &now).map_err(db_err)?;
     let likely = dupes::likely_line(
@@ -85,15 +172,22 @@ pub fn add(conn: &mut Connection, args: AddArgs) -> ToolResult {
         spec.aliases.as_deref(),
         &ids,
     )?;
-    let hint = add_hint(&tx, &spec, &ids, agent.is_none())?;
+    let hint = add_hint(
+        &tx,
+        &spec,
+        &ids,
+        agent.is_none(),
+        now_next.then_some(&parent),
+    )?;
     tx.commit().map_err(db_err)?;
 
     let mut line = format!(
-        "Added {top} {}  {}  (under {} {})",
+        "Added {top} {}  {}  (under {} {}{})",
         spec.kind.as_str(),
         spec.title,
         parent.id,
-        parent.title
+        parent.title,
+        placed.unwrap_or_default()
     );
     if ids.len() > 1 {
         line.push_str(&format!(
@@ -120,6 +214,7 @@ fn add_hint(
     spec: &Clean,
     ids: &[NodeId],
     no_agent: bool,
+    next_step_of: Option<&crate::model::Node>,
 ) -> Result<Option<String>, String> {
     let mut tasks_without_aliases = Vec::new();
     without_aliases(spec, &mut ids.iter().copied(), &mut tasks_without_aliases);
@@ -133,6 +228,7 @@ fn add_hint(
         unaliased: &tasks_without_aliases,
         first_step: first_step.as_ref(),
         no_agent,
+        next_step_of,
     };
     Ok(hints::hint(&action))
 }
@@ -148,27 +244,33 @@ fn without_aliases(spec: &Clean, ids: &mut impl Iterator<Item = NodeId>, out: &m
     }
 }
 
-/// Inserts `spec` as the last child of `parent`, then its children depth-first.
+/// Inserts `spec` under `parent` at `pos` (`None`: last), then its children depth-first.
 fn insert(
     tx: &Transaction<'_>,
     parent: NodeId,
     spec: &Clean,
+    pos: Option<String>,
     now: &str,
     agent: Option<&str>,
     ids: &mut Vec<NodeId>,
 ) -> Result<(), String> {
-    let last: Option<String> = tx
-        .query_row(
-            "SELECT MAX(position) FROM nodes WHERE parent_id = ?1",
-            params![parent.0],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(db_err)?
-        .flatten();
-    let pos = match last {
-        Some(l) => position::after(&l),
-        None => position::first(),
+    let pos = match pos {
+        Some(p) => p,
+        None => {
+            let last: Option<String> = tx
+                .query_row(
+                    "SELECT MAX(position) FROM nodes WHERE parent_id = ?1",
+                    params![parent.0],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?
+                .flatten();
+            match last {
+                Some(l) => position::after(&l),
+                None => position::first(),
+            }
+        }
     };
     tx.execute(
         "INSERT INTO nodes (user_id, parent_id, position, kind, ordered, title, priority,
@@ -207,7 +309,7 @@ fn insert(
     super::fts::reindex(tx, id).map_err(db_err)?;
     log_event(tx, id, now, agent, "created", &spec.title).map_err(db_err)?;
     for child in &spec.children {
-        insert(tx, id, child, now, agent, ids)?;
+        insert(tx, id, child, None, now, agent, ids)?;
     }
     Ok(())
 }
@@ -363,8 +465,11 @@ fn unknown_fix(name: &str, top: bool) -> Option<String> {
         "status" | "state" | "done" => {
             "To record work that is already finished, add it, then set_status done with the new ids."
         }
-        "after" | "before" | "position" | "rank" => {
-            "New nodes go last under their parent; place one with move (before or after a sibling) once it exists."
+        "after" | "before" => {
+            "A child is placed by its order in children; before or after (a sibling id) is taken only at the top of the call."
+        }
+        "position" | "rank" => {
+            "Place the new node with before or after (a sibling id) at the top of the call; without either it goes last."
         }
         "parent" | "parent_id" if !top => {
             "A child's parent is the node it is nested in; pass parent only at the top of the call."
@@ -539,6 +644,8 @@ pub(crate) mod tests {
                 kind: Some(kind),
                 ..NodeSpec::default()
             },
+            before: None,
+            after: None,
             agent: Some("test".into()),
         }
     }
@@ -668,6 +775,113 @@ pub(crate) mod tests {
             .map(|n| n.title)
             .collect();
         assert_eq!(titles, ["a", "b", "c"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn order(conn: &Connection, parent: i64) -> Vec<i64> {
+        crate::store::children(conn, NodeId(parent))
+            .unwrap()
+            .iter()
+            .map(|n| n.id.0)
+            .collect()
+    }
+
+    /// Ordered task 2 "Ladder" with steps 3, 4, 5 (M0, M1, M2).
+    fn ladder(name: &str) -> (Connection, std::path::PathBuf) {
+        let (mut conn, dir) = temp_db(name);
+        let mut a = args(None, "Ladder", Kind::Task);
+        a.node.ordered = Some(true);
+        a.node.children = Some(vec![step("M0"), step("M1"), step("M2")]);
+        add(&mut conn, a).unwrap();
+        (conn, dir)
+    }
+
+    fn placed(
+        parent: Option<i64>,
+        title: &str,
+        before: Option<i64>,
+        after: Option<i64>,
+    ) -> AddArgs {
+        let mut a = args(parent, title, Kind::Task);
+        a.before = before.map(IdArg::Number);
+        a.after = after.map(IdArg::Number);
+        a
+    }
+
+    /// SPOKE-459: after/before on add place the node, and the parent comes from the sibling.
+    #[test]
+    fn after_and_before_place_the_new_node() {
+        let (mut conn, dir) = ladder("add-after");
+        let out = add(&mut conn, placed(None, "M0.5", None, Some(3))).unwrap();
+        assert_eq!(
+            out.lines().next().unwrap(),
+            "Added SPOKE-6 task  M0.5  (under SPOKE-2 Ladder, after SPOKE-3 M0, 2 of 4)"
+        );
+        assert_eq!(order(&conn, 2), [3, 6, 4, 5]);
+        let out = add(&mut conn, placed(Some(2), "M1.5", Some(5), None)).unwrap();
+        assert!(
+            out.starts_with(
+                "Added SPOKE-7 task  M1.5  (under SPOKE-2 Ladder, before SPOKE-5 M2, 4 of 5)"
+            ),
+            "{out}"
+        );
+        assert_eq!(order(&conn, 2), [3, 6, 4, 7, 5]);
+        // After the last one, and before the first one.
+        add(&mut conn, placed(None, "M3", None, Some(5))).unwrap();
+        add(&mut conn, placed(None, "Prep", Some(3), None)).unwrap();
+        assert_eq!(order(&conn, 2), [9, 3, 6, 4, 7, 5, 8]);
+        // Children of a placed node keep their own order.
+        let mut a = placed(None, "M2.5", None, Some(5));
+        a.node.children = Some(vec![step("a"), step("b")]);
+        add(&mut conn, a).unwrap();
+        assert_eq!(order(&conn, 2), [9, 3, 6, 4, 7, 5, 10, 8]);
+        assert_eq!(order(&conn, 10), [11, 12]);
+        let positions: Vec<String> = crate::store::children(&conn, NodeId(2))
+            .unwrap()
+            .into_iter()
+            .map(|n| n.position)
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn placed_ahead_of_the_next_step_says_so() {
+        let (mut conn, dir) = ladder("add-before-next");
+        let out = add(&mut conn, placed(None, "Prep", Some(3), None)).unwrap();
+        assert!(
+            out.contains("Next: SPOKE-6 is now the next step of SPOKE-2 Ladder."),
+            "{out}"
+        );
+        // Behind the next step: no such line.
+        let out = add(&mut conn, placed(None, "Later", None, Some(4))).unwrap();
+        assert!(!out.contains("now the next step"), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bad_placement_is_refused_and_writes_nothing() {
+        let (mut conn, dir) = ladder("add-after-bad");
+        add(&mut conn, args(None, "Other", Kind::Task)).unwrap(); // 6
+        let cases = [
+            (placed(None, "x", Some(3), Some(4)), "not both"),
+            (placed(Some(6), "x", None, Some(3)), "is not under SPOKE-6"),
+            (placed(None, "x", None, Some(99)), "SPOKE-99 does not exist"),
+            (
+                placed(None, "x", None, Some(1)),
+                "is the root and has no siblings",
+            ),
+            (placed(None, "M1", None, Some(3)), "SPOKE-4"),
+        ];
+        for (a, needle) in cases {
+            let err = add(&mut conn, a).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 6);
+        assert_eq!(order(&conn, 2), [3, 4, 5]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

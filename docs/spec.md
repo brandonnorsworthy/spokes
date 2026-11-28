@@ -167,7 +167,7 @@ Twelve tools with flat arguments. The count is deliberately small: every tool's 
 | `next` | The queue: what needs you, what is top priority, what is due, what is stale | `scope`, `limit` (default 5) |
 | `get` | One node and an outline of its children | `id`, `depth` (default 1), `notes` (default false) |
 | `search` | Find nodes by keywords, or list work by state | `query`, `scope`, `include_done`, `tracked`, `state`, `claimed_by`, `untouched_days` |
-| `add` | Create a node, or a whole nested plan in one call | `parent`, `title`, optional fields (`tracked`), `children[]` |
+| `add` | Create a node, or a whole nested plan in one call | `parent`, `title`, optional fields (`tracked`), `before` or `after`, `children[]` |
 | `update` | Change fields, replace or append notes | `id`, fields (`tracked`), `notes_append` |
 | `set_status` | Mark done, dropped or reopened; nothing closes over unfinished work | `ids[]`, `status` |
 | `move` | Reparent or reorder | `id`, `parent`, `before` or `after` |
@@ -360,7 +360,8 @@ Settled on 2026-11-14:
 | Closing parents | The server suggests closing a parent when its last child is done; it never closes one itself |
 | Closing over open work | Settled 2026-11-27 (SPOKE-345): done and dropped are refused while anything beneath is unfinished, and reopening under closed work is refused, so unfinished work is never hidden. Nothing cascades; the caller names every id |
 | IDs | `SPOKE-123` |
-| Unknown fields on add | Settled 2026-11-27 (SPOKE-222): `add` refuses any field it does not take, at the top or on a nested child, naming the field and the child's path, and writes nothing. Chosen over honoring `status` on add, which would need its own close rules (SPOKE-345). The refusal says what to do instead where callers are known to reach for something (`status` -> `set_status done`, `after`/`before` -> `move`). Other tools still ignore unknown fields |
+| Unknown fields on add | Settled 2026-11-27 (SPOKE-222): `add` refuses any field it does not take, at the top or on a nested child, naming the field and the child's path, and writes nothing. Chosen over honoring `status` on add, which would need its own close rules (SPOKE-345). The refusal says what to do instead where callers are known to reach for something (`status` -> `set_status done`, `position` -> `before`/`after`). Other tools still ignore unknown fields |
+| Placing a node on add | Settled 2026-11-27 (SPOKE-459): `add` takes `before` or `after` (a sibling id) at the top of the call and places the new node there, like `move`, so an inserted step costs one call instead of two; `parent` may be omitted and is then the sibling's parent. Nested children are placed by their order in `children`, so `before`/`after` on a child is refused. Chosen over keeping the 0.29.2 refusal because in an ordered parent position is meaning, and a two-call insert leaves the wrong step next in between |
 | Duplicate siblings | Settled 2026-11-27 (SPOKE-260): an unfinished node may not share its title with an unfinished sibling. Titles compare as search normalizes them (case, accents, punctuation, spacing ignored). `add` (nested children included), `move` and `update title` are refused, naming the existing node; done and dropped siblings never block, and `set_status` is never refused for it. Checked in the write's transaction (MCP writes share one connection), not by a unique index, so there is no schema change and the rule can use the search normalization. `add` also lists up to three likely duplicates tree-wide (same title, alias match, most of the same words, or a closed same-title sibling), even with hints off. The agent label stays optional; `add` without one gets a hint asking for it |
 
 Still open:
