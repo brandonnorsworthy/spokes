@@ -47,6 +47,9 @@ TRACKED (what the user follows)
 STRUCTURE
   Everything is one tree; each node has one parent. A parent with ordered: true holds steps and only the
   first unfinished step is actionable (marked <- next). A project is simply a task with children.
+  Position always means something. Ordered parent: it is the sequence. Unordered parent: it ranks the
+  siblings within a priority level, so next lists same-level work in tree order (the order get shows).
+  To rank a task higher, move it up (move before a sibling); priority still comes first.
 
 HOW AN AGENT WORKS A TASK
   next -> claim (use one agent label all session) -> do it, notes_append as you go -> set_status done.

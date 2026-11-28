@@ -10,7 +10,7 @@ The design decisions that shape everything else:
 
 - **One node type.** Home, Work, a project, a step in a deploy pipeline are all the same record with a parent. Depth is unlimited because nothing in the model knows about depth.
 - **A tree, plus optional links.** Each node has exactly one parent, which keeps scope, paths and "show me everything under Work" simple. Cross-links such as "blocks" come later as a separate table, which gives you the graph without making the core one.
-- **Each parent says whether its children are ordered.** Ordered means steps: only the first unfinished child is actionable. Unordered means a grab bag.
+- **Each parent says whether its children are ordered.** Ordered means steps: only the first unfinished child is actionable. Unordered means the children are independent, but their position is still a rank: within a priority level, `next` lists them in tree order (SPOKE-1080), so moving a task up ranks it higher.
 - **Areas never finish; tasks do.** Home and House maintenance are areas. They hold work forever and never show up as something to complete.
 - **Stable short IDs** like `SPOKE-142`, global and never reused, so any device or agent can refer to the same item.
 - **Two-tier reads.** Listings return one compact line per node. The long body (plan, notes, versions, links) is fetched only when asked for, so browsing stays cheap.
@@ -224,7 +224,7 @@ The red task disappears from the second terminal because the first agent claimed
 1. **Needs you.** Tasks in `waiting` with their question, then stalled tasks whose claim lease expired.
 2. **Focus list**, in rank order.
 3. **Due.** Overdue first, then anything due within 7 days.
-4. **By level**, 1 down to 4, oldest first within a level.
+4. **By level**, 1 down to 4, then tree order within a level: the depth-first walk in sibling order, the order `get` shows. Under an unordered parent, position is the rank (SPOKE-1080); when it lists two or more lines, UP NEXT ends `(Within a level, in tree order: move a task up to rank it higher.)`.
 5. **Stale.** Up to three open items untouched for 30 days or more, as a nudge.
 
 The queue lists work items, not every leaf. A node appears if it carries its own rank, level or due date; its line shows progress and the next actionable step beneath it. That keeps a six-step project to one line.
@@ -362,6 +362,7 @@ Settled on 2026-11-14:
 | IDs | `SPOKE-123` |
 | Unknown fields on add | Settled 2026-11-27 (SPOKE-222): `add` refuses any field it does not take, at the top or on a nested child, naming the field and the child's path, and writes nothing. Chosen over honoring `status` on add, which would need its own close rules (SPOKE-345). The refusal says what to do instead where callers are known to reach for something (`status` -> `set_status done`, `position` -> `before`/`after`). Other tools still ignore unknown fields |
 | Placing a node on add | Settled 2026-11-27 (SPOKE-459): `add` takes `before` or `after` (a sibling id) at the top of the call and places the new node there, like `move`, so an inserted step costs one call instead of two; `parent` may be omitted and is then the sibling's parent. Nested children are placed by their order in `children`, so `before`/`after` on a child is refused. Chosen over keeping the 0.29.2 refusal because in an ordered parent position is meaning, and a two-call insert leaves the wrong step next in between |
+| Position in an unordered parent | Settled 2026-11-27 (SPOKE-1080, built in SPOKE-1081): position is a rank. `next` sorts UP NEXT by level, then tree order (the depth-first walk in sibling order), instead of oldest first, and a footer line says so. Chosen over automatic sorting everywhere because agents reorder siblings when they plan and expect it to stick; ignoring that silently is the same failure as silently ignored fields. Focus, due and needs-you sorting are unchanged |
 | Duplicate siblings | Settled 2026-11-27 (SPOKE-260): an unfinished node may not share its title with an unfinished sibling. Titles compare as search normalizes them (case, accents, punctuation, spacing ignored). `add` (nested children included), `move` and `update title` are refused, naming the existing node; done and dropped siblings never block, and `set_status` is never refused for it. Checked in the write's transaction (MCP writes share one connection), not by a unique index, so there is no schema change and the rule can use the search normalization. `add` also lists up to three likely duplicates tree-wide (same title, alias match, most of the same words, or a closed same-title sibling), even with hints off. The agent label stays optional; `add` without one gets a hint asking for it |
 
 Still open:
