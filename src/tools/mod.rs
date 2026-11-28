@@ -157,7 +157,7 @@ impl Spokes {
     }
 
     #[tool(
-        description = "Mark nodes done, dropped (won't do; there is no delete) or open (reopen). A node closes (done or dropped) only when nothing under it is unfinished: pass the children's ids in the same call, or finish, drop or move them first; the refusal lists them. Reopening needs the nodes above it open too (pass them together). Areas can be dropped but never done. A repeating task marked done comes back with its next due date; dropping it stops it."
+        description = "Mark nodes done, dropped (won't do; there is no delete) or open (reopen). A node closes (done or dropped) only when nothing under it is unfinished: finish, drop or move what is under it first, or pass those ids in the same call; the refusal lists them and says which are claimed or waiting. Close only what is really finished or no longer wanted. Reopening needs the nodes above it open too (pass them together). Areas can be dropped but never done. A repeating task marked done comes back with its next due date; dropping it stops it."
     )]
     async fn set_status(&self, Parameters(args): Parameters<SetStatusArgs>) -> ToolResult {
         let today = today_in(self.tz);

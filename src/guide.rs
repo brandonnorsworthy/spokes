@@ -19,7 +19,9 @@ STATUS (what happened to the work)
   Areas (kind area) never finish: they can be dropped but never done.
   Nothing closes over unfinished work. done and dropped are refused while anything under the node, at
   any depth, is unfinished: pass those ids in the same set_status call, or finish, drop or move them
-  first. Reopening is refused under a done or dropped node unless that one is reopened in the same call.
+  first. Close only what is really finished or unwanted: closing ends another agent's claim, so check
+  the ones the refusal says are held. Reopening is refused under a done or dropped node unless that one
+  is reopened in the same call.
 
 REFINEMENT (how ready the work is to pick up; it stops at ready)
   idea          a rough thought; nothing is decided.
