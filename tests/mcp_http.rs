@@ -2842,6 +2842,91 @@ async fn old_stage_argument_is_refused_and_writes_nothing() {
     server.shutdown().await;
 }
 
+/// A field `add` does not take is refused by name at any depth, with what to do instead,
+/// and nothing is created (SPOKE-222: `status` on nested children used to vanish).
+#[tokio::test]
+async fn add_refuses_unknown_fields_and_writes_nothing() {
+    let dir = temp_dir("add-unknown");
+    let server = start(&dir.join("spokes.db")).await;
+    let m = Mcp::new(server.addr);
+
+    // The catch-all that holds unknown fields is not part of the schema models read.
+    let tools = m.rpc("tools/list", json!({})).await;
+    let schema = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "add")
+        .unwrap()["inputSchema"]
+        .to_string();
+    assert!(schema.contains("\"children\""), "{schema}");
+    assert!(!schema.contains("unknown"), "{schema}");
+
+    let kept = first_id(&m.ok("add", json!({"title": "Kept"})).await);
+    for (args, needles) in [
+        (
+            json!({"title": "Zebra", "children": [
+                {"title": "Stripe one"},
+                {"title": "Stripe two", "status": "done"}
+            ]}),
+            vec![
+                "children[1] (\"Stripe two\")",
+                "does not take status",
+                "set_status done",
+            ],
+        ),
+        (
+            json!({"title": "Zebra", "children": [{"title": "Stripe", "children": [
+                {"title": "Hoof", "parent": kept, "colour": "black"}
+            ]}]}),
+            vec![
+                "children[0].children[0] (\"Hoof\")",
+                "colour, parent",
+                "nested in",
+            ],
+        ),
+        (
+            json!({"title": "Zebra", "parent": kept, "after": kept}),
+            vec!["does not take after", "move"],
+        ),
+        (
+            json!({"title": "Zebra", "colour": "black"}),
+            vec![
+                "does not take colour",
+                "Each node takes title",
+                "plus parent and agent",
+            ],
+        ),
+    ] {
+        let e = err(&m, "add", args.clone()).await;
+        for n in needles {
+            assert!(e.contains(n), "{args}: missing {n:?} in {e}");
+        }
+        assert!(e.contains("nothing was added"), "{e}");
+    }
+    let found = m
+        .ok(
+            "search",
+            json!({"query": "zebra stripe hoof kept", "match": "any"}),
+        )
+        .await;
+    assert!(found.contains("Kept"), "{found}");
+    assert!(
+        !found.contains("Zebra") && !found.contains("Stripe"),
+        "{found}"
+    );
+
+    // Known fields, parent and agent at the top, still work.
+    let ok = m
+        .ok(
+            "add",
+            json!({"title": "Zebra", "parent": kept, "agent": "t", "children": [{"title": "Stripe", "type": "chore"}]}),
+        )
+        .await;
+    assert!(ok.starts_with("Added "), "{ok}");
+    server.shutdown().await;
+}
+
 /// A closed node shows no refinement anywhere and matches no refinement filter; the stored
 /// value is kept and shows again when the node is reopened. Its type is unaffected.
 #[tokio::test]
