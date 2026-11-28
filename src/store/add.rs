@@ -252,6 +252,7 @@ fn clean_spec(
     let source = clean_source(spec.source.as_deref()).map_err(at)?;
     let recur = clean_recur(spec.recur.as_ref(), kind).map_err(at)?;
     refuse_stage(spec.stage.as_ref()).map_err(at)?;
+    refuse_unknown(&spec.unknown, nest == 0).map_err(at)?;
     let work_type =
         clean_added("type", spec.work_type.as_deref(), WorkType::parse_loose).map_err(at)?;
     let refinement = clean_added(
@@ -325,6 +326,57 @@ fn clean_spec(
         source,
         children,
     })
+}
+
+/// The fields one node of `add` takes, for the refusal below.
+const NODE_FIELDS: &str = "title, kind, ordered, priority, due, defer_until, aliases, recur, type, refinement, tracked, notes, source, children";
+
+/// Refuses fields `add` does not take, so a caller never believes it set one (SPOKE-222).
+/// `top` is the node named by the call itself, where `parent` and `agent` are also taken.
+fn refuse_unknown(
+    unknown: &std::collections::BTreeMap<String, serde_json::Value>,
+    top: bool,
+) -> Result<(), String> {
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let list = unknown
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fix = unknown
+        .keys()
+        .find_map(|name| unknown_fix(name, top))
+        .unwrap_or_else(|| {
+            let extra = if top { ", plus parent and agent" } else { "" };
+            format!("Each node takes {NODE_FIELDS}{extra}.")
+        });
+    Err(format!(
+        "add does not take {list}, so nothing was added. {fix}"
+    ))
+}
+
+/// What to do instead, for the fields callers are known to reach for.
+fn unknown_fix(name: &str, top: bool) -> Option<String> {
+    let fix = match name {
+        "status" | "state" | "done" => {
+            "To record work that is already finished, add it, then set_status done with the new ids."
+        }
+        "after" | "before" | "position" | "rank" => {
+            "New nodes go last under their parent; place one with move (before or after a sibling) once it exists."
+        }
+        "parent" | "parent_id" if !top => {
+            "A child's parent is the node it is nested in; pass parent only at the top of the call."
+        }
+        "agent" if !top => "Pass agent once, at the top of the call.",
+        "id" => "add gives out the ids; it cannot take one.",
+        "claimed_by" | "claim" => "Claim the task with claim once it exists.",
+        "focus" => "Put it on the focus list with focus once it exists.",
+        "notes_append" | "source_append" => "Those are update fields; on add give notes or source.",
+        _ => return None,
+    };
+    Some(fix.to_string())
 }
 
 /// A type or refinement given on add: parsed loosely; an empty string is an error (omit the field).

@@ -44,6 +44,11 @@ pub struct NodeSpec {
     /// Renamed to `refinement`; taken only so that it can be refused instead of ignored.
     #[schemars(skip)]
     pub stage: Option<serde_json::Value>,
+    /// Every other field given, so that `add` refuses it by name instead of dropping it
+    /// without a word (SPOKE-222).
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unknown: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 // The `agent` label is optional on plain writes (it logs who acted and renews that agent's
