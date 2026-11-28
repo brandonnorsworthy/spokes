@@ -25,11 +25,11 @@ use crate::tools::args::{AnswerArgs, AskArgs, ClaimArgs, ReleaseArgs};
 const MAX_LEASE_MINUTES: i64 = 24 * 60;
 const MAX_QUESTION: usize = 1000;
 
-/// The atomic claim. Wins only if the node is a claimable task (open, or already ours,
-/// or a claim whose lease has run out) and no other agent holds a live claim on a
-/// descendant. A claim inside another agent's claimed project is allowed: that is the
-/// orchestrator pattern (the orchestrator claims the project, each worker claims its
-/// own step). ?1 id, ?2 agent, ?3 now, ?4 new lease end.
+/// The atomic claim. Wins only if the node is a claimable task: open, or already ours,
+/// or a claim whose lease has run out. Only the node itself counts. Claims above or
+/// beneath it, whoever holds them, do not block it, so the orchestrator pattern (one
+/// agent on the project, each worker on its own step) works in either order
+/// (SPOKE-551). ?1 id, ?2 agent, ?3 now, ?4 new lease end.
 const CLAIM_SQL: &str = "
 UPDATE nodes
    SET status = 'in_progress', claimed_by = ?2, claim_expires = ?4,
@@ -37,14 +37,7 @@ UPDATE nodes
  WHERE id = ?1 AND kind = 'task' AND parent_id IS NOT NULL
    AND (status = 'open'
         OR (status = 'in_progress'
-            AND (claimed_by = ?2 OR claim_expires IS NULL OR claim_expires <= ?3)))
-   AND NOT EXISTS (
-       WITH RECURSIVE down(id) AS (
-         SELECT id FROM nodes WHERE parent_id = ?1
-         UNION ALL
-         SELECT c.id FROM nodes c JOIN down ON c.parent_id = down.id)
-       SELECT 1 FROM nodes d JOIN down ON d.id = down.id
-        WHERE d.status = 'in_progress' AND d.claimed_by != ?2 AND d.claim_expires > ?3)";
+            AND (claimed_by = ?2 OR claim_expires IS NULL OR claim_expires <= ?3)))";
 
 pub fn claim(conn: &mut Connection, args: ClaimArgs, tz: Tz) -> ToolResult {
     let id = args.id.parse()?;
@@ -122,6 +115,9 @@ pub fn claim(conn: &mut Connection, args: ClaimArgs, tz: Tz) -> ToolResult {
             a.claimed_by.as_deref().unwrap_or("another agent")
         ));
     }
+    if let Some(line) = held_beneath(&tx, id, &agent, &now, tz)? {
+        reply.push_str(&line);
+    }
     if before.answered_at.is_some() {
         reply.push_str(" The user answered a question on it: read the notes (get notes: true).");
     } else if before.has_notes && before.status != Status::InProgress {
@@ -191,6 +187,59 @@ fn parent_hint(
     Ok(crate::hints::hint(&action))
 }
 
+/// How many held tasks a claim reply names before "+N more".
+const LISTED_HELD: usize = 3;
+
+/// The tasks beneath `id`, at any depth, that other agents hold with a live claim: the
+/// claimer gets the project, not those (SPOKE-551). State, not a hint, so
+/// `SPOKES_HINTS=0` keeps it.
+fn held_beneath(
+    conn: &Connection,
+    id: NodeId,
+    agent: &str,
+    now: &str,
+    tz: Tz,
+) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE down(id) AS (
+               SELECT id FROM nodes WHERE parent_id = ?1
+               UNION ALL
+               SELECT c.id FROM nodes c JOIN down ON c.parent_id = down.id)
+             SELECT d.id, d.title, d.claimed_by, d.claim_expires FROM nodes d JOIN down ON d.id = down.id
+              WHERE d.status = 'in_progress' AND d.claimed_by != ?2 AND d.claim_expires > ?3
+              ORDER BY d.id",
+        )
+        .map_err(db_err)?;
+    let held: Vec<(i64, String, String, String)> = stmt
+        .query_map(params![id.0, agent, now], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .and_then(|rows| rows.collect())
+        .map_err(db_err)?;
+    if held.is_empty() {
+        return Ok(None);
+    }
+    let mut named: Vec<String> = held
+        .iter()
+        .take(LISTED_HELD)
+        .map(|(did, title, who, until)| {
+            format!(
+                "{} {title} ({who}, until {})",
+                NodeId(*did),
+                clock(until, tz)
+            )
+        })
+        .collect();
+    if held.len() > LISTED_HELD {
+        named.push(format!("+{} more", held.len() - LISTED_HELD));
+    }
+    Ok(Some(format!(
+        " Other agents hold work under it, which stays theirs: {}.",
+        named.join(", ")
+    )))
+}
+
 /// Why a claim lost, and what to do instead.
 fn refusal(
     conn: &Connection,
@@ -226,28 +275,6 @@ fn refusal(
         ));
     }
     if let Some(line) = held_by_other(node, agent, now, tz) {
-        return with_other_work(conn, node, line, tz);
-    }
-    let below: Option<(i64, String, String, String)> = conn
-        .query_row(
-            "WITH RECURSIVE down(id) AS (
-               SELECT id FROM nodes WHERE parent_id = ?1
-               UNION ALL
-               SELECT c.id FROM nodes c JOIN down ON c.parent_id = down.id)
-             SELECT d.id, d.title, d.claimed_by, d.claim_expires FROM nodes d JOIN down ON d.id = down.id
-              WHERE d.status = 'in_progress' AND d.claimed_by != ?2 AND d.claim_expires > ?3
-              LIMIT 1",
-            params![id.0, agent, now],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()
-        .map_err(db_err)?;
-    if let Some((did, title, who, until)) = below {
-        let line = format!(
-            "{} {title} under {id} is claimed by {who} until {}. Claim a different step, or ask the user.",
-            NodeId(did),
-            clock(&until, tz)
-        );
         return with_other_work(conn, node, line, tz);
     }
     Ok(format!(

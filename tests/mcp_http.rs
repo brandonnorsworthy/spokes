@@ -1653,13 +1653,14 @@ async fn claim_rules_and_lease_renewal_over_http() {
     mcp.ok("claim", json!({"id": 5, "agent": "red"})).await;
     mcp.ok("release", json!({"id": 5, "agent": "red"})).await;
 
-    // A step claimed by one agent blocks another from claiming its parent.
+    // A step claimed by one agent does not block another from claiming its parent
+    // (SPOKE-551). The step stays the first agent's.
     mcp.ok("claim", json!({"id": 7, "agent": "blue"})).await;
-    let e = err(&mcp, "claim", json!({"id": 6, "agent": "red"})).await;
-    assert!(
-        e.starts_with("SPOKE-7 Roof under SPOKE-6 is claimed by blue until "),
-        "{e}"
-    );
+    let c = mcp.ok("claim", json!({"id": 6, "agent": "red"})).await;
+    assert!(c.contains("SPOKE-7 Roof (blue, until "), "{c}");
+    let e = err(&mcp, "claim", json!({"id": 7, "agent": "red"})).await;
+    assert!(e.starts_with("SPOKE-7 is claimed by blue until "), "{e}");
+    mcp.ok("release", json!({"id": 6, "agent": "red"})).await;
 
     // Writes renew the writer's own claims only: the worker's on the step, the
     // orchestrator's on the project.
@@ -3065,7 +3066,8 @@ async fn claim_hints_at_source_and_at_other_work_over_http() {
         "{out}"
     );
 
-    // An ordered parent has nothing else to offer while its step is held.
+    // A held step of an ordered parent is refused with plain next: the later steps wait
+    // for it, so the parent has nothing else to offer.
     let plan = add_node(
         &mcp,
         json!({"title": "Deploy", "ordered": true,
@@ -3075,14 +3077,90 @@ async fn claim_hints_at_source_and_at_other_work_over_http() {
     let g = mcp.ok("get", json!({"id": plan})).await;
     let map = first_id(line_with(&g, "Map"));
     mcp.ok("claim", json!({"id": map, "agent": "w1"})).await;
-    for id in [&map, &plan] {
-        let (out, failed) = mcp.call("claim", json!({"id": id, "agent": "w2"})).await;
-        assert!(failed, "{out}");
-        assert!(
-            out.ends_with("\nNext: Call next to find other open work."),
-            "{out}"
-        );
+    let (out, failed) = mcp.call("claim", json!({"id": map, "agent": "w2"})).await;
+    assert!(failed, "{out}");
+    assert!(
+        out.ends_with("\nNext: Call next to find other open work."),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An orchestrator can claim a project after a worker has taken a step in it, and the
+/// reply names what other agents hold beneath it, at any depth (SPOKE-551).
+#[tokio::test]
+async fn claim_a_parent_while_workers_hold_work_beneath_it_over_http() {
+    let dir = temp_dir("claim-nested");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+
+    // 2 Ladder; 3 Phase with 4 Deep; 5 One, 6 Two, 7 Three, 8 Lapsed, 9 Free.
+    add_node(
+        &mcp,
+        json!({"title": "Ladder", "children": [
+            {"title": "Phase", "children": [{"title": "Deep"}]},
+            {"title": "One"}, {"title": "Two"}, {"title": "Three"},
+            {"title": "Lapsed"}, {"title": "Free"}]}),
+    )
+    .await;
+    mcp.ok("claim", json!({"id": 4, "agent": "w-deep"})).await;
+
+    // One holder, two levels down.
+    let c = mcp.ok("claim", json!({"id": 2, "agent": "orch"})).await;
+    assert!(
+        c.starts_with("Claimed SPOKE-2 Ladder for orch until "),
+        "{c}"
+    );
+    assert!(
+        c.contains(
+            " Other agents hold work under it, which stays theirs: SPOKE-4 Deep (w-deep, until "
+        ),
+        "{c}"
+    );
+    // The worker's claim is untouched and the project is now the orchestrator's.
+    let g = mcp.ok("get", json!({"id": 4})).await;
+    assert!(g.contains("\nclaimed by w-deep until "), "{g}");
+    let g = mcp.ok("get", json!({"id": 2})).await;
+    assert!(g.contains("\nclaimed by orch until "), "{g}");
+    // Workers go on claiming inside it.
+    for (id, agent) in [(5, "w1"), (6, "w2"), (7, "w3"), (8, "gone")] {
+        mcp.ok("claim", json!({"id": id, "agent": agent})).await;
     }
+    db(&path)
+        .execute(
+            "UPDATE nodes SET claim_expires = '2000-01-01T00:00:00Z' WHERE id = 8",
+            [],
+        )
+        .unwrap();
+
+    // A renewal repeats it: three are named, the rest counted, a lapsed claim and the
+    // caller's own claim are not listed.
+    mcp.ok("claim", json!({"id": 9, "agent": "orch"})).await;
+    let c = mcp.ok("claim", json!({"id": 2, "agent": "orch"})).await;
+    assert!(
+        c.starts_with("Renewed SPOKE-2 Ladder for orch until "),
+        "{c}"
+    );
+    for held in [
+        "SPOKE-4 Deep (w-deep, ",
+        "SPOKE-5 One (w1, ",
+        "SPOKE-6 Two (w2, ",
+    ] {
+        assert!(c.contains(held), "{held}: {c}");
+    }
+    assert!(c.contains("), +1 more."), "{c}");
+    assert!(!c.contains("Lapsed") && !c.contains("Free"), "{c}");
+
+    // The same node is still one agent's: a second claim on the project is refused.
+    let e = err(&mcp, "claim", json!({"id": 2, "agent": "other"})).await;
+    assert!(e.starts_with("SPOKE-2 is claimed by orch until "), "{e}");
+
+    // A parent with nobody else beneath it says nothing about it.
+    let c = mcp.ok("claim", json!({"id": 3, "agent": "w-deep"})).await;
+    assert!(!c.contains("Other agents hold"), "{c}");
+
+    server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }
 

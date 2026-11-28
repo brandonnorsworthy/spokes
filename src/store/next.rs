@@ -556,7 +556,7 @@ impl Queue {
                 && reachable
                 && (at.top || kid.priority.is_some() || kid.due_at.is_some())
                 // A project whose every open step is claimed, waiting or deferred has
-                // nothing to offer right now (claiming it would be refused anyway).
+                // nothing to offer right now.
                 && (tree.kids(kid.id).is_empty()
                     || tree.next_step(kid.id, kid.ordered, self.today).is_some())
             {
