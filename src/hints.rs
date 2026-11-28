@@ -63,6 +63,9 @@ pub enum Action<'a> {
     Answered { node: &'a Node },
     /// `move` changed the children of these parents (the old one and/or the new one).
     Moved { parents: &'a [Reordered<'a>] },
+    /// `search` listed work by state, holder or idle time (SPOKE-1029). `stalled`: a line
+    /// shown is a claim that ran out. `children_done`: it listed parents left open.
+    Listed { stalled: bool, children_done: bool },
 }
 
 /// A parent whose children a move changed, read after the move.
@@ -82,6 +85,12 @@ pub const CLAIM_ON_READ: &str = "Working on this? Claim it first (that marks it 
 pub const CLAIM_FROM_QUEUE: &str = "Claim the one you pick before starting.";
 /// After appending notes to a task nobody holds.
 pub const CLAIM_ON_NOTES: &str = "Recording progress? Claim it so other agents skip it.";
+/// After a listing that shows a claim which ran out.
+pub const TAKE_OVER: &str =
+    "To take over a stalled task, claim it and read its notes (get notes: true).";
+/// After listing parents with nothing open beneath them.
+pub const CHECK_FINISHED: &str =
+    "Check the work is really finished before you mark it done with set_status.";
 /// How many nodes a hint names before "+N more".
 const LISTED: usize = 3;
 
@@ -138,6 +147,16 @@ pub fn hint(action: &Action<'_>) -> Option<String> {
             format!("Claim {} before continuing the work.", node.id)
         }
         Action::Moved { parents } => moved(parents)?,
+        Action::Listed {
+            stalled,
+            children_done,
+        } => {
+            if *stalled {
+                TAKE_OVER.to_string()
+            } else {
+                children_done.then(|| CHECK_FINISHED.to_string())?
+            }
+        }
     };
     Some(format!("{PREFIX}{text}"))
 }

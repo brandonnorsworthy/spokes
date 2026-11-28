@@ -3296,3 +3296,249 @@ async fn move_hints_at_a_changed_next_step_over_http() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Sets one column of a node directly, to age a lease or a node without waiting.
+fn set_column(path: &Path, id: &str, column: &str, value: &str) {
+    let n: i64 = id.trim_start_matches("SPOKE-").parse().unwrap();
+    db(path)
+        .execute(
+            &format!("UPDATE nodes SET {column} = ?1 WHERE id = ?2"),
+            rusqlite::params![value, n],
+        )
+        .unwrap();
+}
+
+/// The ids on the result lines of a `search` reply, sorted.
+fn result_ids(out: &str) -> Vec<String> {
+    let mut ids: Vec<String> = out
+        .lines()
+        .filter(|l| l.starts_with("  SPOKE-"))
+        .map(first_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn sorted(ids: &[&String]) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().map(|s| (*s).clone()).collect();
+    ids.sort();
+    ids
+}
+
+/// SPOKE-1029: one `search` call lists leftover work by state under a scope, including
+/// what `next` hides under a held or waiting parent.
+#[tokio::test]
+async fn search_lists_work_by_state_over_http() {
+    let dir = temp_dir("by-state");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+
+    let area = add_node(&mcp, json!({"title": "Home", "kind": "area"})).await;
+    let task = |title: &str, parent: &str| json!({"title": title, "parent": parent});
+    let held = add_node(&mcp, task("Held project", &area)).await;
+    let dead = add_node(&mcp, task("Dead step", &held)).await;
+    let asked_in_held = add_node(&mcp, task("Question in held", &held)).await;
+    let blocked = add_node(&mcp, task("Waiting project", &area)).await;
+    let asked_in_blocked = add_node(&mcp, task("Question in waiting", &blocked)).await;
+
+    mcp.ok("claim", json!({"id": held, "agent": "opus"})).await;
+    mcp.ok("claim", json!({"id": dead, "agent": "sonnet-1"}))
+        .await;
+    set_column(&path, &dead, "claim_expires", &ts_ago(120));
+    for (id, q) in [
+        (&asked_in_held, "Which disk?"),
+        (&blocked, "Go ahead?"),
+        (&asked_in_blocked, "Which\nvault?"),
+    ] {
+        mcp.ok("ask", json!({"id": id, "agent": "sonnet-2", "question": q}))
+            .await;
+    }
+
+    // Stalled claims show under a held parent; the holder and the expiry are named.
+    let out = mcp.ok("search", json!({"state": "stalled"})).await;
+    assert!(out.starts_with("1 match for state stalled:"), "{out}");
+    assert_eq!(result_ids(&out), sorted(&[&dead]), "{out}");
+    assert!(
+        line_with(&out, "Dead step").ends_with("(claim by sonnet-1 expired 2h ago)"),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .last()
+            .unwrap()
+            .starts_with("Next: To take over a stalled task, claim it"),
+        "{out}"
+    );
+
+    // `status` is accepted as another name, and values are read loosely.
+    let out = mcp.ok("search", json!({"status": " Claimed "})).await;
+    assert_eq!(result_ids(&out), sorted(&[&held]), "{out}");
+    assert!(
+        line_with(&out, "Held project").contains("(held by opus until "),
+        "{out}"
+    );
+    assert!(!out.contains("Next: "), "{out}");
+
+    let out = mcp.ok("search", json!({"state": "in_progress"})).await;
+    assert_eq!(result_ids(&out), sorted(&[&held, &dead]), "{out}");
+
+    // Questions show under held and waiting parents alike, with their text.
+    let out = mcp.ok("search", json!({"state": "waiting"})).await;
+    assert_eq!(
+        result_ids(&out),
+        sorted(&[&asked_in_held, &blocked, &asked_in_blocked]),
+        "{out}"
+    );
+    assert!(
+        line_with(&out, "Question in waiting").ends_with("(sonnet-2 asked: \"Which vault?\")"),
+        "{out}"
+    );
+
+    // claimed_by lists everything one label holds, alone or with a state.
+    let out = mcp.ok("search", json!({"claimed_by": "sonnet-1"})).await;
+    assert!(out.starts_with("1 match for claimed by sonnet-1:"), "{out}");
+    assert_eq!(result_ids(&out), sorted(&[&dead]), "{out}");
+    let out = mcp
+        .ok(
+            "search",
+            json!({"claimed_by": "sonnet-2", "state": "waiting", "scope": blocked}),
+        )
+        .await;
+    assert_eq!(result_ids(&out), sorted(&[&asked_in_blocked]), "{out}");
+    let out = mcp
+        .ok("search", json!({"claimed_by": "opus", "state": "stalled"}))
+        .await;
+    assert!(
+        out.starts_with("No matches for state stalled, claimed by opus."),
+        "{out}"
+    );
+
+    // Open means nobody holds it: areas never count.
+    let out = mcp
+        .ok("search", json!({"query": "", "state": "open"}))
+        .await;
+    assert!(out.starts_with("No matches for state open."), "{out}");
+
+    // Keywords combine with a state, and the line still says who holds it.
+    let out = mcp
+        .ok("search", json!({"query": "step", "state": "in_progress"}))
+        .await;
+    assert_eq!(result_ids(&out), sorted(&[&dead]), "{out}");
+    assert!(out.contains("claim by sonnet-1 expired"), "{out}");
+    // Without these filters, search lines are as before.
+    let out = mcp.ok("search", json!({"query": "step"})).await;
+    assert!(
+        !out.contains("sonnet-1") && !out.contains("Next: "),
+        "{out}"
+    );
+
+    // Paging works on a listing.
+    let out = mcp
+        .ok("search", json!({"state": "waiting", "limit": 2}))
+        .await;
+    assert!(out.contains("(+1 more matches. Pass offset: 2"), "{out}");
+
+    for (args, fragment) in [
+        (json!({"state": "stuck"}), "children_done"),
+        (json!({"state": "done"}), "include_done: true"),
+        (
+            json!({"claimed_by": "  "}),
+            "claimed_by needs an agent label",
+        ),
+        (json!({"untouched_days": 0}), "untouched_days must be 1 to"),
+        (json!({}), "query has no words"),
+    ] {
+        let e = err(&mcp, "search", args).await;
+        assert!(e.contains(fragment), "{e}");
+    }
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SPOKE-1029: parents left open after their subtasks closed, tasks nobody has touched,
+/// and unfinished work under a closed node.
+#[tokio::test]
+async fn search_lists_finished_parents_and_untouched_tasks_over_http() {
+    let dir = temp_dir("left-open");
+    let path = dir.join("spokes.db");
+    let server = start(&path).await;
+    let mcp = Mcp::new(server.addr);
+
+    let area = add_node(&mcp, json!({"title": "Home", "kind": "area"})).await;
+    let task = |title: &str, parent: &str| json!({"title": title, "parent": parent});
+    let finished = add_node(&mcp, task("Finished project", &area)).await;
+    let f1 = add_node(&mcp, task("F one", &finished)).await;
+    let f2 = add_node(&mcp, task("F two", &finished)).await;
+    let half = add_node(&mcp, task("Half project", &area)).await;
+    let h1 = add_node(&mcp, task("H one", &half)).await;
+    add_node(&mcp, task("H two", &half)).await;
+    // All subtasks dropped: nothing was finished, so it is not offered as finished.
+    let abandoned = add_node(&mcp, task("Abandoned project", &area)).await;
+    let a1 = add_node(&mcp, task("A one", &abandoned)).await;
+    // A done step with an open one hidden beneath it: still unfinished work.
+    let deep = add_node(&mcp, task("Deep project", &area)).await;
+    let mid = add_node(&mcp, task("Mid step", &deep)).await;
+    let buried = add_node(&mcp, task("Buried step", &mid)).await;
+    // An area with only done children never finishes.
+    let shed = add_node(&mcp, json!({"title": "Shed", "kind": "area"})).await;
+    let s1 = add_node(&mcp, task("S one", &shed)).await;
+
+    mcp.ok(
+        "set_status",
+        json!({"ids": [f1, h1, mid, s1], "status": "done"}),
+    )
+    .await;
+    mcp.ok("set_status", json!({"ids": [f2, a1], "status": "dropped"}))
+        .await;
+
+    let out = mcp.ok("search", json!({"state": "children_done"})).await;
+    assert!(out.starts_with("1 match for state children_done:"), "{out}");
+    assert_eq!(result_ids(&out), sorted(&[&finished]), "{out}");
+    assert_eq!(
+        out.lines().last().unwrap(),
+        "Next: Check the work is really finished before you mark it done with set_status.",
+        "{out}"
+    );
+
+    // Open work under a closed node is counted and reachable with include_done.
+    let out = mcp
+        .ok("search", json!({"state": "open", "scope": deep}))
+        .await;
+    assert!(out.starts_with("No matches for state open."), "{out}");
+    assert!(
+        out.contains("(1 more under done or dropped nodes; pass include_done: true"),
+        "{out}"
+    );
+    let out = mcp
+        .ok(
+            "search",
+            json!({"state": "open", "scope": deep, "include_done": true}),
+        )
+        .await;
+    assert_eq!(result_ids(&out), sorted(&[&buried]), "{out}");
+
+    // Untouched: only old unfinished tasks, oldest first; deferred ones are left out.
+    set_column(&path, &half, "touched_at", &ts_ago(60 * 24 * 10));
+    set_column(&path, &abandoned, "touched_at", &ts_ago(60 * 24 * 40));
+    set_column(&path, &finished, "touched_at", &ts_ago(60 * 24 * 40));
+    set_column(&path, &finished, "defer_until", "2099-01-01");
+    set_column(&path, &f1, "touched_at", &ts_ago(60 * 24 * 40));
+    set_column(&path, &area, "touched_at", &ts_ago(60 * 24 * 40));
+    let out = mcp.ok("search", json!({"untouched_days": 7})).await;
+    assert!(out.starts_with("2 matches for untouched 7+ days:"), "{out}");
+    assert!(
+        pos(&out, "Abandoned project") < pos(&out, "Half project"),
+        "{out}"
+    );
+    assert!(
+        line_with(&out, "Half project").ends_with("(untouched 10d)"),
+        "{out}"
+    );
+    let out = mcp.ok("search", json!({"untouched_days": "30"})).await;
+    assert_eq!(result_ids(&out), sorted(&[&abandoned]), "{out}");
+
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
